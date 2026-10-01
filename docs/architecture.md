@@ -3,10 +3,14 @@
 ## Pipeline Diagram
 
 ```
-mic → wake ("hey jarvis") → VAD (0.7 s silence) → STT → brain (persistent claude -p)
-                                                          │ streamed text
-                                                          ▼
-speaker ← say ← speech queue (player.py) ← sentence chunker ─┘
+Path A (undertone attach + undertone session):
+  mic → wake ("hey jarvis") → VAD (0.7 s silence) → STT → voice.sock → channel (mcp_channel.py) → Claude Code session
+                                                                                       │ reply tool
+  speaker ← say ← speech queue (player.py) ← sentence chunker ← voice.sock ← channel ◄─┘
+
+Path B (undertone chat):
+  mic → wake ("hey jarvis") → VAD (0.7 s silence) → STT → brain (persistent claude -p)
+  speaker ← say ← speech queue (player.py) ← sentence chunker ◄─ streamed text ─┘
 ```
 
 The wake detector stays live while Claude is thinking or speaking. Saying "hey jarvis" again stops the speech and interrupts the turn (barge-in).
@@ -15,25 +19,26 @@ The wake detector stays live while Claude is thinking or speaking. Saying "hey j
 
 There are two brains:
 
-- **Brain A (Claude Code sessions):** the Stop hook sends a short spoken summary of each reply to the speaker daemon via `~/.undertone/speaker.sock`. A Channel MCP server (Phase 3, planned) will feed transcripts from undertone's mic pipeline into a running session.
+- **Brain A (Claude Code sessions):** A Channel MCP server (`mcp_channel.py`) receives transcripts from `undertone attach` (via `~/.undertone/voice.sock`) and injects them as notifications into a running session. Claude calls the `reply` tool to speak answers.
 - **Brain B (`undertone chat`):** One persistent `claude -p` stream-json child, reading replies sentence by sentence.
 
 ## Modules
 
 | Module | Role | Key Details |
 |---|---|---|
-| `audio.py` | sounddevice RawInputStream, 320-byte (10 ms) int16 frames | Lazy import; never used by light commands like `undertone hook stop` |
+| `audio.py` | sounddevice RawInputStream, 320-byte (10 ms) int16 frames | Lazy import; not loaded by light commands like `undertone channel` |
 | `listener.py` | Pure state machine: IDLE→LISTENING→IDLE over frame stream | VAD in 1024-byte (32 ms) chunks; 0.7 s silence → end of turn; 4 s no-speech timeout; 15 s max utterance; 0.15 s VAD ignore window after wake. Strips leading wake phrase from transcripts. Wake detector is re-created after every turn (Phase 0 found a stale one could double-trigger). |
 | `stt.py` | ParakeetSTT: warm-up on load (first call ~823 ms → 54 ms after warm-up, Phase 2a); HF_HUB_OFFLINE forced at import | Model: mlx-community/parakeet-tdt-0.6b-v3. Float32 in-memory, never written to disk. |
 | `brain.py` | ClaudeBrain: one persistent child; reader thread → queue; `ask()` yields TextDelta/ToolUse/TurnEnd; `interrupt()` writes control_request JSON (~10 ms response) | 120 s turn timeout; stderr → 0600 log; atomic 0600 session file. Process startup cost eliminated (one-shot `claude -p` is 5.5–13 s; persistent child gives ~1.0–2.0 s to first token, measured on M4 Max). |
 | `chunker.py` | SentenceChunker: stream of text deltas → sentences | `.!?` + whitespace, or newline; skips decimals and abbreviations (e.g., "e.g.", "etc."); fenced code → "Code's on screen." once per turn; 240-char soft cap. |
 | `player.py` | SpeechQueue: sequential `say` per sentence; `stop()` for barge-in with generation counter | Closes race between dequeue and spawn via generation counter. Worker thread owned by SpeechQueue. |
 | `chat.py` | ChatSession: main thread owns mic and Listener; ONE brain worker thread runs turns sequentially | An interrupted turn drains to its end before the next message is written. Generation counter bumped on every utterance and barge-in discards stale output. After a completed reply, worker waits for player idle, then posts to control queue; main thread drains → follow-up window. |
-| `speaker.py` | Path A daemon: unix socket `~/.undertone/speaker.sock` (0600), newline JSON ops (say/stop/ping), 1 s deadline per connection, 64 KB cap | build_say_argv is the ONE place `say` argv is built (with `--` to guard against flag injection). |
-| `spoken.py` | Reply → short speakable summary (SPOKEN: line or first 2 sentences) | Markdown stripped, code/URLs skipped. |
-| `hooks.py` | Stop hook (speaks a summary of the reply) and UserPromptSubmit hook (asks Claude to end replies with a `SPOKEN:` line) | Opted-in sessions only; never speaks on `stop_hook_active` turns. |
-| `paths.py` | UNDERTONE_HOME layout (0700) | Default `~/.undertone`. |
-| `cli.py` | Commands: `chat`, `listen`, `serve`, `say`, `stop`, `on`, `off`, `status`, `hook`, `hooks-snippet`, `models fetch`. `chat_workdir()` picks the working directory. | Resolves the cwd (symlinks followed). If it is home or an ancestor of home, any dot-directory under home, `~/Library`, or exactly `~/Documents`/`~/Desktop`/`~/Downloads`, it switches to `~/.undertone/workspace` and refuses a symlinked workspace. |
+| `speaker.py` | build_say_argv: constructs `say` argv with `--` to guard against flag injection | Single point where `say` text is prepared; speaks replies in Path A (via reply tool) and Path B (via player queue). Runs `spoken.sanitize_for_tts()` to filter wake word. |
+| `spoken.py` | Reply sanitization for TTS: strips invisible characters, removes `[`/`]`, replaces wake word forms with "the wake word" | Used by speaker.build_say_argv. |
+| `mcp_channel.py` | Stdlib MCP stdio **channel** server. Claude Code spawns it from the config `undertone session` writes (`python -P -m undertone.cli channel`). | Connects as a client to `~/.undertone/voice.sock` and says `hello`. Each `utterance` becomes a `notifications/claude/channel` event. Exposes the `reply` tool (`kind` = ack/answer/confirm, ≤4000 chars) and forwards replies to `attach`. Rejects the 2026-07-28 `server/discover` probe so Claude Code falls back to `initialize` 2025-11-25. |
+| `voice.py` | `VoiceBridge`, the `undertone attach` process. It runs the mic loop (Listener on the main thread) and the unix-socket server at `~/.undertone/voice.sock` (0600). | Sends each utterance to the attached channel and speaks replies sentence by sentence through `SpeechQueue`. Wake during speech = barge-in (stop speech). The follow-up window opens only after an `answer`. Socket rules: 64 KB lines, 16 connections, latest session wins. |
+| `paths.py` | UNDERTONE_HOME layout (0700) | Default `~/.undertone`. Includes voice.sock path. |
+| `cli.py` | Commands: `listen`, `chat`, `session`, `attach`, `channel` (internal), `models fetch`. `chat_workdir()` picks the working directory. | Resolves the cwd (symlinks followed). If it is home or an ancestor of home, any dot-directory under home, `~/Library`, or exactly `~/Documents`/`~/Desktop`/`~/Downloads`, it switches to `~/.undertone/workspace` and refuses a symlinked workspace. |
 
 ## State Machine
 

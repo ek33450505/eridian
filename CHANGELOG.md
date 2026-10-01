@@ -4,6 +4,41 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-01 — Phase 1 retired (Stop hook and speaker daemon)
+
+**Removed**
+- The `Stop` and `UserPromptSubmit` (`SPOKEN:`) hooks (`hooks.py`) and the unix-socket speaker daemon (`speaker.sock`).
+- The commands `undertone serve`, `say`, `stop`, `on`, `off`, `status`, `hook` and `hooks-snippet`.
+- The `UNDERTONE_SPEAK` opt-in and the `enabled` flag file.
+- `paths.socket_path()`, `paths.enabled_flag_path()` and `spoken.spoken_text()`.
+
+**Changed**
+- `speaker.py` now holds only `build_say_argv`, the single sanitizing `say` argv builder.
+- `undertone session` no longer needs to disable the hook.
+
+**Replaced by:** Phase 3. A voice session speaks Claude's `reply` tool text instead of a Stop-hook summary.
+
+**Note:** if you registered the Phase 1 hooks, remove them from your Claude Code settings. A leftover registration (`… undertone hook stop || true`) fails harmlessly, because the `hook` subcommand is gone.
+
+### 2026-10-01 — Phase 3: voice into a running session (PR #4)
+
+**Added**
+- `undertone attach`: the mic process. It runs the wake word, VAD and STT, sends transcripts over `~/.undertone/voice.sock` (0600, newline JSON), and speaks replies sentence by sentence. "Latest session wins" when several sessions attach.
+- `mcp_channel.py`: a stdlib MCP stdio server that Claude Code spawns as a **Channel** (`python -P -m undertone.cli channel`). It turns each transcript into a `notifications/claude/channel` event that lands as `← undertone: …`, and exposes a `reply` tool whose `kind` is `ack`, `answer` or `confirm`.
+- `undertone session [claude args...]`: runs `claude --mcp-config ~/.undertone/channel.mcp.json --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`.
+
+**Security**
+- Voice turns keep full session power but are unverified input (Ed's decision: confirm risky actions). Before anything destructive, irreversible or outward-facing, Claude sends a `kind=confirm` reply and asks the user to say the wake word, then "confirm <two fresh uncommon words>". The listener strips the wake word from every transcript, so Claude accepts "confirm walnut lantern" with the words immediately after "confirm". "Yes" is a refusal.
+- `attach` opens the no-wake-word follow-up window only after an `answer`, never after an `ack` or a `confirm`, so ambient audio can't answer a confirmation.
+- undertone never speaks its own wake word. `speaker.build_say_argv` runs `spoken.sanitize_for_tts`, which strips invisible characters, removes every `[`/`]` (`say` inline commands), and replaces any spoken or obfuscated "hey jarvis"/"jarvis" with "the wake word".
+- No permission relay is declared. Reply text is capped at 4000 chars, and `<`/`>` are stripped from utterances.
+
+**Verified live (2026-10-01):**
+- A stdlib Python server works as a channel. Claude Code probes `server/discover` (protocol 2026-07-28); answering -32601 makes it fall back to `initialize` 2025-11-25.
+- The confirm flow passed: "confirm walnut lantern" deleted a test file.
+
+**Commits:** 0a983dc, 807e6f2, 5866265, 8735486, 1dcf551
+
 ### 2026-10-01 — Docs unit D
 
 **Added**
