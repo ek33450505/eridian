@@ -72,6 +72,17 @@ class StopHookTest(HooksTestCase):
         finally:
             os.environ.pop("UNDERTONE_SPEAK", None)
 
+    def test_env_zero_disables_even_with_flag_file(self) -> None:
+        self._enable()
+        os.environ["UNDERTONE_SPEAK"] = "0"
+        try:
+            with mock.patch.object(speaker, "send", return_value=True) as send:
+                rc = hooks.stop_hook(json.dumps({"last_assistant_message": "All set."}))
+            self.assertEqual(rc, 0)
+            send.assert_not_called()
+        finally:
+            os.environ.pop("UNDERTONE_SPEAK", None)
+
     def test_daemon_down_still_returns_zero(self) -> None:
         self._enable()
         with mock.patch.object(speaker, "send", return_value=False):

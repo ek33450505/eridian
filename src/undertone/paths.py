@@ -27,6 +27,16 @@ def socket_path() -> Path:
     return home_dir() / "speaker.sock"
 
 
+def voice_socket_path() -> Path:
+    """Unix socket the `undertone attach` voice process listens on; channel servers connect to it."""
+    return home_dir() / "voice.sock"
+
+
+def channel_config_path() -> Path:
+    """MCP config `undertone session` writes and passes to `claude --mcp-config`."""
+    return home_dir() / "channel.mcp.json"
+
+
 def enabled_flag_path() -> Path:
     """Flag file whose mere existence means 'speak replies is on'."""
     return home_dir() / "enabled"

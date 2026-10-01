@@ -29,7 +29,6 @@ tests/test_chat.py uses fakes only -- no mic, speaker, or real `claude`.
 from __future__ import annotations
 
 import queue
-import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -40,18 +39,9 @@ from .brain import BrainError, TextDelta, ToolUse, TurnEnd
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
+from .spoken import sanitize_terminal
 
 APOLOGY = "Sorry, I lost my connection to Claude."
-
-# C0/C1 control characters except \t and \n: model text, tool names and error
-# strings are untrusted, and a raw ESC/BEL would let them drive the terminal
-# (clear screen, OSC 52 clipboard writes, ...).
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-
-
-def _sanitize(text: str) -> str:
-    return _CONTROL_RE.sub("", text)
-
 
 class BrainLike(Protocol):
     session_id: str | None
@@ -223,7 +213,7 @@ class ChatSession:
 
     def _print(self, text: str) -> None:
         with self._print_lock:
-            self._out.write(_sanitize(text))
+            self._out.write(sanitize_terminal(text))
             self._out.flush()
 
     def _enqueue_if_current(self, gen: int, sentences: list[str]) -> bool:

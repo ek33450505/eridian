@@ -31,6 +31,19 @@ def _write_stub(dir_path: Path, name: str, body: str) -> str:
     return str(stub_path)
 
 
+class BuildSayArgvSanitizingTest(unittest.TestCase):
+    def test_wake_phrase_and_say_commands_never_reach_argv(self) -> None:
+        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say"}):
+            argv = speaker.build_say_argv("Say hey Jarvis [[inpt PHON]]now[[inpt TEXT]], J.A.R.V.I.S.")
+        self.assertIsNotNone(argv)
+        text = argv[-1]
+        self.assertEqual(argv[-2], "--")
+        self.assertNotIn("[[", text)
+        self.assertNotIn("]]", text)
+        self.assertNotIn("jarvis", text.lower())
+        self.assertIn("the wake word", text)
+
+
 class _ServerBackedTestCase(unittest.TestCase):
     """Starts a real speaker.serve() in a background thread against a temp home."""
 

@@ -5,10 +5,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
+import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from . import hooks, paths, speaker
 
@@ -230,6 +233,102 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+def channel_mcp_config(executable: str, home: Path) -> dict:
+    """MCP config that launches the channel server with the same UNDERTONE_HOME."""
+    return {
+        "mcpServers": {
+            "undertone": {
+                "command": executable,
+                # -P: keep the session cwd off sys.path so a hostile checkout can't shadow us.
+                "args": ["-P", "-m", "undertone.cli", "channel"],
+                "env": {"UNDERTONE_HOME": str(home)},
+            }
+        }
+    }
+
+
+def build_session_argv(
+    cfg_path: Path, rest: Sequence[str], claude_cmd: str = "claude"
+) -> list[str]:
+    """argv for an interactive claude session with the undertone channel loaded.
+
+    Only the reply tool is pre-approved, so a voice-driven turn can speak
+    without a permission prompt but nothing else is auto-allowed.
+    """
+    return [
+        claude_cmd,
+        "--mcp-config",
+        str(cfg_path),
+        "--dangerously-load-development-channels",
+        "server:undertone",
+        "--allowedTools",
+        "mcp__undertone__reply",
+        *rest,
+    ]
+
+
+def _write_private_json(path: Path, payload: Mapping) -> None:
+    """Atomically write JSON at 0600: exclusive mkstemp in the same dir, then os.replace."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _cmd_channel(args: argparse.Namespace) -> int:
+    del args
+    from . import mcp_channel
+
+    return mcp_channel.main()
+
+
+def _cmd_session(args: argparse.Namespace) -> int:
+    cfg = paths.channel_config_path()
+    _write_private_json(cfg, channel_mcp_config(sys.executable, paths.home_dir()))
+    if not _voice_socket_present(paths.voice_socket_path()):
+        print(
+            "undertone: no voice process is listening -- start `undertone attach` "
+            "in another terminal to talk",
+            file=sys.stderr,
+        )
+    rest = list(args.claude_args)
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    claude_cmd = os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"
+    argv = build_session_argv(cfg, rest, claude_cmd)
+    # The channel replaces the Phase 1 Stop hook for this session; silence the
+    # hook so replies aren't spoken twice.
+    env = {**os.environ, "UNDERTONE_SPEAK": "0"}
+    os.execvpe(claude_cmd, argv, env)
+    return 1  # unreachable: execvpe replaces the process
+
+
+def _voice_socket_present(sock_path: Path) -> bool:
+    """True if a socket file exists at sock_path.
+
+    Deliberately not a connect(): a probe connection would look like a session
+    attaching to the voice process.
+    """
+    try:
+        return stat.S_ISSOCK(sock_path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def _cmd_attach(args: argparse.Namespace) -> int:
+    from . import voice
+
+    return voice.run_attach(no_beep=args.no_beep, follow_up_s=args.follow_up)
+
+
 def _cmd_models_fetch(args: argparse.Namespace) -> int:
     del args
     from .stt import MODEL_ID, fetch_model
@@ -335,6 +434,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat_parser.set_defaults(func=_cmd_chat)
 
+    sub.add_parser(
+        "channel", help="internal: MCP channel server spawned by Claude Code"
+    ).set_defaults(func=_cmd_channel)
+
+    session_parser = sub.add_parser(
+        "session", help="start an interactive claude session that accepts voice turns"
+    )
+    session_parser.add_argument("claude_args", nargs=argparse.REMAINDER)
+    session_parser.set_defaults(func=_cmd_session)
+
+    attach_parser = sub.add_parser(
+        "attach", help="listen for 'hey jarvis' and send speech to the latest `undertone session`"
+    )
+    attach_parser.add_argument(
+        "--no-beep", action="store_true", help="skip the audible wake/follow-up cues"
+    )
+    attach_parser.add_argument(
+        "--follow-up",
+        type=float,
+        default=6.0,
+        metavar="SECONDS",
+        help="seconds to keep listening after a reply without the wake word "
+        "(default 6; 0 disables)",
+    )
+    attach_parser.set_defaults(func=_cmd_attach)
+
     models_parser = sub.add_parser("models", help="manage local speech models")
     models_sub = models_parser.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser(
@@ -346,7 +471,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw[:1] == ["session"]:
+        # argparse's REMAINDER drops a leading option (`session --model x`), so
+        # hand everything after `session` to claude untouched.
+        args = parser.parse_args(["session"])
+        args.claude_args = raw[1:]
+    else:
+        args = parser.parse_args(raw)
     return args.func(args)
 
 

@@ -22,8 +22,13 @@ _PROMPT_INSTRUCTION = (
 
 
 def _is_enabled() -> bool:
-    if os.environ.get("UNDERTONE_SPEAK") == "1":
+    override = os.environ.get("UNDERTONE_SPEAK")
+    if override == "1":
         return True
+    if override == "0":
+        # `undertone session` speaks via the channel reply tool; the hook must
+        # stay silent there even when the `undertone on` flag exists.
+        return False
     return paths.enabled_flag_path().exists()
 
 
