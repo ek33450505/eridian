@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import subprocess
 import sys
 from typing import Sequence
 
@@ -51,6 +53,70 @@ def _cmd_status(args: argparse.Namespace) -> int:
     enabled = paths.enabled_flag_path().exists()
     print(f"daemon: {'up' if daemon_up else 'down'}")
     print(f"enabled: {'yes' if enabled else 'no'}")
+    return 0
+
+
+def _cmd_listen(args: argparse.Namespace) -> int:
+    # Imported lazily -- these pull in numpy/sounddevice/pymicro-wakeword/
+    # pysilero-vad/parakeet-mlx, which other commands (notably `hook stop`)
+    # must stay fast and dependency-light without.
+    import time
+
+    from . import audio
+    from .listener import Listener, ListenerEvent
+    from .stt import ModelNotCachedError, ParakeetSTT
+
+    try:
+        stt = ParakeetSTT()
+    except ModelNotCachedError as exc:
+        print(f"undertone: {exc}", file=sys.stderr)
+        return 1
+
+    from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures, Model
+    from pysilero_vad import SileroVoiceActivityDetector
+
+    vad = SileroVoiceActivityDetector()
+
+    def wake_factory():
+        mww = MicroWakeWord.from_builtin(Model.HEY_JARVIS)
+        feats = MicroWakeWordFeatures()
+
+        def detect(frame: bytes) -> bool:
+            for processed in feats.process_streaming(frame):
+                if mww.process_streaming(processed):
+                    return True
+            return False
+
+        return detect
+
+    def on_event(event: ListenerEvent) -> None:
+        if event.kind == "wake" and not args.no_beep:
+            subprocess.Popen(
+                ["afplay", "/System/Library/Sounds/Tink.aiff"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        print(json.dumps(dataclasses.asdict(event)), flush=True)
+
+    listener = Listener(
+        wake_factory=wake_factory,
+        vad=lambda chunk: vad(chunk),
+        stt=stt,
+        clock=time.monotonic,
+        on_event=on_event,
+        vad_reset=vad.reset,
+    )
+    listener.run(audio.frame_source())
+    return 0
+
+
+def _cmd_models_fetch(args: argparse.Namespace) -> int:
+    del args
+    from .stt import MODEL_ID, fetch_model
+
+    print(f"undertone: fetching {MODEL_ID} (contacts the Hugging Face Hub)...")
+    fetch_model()
+    print("undertone: model cached")
     return 0
 
 
@@ -121,6 +187,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "hooks-snippet", help="print the settings.json hooks block to register undertone"
     ).set_defaults(func=_cmd_hooks_snippet)
+
+    listen_parser = sub.add_parser(
+        "listen", help="mic -> wake word -> VAD -> STT; prints one JSON event per line"
+    )
+    listen_parser.add_argument(
+        "--no-beep", action="store_true", help="skip the audible wake-word beep"
+    )
+    listen_parser.set_defaults(func=_cmd_listen)
+
+    models_parser = sub.add_parser("models", help="manage local speech models")
+    models_sub = models_parser.add_subparsers(dest="models_command", required=True)
+    models_sub.add_parser(
+        "fetch", help="download the Parakeet STT model once (needs network)"
+    ).set_defaults(func=_cmd_models_fetch)
 
     return parser
 
