@@ -56,7 +56,9 @@ class ListenerConfig:
 class ListenerEvent:
     """One emitted event. `kind` selects which other fields are populated."""
 
-    kind: str  # "wake" | "utterance" | "wake_no_speech" | "dropped_empty"
+    # "wake" | "follow_up" | "utterance" | "wake_no_speech" | "dropped_empty"
+    # ("follow_up" = a turn opened by listen_now, with no wake word)
+    kind: str
     text: str | None = None
     audio_s: float | None = None
     stt_ms: float | None = None
@@ -101,6 +103,22 @@ class Listener:
         self._speech_started = False
         self._t_wake = 0.0
         self._last_voice = 0.0
+        self._no_speech_timeout_s = self._config.no_speech_timeout_s
+
+    @property
+    def state(self) -> str:
+        """"IDLE" or "LISTENING" (read-only)."""
+        return self._state
+
+    def listen_now(self, no_speech_timeout_s: float | None = None) -> None:
+        """Enter LISTENING without a wake word (the follow-up window).
+
+        `no_speech_timeout_s` overrides the configured timeout for this turn
+        only. No-op if a turn is already in progress.
+        """
+        if self._state == "LISTENING":
+            return
+        self._start_turn("follow_up", no_speech_timeout_s)
 
     def process_frame(self, frame: bytes) -> None:
         """Feed one chunk of raw audio bytes; may call `vad` zero or several
@@ -117,9 +135,14 @@ class Listener:
 
     def _process_idle(self, frame: bytes) -> None:
         if self._wake(frame):
-            self._start_turn()
+            self._start_turn("wake")
 
-    def _start_turn(self) -> None:
+    def _start_turn(self, kind: str, no_speech_timeout_s: float | None = None) -> None:
+        self._no_speech_timeout_s = (
+            self._config.no_speech_timeout_s
+            if no_speech_timeout_s is None
+            else no_speech_timeout_s
+        )
         self._state = "LISTENING"
         self._utterance = bytearray()
         self._vad_buf = bytearray()
@@ -128,7 +151,7 @@ class Listener:
         self._last_voice = self._t_wake
         if self._vad_reset is not None:
             self._vad_reset()
-        self._emit(ListenerEvent(kind="wake"))
+        self._emit(ListenerEvent(kind=kind))
 
     def _process_listening(self, frame: bytes) -> None:
         cfg = self._config
@@ -145,7 +168,7 @@ class Listener:
                 self._last_voice = now
 
         now = self._clock()
-        if not self._speech_started and now - self._t_wake >= cfg.no_speech_timeout_s:
+        if not self._speech_started and now - self._t_wake >= self._no_speech_timeout_s:
             self._end_turn_no_speech()
             return
 

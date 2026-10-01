@@ -201,6 +201,31 @@ class SlowClientTest(_ServerBackedTestCase):
         self._assert_daemon_responsive()
 
 
+class VoiceSelectionTest(unittest.TestCase):
+    """Pure argv tests for build_say_argv -- `say` is never run."""
+
+    def _argv(self, voice: str | None) -> list[str] | None:
+        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say-stub"}, clear=False):
+            if voice is None:
+                os.environ.pop("UNDERTONE_VOICE", None)
+            else:
+                os.environ["UNDERTONE_VOICE"] = voice
+            return speaker.build_say_argv("hello")
+
+    def test_default_voice_is_evan_enhanced(self) -> None:
+        self.assertEqual(
+            self._argv(None), ["say-stub", "-v", "Evan (Enhanced)", "--", "hello"]
+        )
+
+    def test_env_override_selects_voice(self) -> None:
+        self.assertEqual(
+            self._argv("Zoe (Premium)"), ["say-stub", "-v", "Zoe (Premium)", "--", "hello"]
+        )
+
+    def test_empty_voice_omits_v_flag(self) -> None:
+        self.assertEqual(self._argv(""), ["say-stub", "--", "hello"])
+
+
 class StaleSocketPathTest(unittest.TestCase):
     """serve() must never delete a path it doesn't own. No server runs here."""
 

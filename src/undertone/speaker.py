@@ -74,26 +74,34 @@ def _log_error(context: str, exc: BaseException) -> None:
         pass  # logging must never crash the daemon either
 
 
-def _say(text: str) -> None:
-    global _current_process
-    _stop_current()
+def build_say_argv(text: str) -> list[str] | None:
+    """NUL-strip text; return None if empty; else [say_cmd, (-v voice), "--", text]."""
     # subprocess.Popen raises ValueError on an embedded NUL byte -- strip it
     # rather than letting one malformed "say" bring down the whole daemon.
     text = text.replace("\x00", "")
     if not text:
-        return
+        return None
     say_cmd = os.environ.get("UNDERTONE_SAY_CMD", "say")
-    voice = os.environ.get("UNDERTONE_VOICE", "Zoe (Premium)")
+    voice = os.environ.get("UNDERTONE_VOICE", "Evan (Enhanced)")
     cmd = [say_cmd]
     if voice:
         cmd += ["-v", voice]
     # "--" stops `say` (and any well-behaved stub) from parsing `text` as
     # flags -- without it, a reply containing e.g. "-o/path/to/overwrite"
     # is argv flag injection into the TTS command. This is the ONE place
-    # that builds the say argv; cli.py only ever sends {"op": "say", ...}
-    # over the socket, it never shells out itself.
+    # that builds the say argv; both the daemon (_say) and player.py's
+    # SpeechQueue use it, and cli.py never shells out itself.
     cmd += ["--", text]
-    _current_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return cmd
+
+
+def _say(text: str) -> None:
+    global _current_process
+    _stop_current()
+    argv = build_say_argv(text)
+    if argv is None:
+        return
+    _current_process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _stop_current() -> None:

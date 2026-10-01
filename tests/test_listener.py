@@ -306,5 +306,77 @@ class ListenerConfigOverrideTest(unittest.TestCase):
         self.assertEqual([e.kind for e in events], ["wake", "wake_no_speech"])
 
 
+class ListenerListenNowTest(unittest.TestCase):
+    def _setup(self, vad_script, stt=lambda audio: "unused", wake_on=frozenset()):
+        clock = _FakeClock(0.0)
+        events: list = []
+        listener = _make_listener(
+            _CountingWakeFactory(triggers_on_call=set(wake_on)),
+            _ScriptedVad(vad_script),
+            stt,
+            clock,
+            events,
+        )
+        return listener, clock, events
+
+    def test_enters_listening_and_emits_follow_up_not_wake(self) -> None:
+        listener, _, events = self._setup([0.0])
+        self.assertEqual(listener.state, "IDLE")
+        listener.listen_now()
+        self.assertEqual(listener.state, "LISTENING")
+        self.assertEqual([e.kind for e in events], ["follow_up"])
+
+    def test_custom_timeout_is_honored_not_default(self) -> None:
+        listener, clock, events = self._setup([0.0])
+        listener.listen_now(no_speech_timeout_s=1.0)
+        clock.now = 0.9
+        listener.process_frame(_chunk(1))
+        self.assertEqual(listener.state, "LISTENING")
+        clock.now = 1.1  # default is 4.0
+        listener.process_frame(_chunk(1))
+        self.assertEqual([e.kind for e in events], ["follow_up", "wake_no_speech"])
+        self.assertEqual(listener.state, "IDLE")
+
+    def test_next_wake_turn_uses_default_timeout(self) -> None:
+        listener, clock, events = self._setup([0.0], wake_on={0})
+        listener.listen_now(no_speech_timeout_s=1.0)
+        clock.now = 1.1
+        listener.process_frame(_chunk(1))  # follow-up times out
+        clock.now = 2.0
+        listener.process_frame(_chunk(0))  # wake
+        clock.now = 3.5  # 1.5 s into the wake turn: past 1.0, short of 4.0
+        listener.process_frame(_chunk(1))
+        self.assertEqual(listener.state, "LISTENING")
+        clock.now = 6.1
+        listener.process_frame(_chunk(1))
+        self.assertEqual(
+            [e.kind for e in events],
+            ["follow_up", "wake_no_speech", "wake", "wake_no_speech"],
+        )
+
+    def test_is_a_noop_while_already_listening(self) -> None:
+        listener, clock, events = self._setup([0.0])
+        listener.listen_now(no_speech_timeout_s=1.0)
+        clock.now = 0.5
+        listener.listen_now(no_speech_timeout_s=100.0)  # must not extend or re-emit
+        self.assertEqual([e.kind for e in events], ["follow_up"])
+        clock.now = 1.1
+        listener.process_frame(_chunk(1))
+        self.assertEqual(events[-1].kind, "wake_no_speech")
+
+    def test_utterance_in_follow_up_window_is_transcribed(self) -> None:
+        listener, clock, events = self._setup(
+            [1.0, 0.0], stt=lambda audio: "Hey Jarvis, and the next one?"
+        )
+        listener.listen_now()
+        clock.now = 0.2
+        listener.process_frame(_chunk(1))  # speech
+        clock.now = 0.95
+        listener.process_frame(_chunk(2))  # silence -> end of turn
+        self.assertEqual([e.kind for e in events], ["follow_up", "utterance"])
+        self.assertEqual(events[-1].text, "and the next one?")
+        self.assertEqual(listener.state, "IDLE")
+
+
 if __name__ == "__main__":
     unittest.main()
