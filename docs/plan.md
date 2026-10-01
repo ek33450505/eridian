@@ -1,4 +1,4 @@
-# hey-claude — research + plan
+# undertone — research + plan
 
 > **Date:** 2026-09-30 · **Status:** PLAN (nothing built) · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
 > **Prior art:** `claude-agent-team/research/v8-phase-0-tauri-architecture-decision.md:65` (push-to-talk Voice MVP, never built)
@@ -21,7 +21,7 @@ Scope note: the *text* of each turn still goes to Anthropic — that's Claude. "
    - **No wake word** (issue #485 OPEN) and **no talk-over barge-in** (#211, #312 OPEN). Barge-in today = key / media key / control command.
    - End-of-turn = WebRTC VAD with `VOICEMODE_SILENCE_THRESHOLD` default **3.0 s** (sluggish).
    - Its loop is *Claude-driven* (Claude calls the `converse` MCP tool to speak-then-listen). The control socket binds **only while speaking**, so a wake word can stop playback but cannot start a conversation from idle.
-3. **"Hey Jarvis" is free; bare "Jarvis" is not.** `pymicro-wakeword` and `openWakeWord` both ship a pretrained **"hey jarvis"**. The only off-the-shelf bare "jarvis" is Porcupine (`jarvis_mac.ppn`), which **requires a Picovoice Console AccessKey** → violates "no API keys". Bare "jarvis" = train a custom model. **Superseded by §7.2: Ed chose "hey claude" (custom-trained).**
+3. **"Hey Jarvis" is free; bare "Jarvis" is not.** `pymicro-wakeword` and `openWakeWord` both ship a pretrained **"hey jarvis"**. The only off-the-shelf bare "jarvis" is Porcupine (`jarvis_mac.ppn`), which **requires a Picovoice Console AccessKey** → violates "no API keys". Bare "jarvis" = train a custom model. **Ed first chose "hey claude", then switched to "hey jarvis" (§7.2): it's pretrained, needs no training, and doesn't depend on which model is behind it.**
 4. **Barge-in without headphones needs echo cancellation with a reference signal** — the canceller must see the audio being played. So TTS must be **rendered and played by our own process**, not fire-and-forget `say`.
 5. **Claude Code already exposes the hooks both paths need** (all VERIFIED in official docs):
    - Stop hook payload carries `last_assistant_message` (full reply text) and `stop_hook_active`; hooks support `"async": true` so playback never blocks the session.
@@ -33,8 +33,8 @@ Scope note: the *text* of each turn still goes to Anthropic — that's Claude. "
 
 | Layer | Pick | Fallback | License | Maintained | Key gotcha |
 |---|---|---|---|---|---|
-| Wake word | **openWakeWord + custom-trained `hey_claude` model** (see §7.2) | **pymicro-wakeword** 2.5.0 built-in `HEY_JARVIS` as the dev placeholder until the model exists | Apache-2.0 code (oWW pretrained models: **CC BY-NC-SA 4.0**, fine for personal use) | oWW last release v0.6.0 (2024-02), pushed 2025-12-30; pymicro pushed 2026-09-17 | No public "hey claude" model exists (checked 2026-09-30). oWW is slow-moving → pin Python 3.12 via `uv`. pymicro wheel is `macosx_15_0_universal2`; 16 kHz mono, 10 ms frames |
-| VAD / end-of-turn | **Silero VAD** | WebRTC VAD | MIT | pushed 2026-09-29 | Skip **TEN VAD** — license `NOASSERTION` (custom terms) |
+| Wake word | **pymicro-wakeword** 2.5.0, built-in `HEY_JARVIS` (see §7.2) | openWakeWord `hey_jarvis`; any custom phrase via the optional `training/` image | Apache-2.0 (oWW pretrained models and anything trained with its data: **CC BY-NC-SA 4.0**, fine for personal use) | pymicro pushed 2026-09-17; oWW last release v0.6.0 (2024-02) | pymicro wheel is `macosx_15_0_universal2`; 16 kHz mono, 10 ms frames |
+| VAD / end-of-turn | **Silero VAD** | WebRTC VAD | MIT | pushed 2026-09-29 | Skip **TEN VAD** — license `NOASSERTION` (custom terms). Lead (unverified): pykeio `earshot` on PyPI ("fast & accurate VAD", v1.2.2, 2026-08-19) |
 | STT | **parakeet-mlx** (`parakeet-tdt-0.6b-v3`, `transcribe_stream`) | **whisper.cpp** 1.9.4 (`brew install whisper-cpp`, Metal, built-in Silero `--vad`) | Apache-2.0 / MIT | 2026-08-29 / 2026-09-28 | No latency numbers verified from primary sources → measure in Phase 0 |
 | STT (future) | Apple SpeechAnalyzer (macOS 26, on-device) | — | — | — | `yap` (CC0, `brew install yap`) does files + **system audio** only, not the mic → would need a small Swift helper |
 | TTS | **macOS `say`** + Zoe (Premium) (installed) → **Kokoro-82M** via mlx-audio (`--stream`) or kokoro-onnx (~300 MB / ~80 MB int8) | — | Kokoro weights Apache-2.0; mlx-audio/kokoro-onnx MIT | active | Kokoro must stay resident (cold CLI start is seconds). Piper: `rhasspy/piper` **archived**, successor `piper1-gpl` is **GPL-3.0** — not needed |
@@ -43,10 +43,10 @@ Scope note: the *text* of each turn still goes to Anthropic — that's Claude. "
 
 ## 4. Architecture — one shared core, two "brains"
 
-Build the audio pipeline **once** as a small resident daemon (`jarvisd`, Python via `uv`). Paths A and B are thin adapters.
+Build the audio pipeline **once** as a small resident daemon (`undertone serve`, Python via `uv`). Paths A and B are thin adapters.
 
 ```
- mic ──► [echo cancel*] ──► wake word ("hey claude") ──► Silero VAD ──► STT (parakeet-mlx)
+ mic ──► [echo cancel*] ──► wake word ("hey jarvis") ──► Silero VAD ──► STT (parakeet-mlx)
   ▲                              │ (also active during playback = barge-in)         │ text
   │                              ▼                                                  ▼
  speaker ◄── player ◄── TTS queue (sentence chunks) ◄─────────── BRAIN ADAPTER ◄────┘
@@ -55,22 +55,22 @@ Build the audio pipeline **once** as a small resident daemon (`jarvisd`, Python 
  * Phase 4
 ```
 
-State machine: `IDLE` (wake word only) → `LISTENING` (VAD, end-of-turn at ~0.7 s silence) → `THINKING` → `SPEAKING` (wake word stays live; later AEC + VAD for talk-over) → back to `IDLE`, with a short **follow-up window** (e.g. 6 s of VAD-armed listening after a reply) so back-and-forth doesn't need "hey claude" every turn.
+State machine: `IDLE` (wake word only) → `LISTENING` (VAD, end-of-turn at ~0.7 s silence) → `THINKING` → `SPEAKING` (wake word stays live; later AEC + VAD for talk-over) → back to `IDLE`, with a short **follow-up window** (e.g. 6 s of VAD-armed listening after a reply) so back-and-forth doesn't need "hey jarvis" every turn.
 
 ### Path A — voice in real Claude Code sessions
 
 | Direction | Mechanism | Status |
 |---|---|---|
-| Out (speak replies) | `Stop` hook, `async: true` → reads `last_assistant_message` → posts text to `jarvisd` over a unix socket (hook never plays audio itself) | VERIFIED primitives |
+| Out (speak replies) | `Stop` hook, `async: true` → reads `last_assistant_message` → posts text to `undertone` over a unix socket (hook never plays audio itself) | VERIFIED primitives |
 | Spoken summary | Opted-in sessions get an instruction (via `UserPromptSubmit` `additionalContext`) to end replies with `SPOKEN: <≤2 sentences, no code/paths>`; hook speaks that line, else falls back to stripping code blocks and speaking the first 2 sentences | Design inference |
-| In (voice → session) | Custom **Channel** MCP server: `jarvisd` transcript → channel event → running session | VERIFIED exists; research preview; availability on Ed's account UNTESTED |
-| Barge-in | `jarvisd` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs | Gap |
+| In (voice → session) | Custom **Channel** MCP server: `undertone` transcript → channel event → running session | VERIFIED exists; research preview; availability on Ed's account UNTESTED |
+| Barge-in | `undertone` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs | Gap |
 
 Must-haves: speak only for **opted-in sessions** (flag file per `session_id`, toggled by a `/jarvis` command) or every open session talks at once; skip when `stop_hook_active` is true (the CAST journal Stop hook blocks and causes a continuation turn).
 
 ### Path B — standalone voice REPL
 
-- `jarvisd` owns one persistent `claude -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose` process (or Python `claude-agent-sdk` `ClaudeSDKClient` for a documented `interrupt()`).
+- `undertone` owns one persistent `claude -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose` process (or Python `claude-agent-sdk` `ClaudeSDKClient` for a documented `interrupt()`).
 - Stream `text_delta` → sentence chunker → TTS, so the first sentence plays while the rest generates. Code blocks are not read aloud ("code's on screen").
 - Barge-in: stop playback + `interrupt()`.
 - Continuity: persist the session id; `--resume <id>` after restart, and Ed can open the same conversation in a terminal with `claude --resume <id>`.
@@ -103,21 +103,24 @@ Must-haves: speak only for **opted-in sessions** (flag file per `session_id`, to
 
 | Phase | Deliverable | Size | Exit criteria |
 |---|---|---|---|
-| **0. Spike** (throwaway, scratchpad) | Train `hey_claude` openWakeWord model (§7.2); measure its false accepts during 30 min of normal work (incl. a meeting/video where "Claude" is said) + CPU %; parakeet-mlx vs whisper.cpp on 10 recorded utterances; `say` vs Kokoro first audio; `claude -p` stream-json time to first token; **hello-world Channel** into a live session | 1 session | Numbers in this doc; Channels GO/NO-GO |
-| **1. Speak replies** (Path A out) | `jarvisd` speaker (unix socket + `say`) + async Stop hook + `/jarvis on|off` + `SPOKEN:` extraction | 1 session | Opted-in session speaks a ≤2-sentence summary; other sessions stay silent; no speech on `stop_hook_active` turns |
+| **0. Spike** (throwaway, scratchpad) | Measure `hey jarvis` (pymicro-wakeword) false accepts during 30 min of normal work (incl. a meeting/video) + CPU %; parakeet-mlx vs whisper.cpp on 10 recorded utterances; `say` vs Kokoro first audio; `claude -p` stream-json time to first token; **hello-world Channel** into a live session | 1 session | Numbers in this doc; Channels GO/NO-GO |
+| **1. Speak replies** (Path A out) | `undertone` speaker (unix socket + `say`) + async Stop hook + `/undertone on|off` + `SPOKEN:` extraction | 1 session | Opted-in session speaks a ≤2-sentence summary; other sessions stay silent; no speech on `stop_hook_active` turns |
 | **2. Listening core + Path B** | mic → wake → Silero VAD → STT → persistent `claude -p` → sentence-streamed TTS; wake-word barge-in; follow-up window; read-only tool policy | 1–2 sessions | 5-turn spoken conversation, hands-free, speech-end → first word ≤ 4 s |
-| **3. Path A in** | Channel MCP server fed by `jarvisd` | 1 session | "Hey Claude, run the tests" lands as a turn in a running session (only if Phase 0 = GO) |
-| **4. Polish** | Kokoro resident voice; livekit AEC talk-over barge-in (TTS rendered + played by `jarvisd` for the reference signal); optional custom verifier model if "hey claude" false-accepts | 1–2 sessions | Talking over a reply stops it without the wake word, speakers on, no self-trigger |
+| **3. Path A in** | Channel MCP server fed by `undertone` | 1 session | "Hey Jarvis, run the tests" lands as a turn in a running session (only if Phase 0 = GO) |
+| **4. Polish** | Kokoro resident voice; livekit AEC talk-over barge-in (TTS rendered + played by `undertone` for the reference signal); optional custom verifier model if "hey jarvis" false-accepts | 1–2 sessions | Talking over a reply stops it without the wake word, speakers on, no self-trigger |
+| **5. Offline brain (opt-in)** | `--offline`: Path B drives Ollama (`gpt-oss:20b`) directly through its streaming chat API instead of `claude -p`; same audio core, same sentence-streamed TTS | 1 session | A 5-turn spoken conversation with Wi-Fi off; README states the quality trade-off |
+| **D. Docs to flagship standard** (Ed, 2026-09-30) | README at the `claude-agent-team` bar, led by a **"Local-first by design (the point of this repo)"** section in the style of warden's "Safety model". It includes a data-flow table with three columns: stays on the Mac (mic audio, wake word, VAD, STT, TTS, all models), goes to Anthropic (the transcribed text of each turn, nothing else), never exists (API keys, cloud fallbacks — contrast VoiceMode's OpenAI defaults). Also: how to verify it yourself; a component and model license table (note: oWW-trained models carry **non-commercial** data terms); quick start; architecture diagram; status/roadmap; testing. Plus `docs/local-first.md`, `docs/architecture.md`, `docs/training.md`, `LICENSE`, `SECURITY.md` (mic access, local socket permissions), `CHANGELOG.md` | 1 session, `docs` agent; first pass after Phase 0 lands, then refreshed at every phase end | Every local-first claim is **demonstrable**: an offline test runs wake → VAD → STT → TTS in a `--network none` container, plus a documented `nettop`/`lsof -i` check that the daemon's only remote connection is Claude's |
 
 Ceremony: each phase is single-session → native plan mode + one implementer + `code-reviewer`; the Stop hook and anything under `scripts/` also gets `security` if it lands in CAST.
 
 ## 7. Decisions
 
-1. **Where it lives — DECIDED (Ed, 2026-09-30): new repo** → `~/Projects/personal/hey-claude` (private GitHub `ek33450505/hey-claude`; `jarvis` was taken by the unrelated JARVIS pa-agents repo). Plan moved here from `claude-agent-team/research/` on creation.
-2. **Wake phrase — DECIDED (Ed, 2026-09-30): "hey claude".** No pretrained model exists, so train one with openWakeWord's automated trainer. It uses **100% synthetic TTS clips** — no recordings of Ed, so no audio leaves the Mac. Routes: the documented Colab notebook ("<1 hour"; only the phrase text goes to Google) or run `automatic_model_training` locally in Docker (fully local, slower, Linux-oriented deps). Risk: "Claude" is said in normal speech (meetings, videos, conversations about Claude) → false accepts. Mitigation if Phase 0 shows it: openWakeWord's **custom verifier model**, a second-stage filter trained on a few local recordings of Ed's voice.
+1. **Where it lives and its name — DECIDED (Ed, 2026-09-30): new repo `undertone`** → `~/Projects/personal/undertone`, private GitHub `ek33450505/undertone`. It was created as `hey-claude` and renamed the same day, before any code landed. `jarvis` was taken by the unrelated JARVIS pa-agents repo, which Ed says to ignore as over-engineered. `earshot` and `sotto` were rejected because PyPI has active projects with those names in the same field. The plan moved here from `claude-agent-team/research/`.
+2. **Wake phrase — DECIDED (Ed, 2026-09-30): "hey jarvis".** pymicro-wakeword ships it pretrained (Apache-2.0), so **no training run is needed**, and the phrase doesn't depend on which model answers. An earlier choice, "hey claude", was dropped before training started. It had no public model and a high false-accept risk, since "Claude" comes up all the time at work. The `training/` Docker image stays as an **optional "bring your own wake phrase"** tool. It trains openWakeWord on 100% synthetic TTS clips, locally on CPU, with no recordings of the user. The negative features (17 GB) are at `~/Datasets/openwakeword/` and the work dir is `~/Datasets/undertone-training/`. A second-stage custom verifier model can be trained if false accepts show up.
 3. **VoiceMode — recommendation: skip.** It can't wake from idle and its defaults leak to OpenAI.
 4. **Path B tool policy — ADVISED: read-only, no spoken confirmation in v1.** Allow Read/Grep/Glob/WebSearch/WebFetch plus a short read-only Bash allowlist (`git status/log/diff`); deny everything else. Why not spoken confirmation: STT can mishear "yes", voice confirms get rubber-stamped, and CAST's confirm-pauses don't run in headless. Changes go through Path A, where the real session's guards run and the diff is on screen. Revisit after a week of use.
 5. **`/voice` — ADVISED: keep as a stopgap, turn it off when Phase 3 lands.** It only records while space is held (no ambient capture), and Anthropic already receives the transcript text. The raw audio (voiceprint, background) is the real difference. If "no audio off the Mac" is absolute rather than a build requirement, turn it off now.
+6. **Model behind it (the "brain") — DECIDED (Ed, 2026-09-30): Claude via Anthropic by default, for quality.** "I would prefer better quality. Offline off by default and we go through anthropic." Offline mode is an **opt-in** for Path B (`--offline`): Ollama `gpt-oss:20b` (already installed) driven directly, which makes the whole loop local and lets it work with Wi-Fi off. Path A can only go fully local through `ccr`, which is not recommended for agentic work. The brain adapter stays pluggable either way.
 
 ## 8. Sources
 
