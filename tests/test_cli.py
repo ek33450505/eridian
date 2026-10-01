@@ -197,7 +197,7 @@ class SessionHelpersTest(CliTestCase):
         st = cli.voice_guard_settings("/py", Path("/h o/me"), self.TOK)
         self.assertIs(st["disableAllHooks"], False)
         hooks = st["hooks"]
-        self.assertEqual(set(hooks), {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"})
+        self.assertEqual(set(hooks), {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop", "SubagentStart", "SubagentStop"})
         for event, entries in hooks.items():
             self.assertEqual(entries[0]["hooks"][0]["timeout"], 10 if event == "PreToolUse" else 30)
             self.assertEqual(entries[0]["hooks"][0]["type"], "command")
@@ -205,6 +205,12 @@ class SessionHelpersTest(CliTestCase):
         self.assertIn(self.TOK, shlex.split(stop))
         self.assertIn("stop", shlex.split(stop))
         self.assertNotIn("exit 2", stop)
+        for event in ("SubagentStart", "SubagentStop"):
+            self.assertNotIn("matcher", hooks[event][0])
+            argv = shlex.split(hooks[event][0]["hooks"][0]["command"])
+            self.assertIn(event.lower(), argv)
+            self.assertIn(self.TOK, argv)
+            self.assertNotIn("exit 2", hooks[event][0]["hooks"][0]["command"])
         self.assertEqual(hooks["PreToolUse"][0]["matcher"], "*")
         self.assertTrue(hooks["PreToolUse"][0]["hooks"][0]["command"].endswith("|| exit 2"))
         start = hooks["SessionStart"][0]["hooks"][0]["command"]
