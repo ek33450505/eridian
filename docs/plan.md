@@ -1,6 +1,6 @@
 # undertone — research + plan
 
-> **Date:** 2026-09-30, updated 2026-10-01 · **Status:** Phases 0, 1, 2a on `main` (PR #1) · Phase 2b (Path B: `undertone chat`) built + reviewed on `feature/phase2b-path-b`, live voice check pending · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
+> **Date:** 2026-09-30, updated 2026-10-01 · **Status:** Phases 0–3 complete (PR #4 merged) · Phase 1 retired on `feature/retire-stop-hook` · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
 > **Prior art:** `claude-agent-team/research/v8-phase-0-tauri-architecture-decision.md:65` (push-to-talk Voice MVP, never built)
 
 ## 1. Requirements (Ed, 2026-09-30)
@@ -43,7 +43,7 @@ Scope note: the *text* of each turn still goes to Anthropic — that's Claude. "
 
 ## 4. Architecture — one shared core, two "brains"
 
-Build the audio pipeline **once** as a small resident daemon (`undertone serve`, Python via `uv`). Paths A and B are thin adapters.
+Build the audio pipeline **once** as a small resident daemon (`undertone serve`, Python via `uv`). Paths A and B are thin adapters. *(As built: there is no shared daemon. Path B is `undertone chat`. Path A is `undertone attach` plus a Claude Code channel (`undertone session`). The Phase 1 `serve` daemon was retired on 2026-10-01.)*
 
 ```
  mic ──► [echo cancel*] ──► wake word ("hey jarvis") ──► Silero VAD ──► STT (parakeet-mlx)
@@ -57,17 +57,15 @@ Build the audio pipeline **once** as a small resident daemon (`undertone serve`,
 
 State machine: `IDLE` (wake word only) → `LISTENING` (VAD, end-of-turn at ~0.7 s silence) → `THINKING` → `SPEAKING` (wake word stays live; later AEC + VAD for talk-over) → back to `IDLE`, with a short **follow-up window** (e.g. 6 s of VAD-armed listening after a reply) so back-and-forth doesn't need "hey jarvis" every turn.
 
-### Path A — voice in real Claude Code sessions
+### Path A — voice in real Claude Code sessions (Phase 3)
 
 | Direction | Mechanism | Status |
 |---|---|---|
-| Out (speak replies) | `Stop` hook, `async: true` → reads `last_assistant_message` → posts text to `undertone` over a unix socket (hook never plays audio itself) | VERIFIED primitives |
-| Spoken summary | Opted-in sessions get an instruction (via `UserPromptSubmit` `additionalContext`) to end replies with `SPOKEN: <≤2 sentences, no code/paths>`; hook speaks that line, else falls back to stripping code blocks and speaking the first 2 sentences | Design inference |
-| In (voice → session) | Custom **Channel** MCP server: `undertone` transcript → channel event → running session | VERIFIED exists (research preview). **GO on Ed's account**, Phase 0 hello-world 2026-09-30. **Phase 3 (2026-10-01):** a stdlib Python stdio server works as a channel; verified live in Ed's interactive session. Claude Code first sends `server/discover` (protocol 2026-07-28); answering -32601 makes it fall back to `initialize` 2025-11-25, which a channel must use. In `claude -p`, dev-channel events are dropped, because the dev flag needs its interactive warning accepted. |
-| Out via the channel | A two-way channel's `reply` tool: Claude writes the spoken answer itself and can acknowledge early ("Running the tests now."). **Chosen to replace the Stop hook (Ed, 2026-10-01)** for voice sessions, retiring the hook after the live check. The probe showed Claude answers in text unless the instructions make `reply` mandatory. | Building |
-| Barge-in | `undertone` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs. Channel events queue while Claude is busy and arrive on the next turn | Gap (by design) |
-
-Must-haves: speak only for **opted-in sessions** (**as built in Phase 1:** `UNDERTONE_SPEAK=1 claude` per session, or `undertone on` for every session) or every open session talks at once; skip when `stop_hook_active` is true (the CAST journal Stop hook blocks and causes a continuation turn).
+| In (voice → session) | Custom **Channel** MCP server: `undertone attach` sends transcripts via `~/.undertone/voice.sock` → channel event → running session as `← undertone: <text>` | ✓ BUILT (2026-10-01): a stdlib Python stdio server works as a channel; verified live in Ed's interactive session. Claude Code first sends `server/discover` (protocol 2026-07-28); answering -32601 makes it fall back to `initialize` 2025-11-25, which a channel must use. In `claude -p`, dev-channel events are dropped, because the dev flag needs its interactive warning accepted. |
+| Out via the channel | Claude calls the `reply` tool with `kind` = `ack` (early: "Running the tests now."), `answer` (default), or `confirm` (ask for confirmation) | ✓ BUILT: confirmed live test showed `confirm walnut lantern` (deleted a file after spoken "yes"). |
+| Confirmation flow | User says wake word → "confirm <word1> <word2>" (uncommon nouns, fresh each time, one-shot per action). Wake word is stripped from transcript. | ✓ BUILT: soft control via Claude's instructions and choice of reply tool. |
+| Barge-in | `undertone attach` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs. Channel events queue while Claude is busy and arrive on the next turn | Gap (by design) |
+| Phase 1 (retired) | Stop hook + UserPromptSubmit hook for opted-in sessions — **removed 2026-10-01** | ✓ Retired, replaced by Phase 3 channel |
 
 ### Path B — standalone voice REPL
 
@@ -80,14 +78,14 @@ Must-haves: speak only for **opted-in sessions** (**as built in Phase 1:** `UNDE
 
 ### A vs B
 
-| | A: inside Claude Code | B: standalone REPL |
+| | A: inside Claude Code (Channel) | B: standalone REPL |
 |---|---|---|
 | Agent power | Full (your real session, tools, CAST) | Full CLI, but tools deliberately restricted |
-| Latency to first word | Reply must **finish** before the Stop hook fires | **Streams** — first sentence plays early |
+| Latency to first word | Streams via channel → runs immediately | **Streams** — first sentence plays early |
 | Barge-in | Stop playback only | Stop playback + cancel the turn |
-| Hands-free input | Depends on Channels (research preview) | Fully under our control |
-| Risk | Research-preview dependency | Headless bypasses CAST confirm-pauses |
-| Best for | "Read me what you did" while coding | Conversational Jarvis |
+| Hands-free input | Fully under our control via voice.sock | Fully under our control |
+| Risk | None (Channel is production in Claude Code) | Headless bypasses CAST confirm-pauses |
+| Best for | Power user: all tools, confirmable actions | Conversational Jarvis: safer restricted tools |
 
 ## 5. Latency budget (Phase 0 measurements, 2026-09-30, M4 Max)
 
@@ -110,15 +108,15 @@ Must-haves: speak only for **opted-in sessions** (**as built in Phase 1:** `UNDE
 
 ## 6. Phased plan
 
-| Phase | Deliverable | Size | Exit criteria |
-|---|---|---|---|
-| **0. Spike** (throwaway, scratchpad) | Measure `hey jarvis` (pymicro-wakeword) false accepts during 30 min of normal work (incl. a meeting/video) + CPU %; parakeet-mlx vs whisper.cpp on 10 recorded utterances; `say` vs Kokoro first audio; `claude -p` stream-json time to first token; **hello-world Channel** into a live session | 1 session | Numbers in this doc; Channels GO/NO-GO |
-| **1. Speak replies** (Path A out) | `undertone` speaker (unix socket + `say`) + async Stop hook + `/undertone on|off` + `SPOKEN:` extraction | 1 session | Opted-in session speaks a ≤2-sentence summary; other sessions stay silent; no speech on `stop_hook_active` turns |
-| **2. Listening core + Path B** | mic → wake → Silero VAD → STT → persistent `claude -p` → sentence-streamed TTS; wake-word barge-in; follow-up window; read-only tool policy | 1–2 sessions | 5-turn spoken conversation, hands-free, speech-end → first word ≤ 4 s |
-| **3. Path A in** | Channel MCP server fed by `undertone` | 1 session | "Hey Jarvis, run the tests" lands as a turn in a running session (only if Phase 0 = GO) |
-| **4. Polish** | Kokoro resident voice; livekit AEC talk-over barge-in (TTS rendered + played by `undertone` for the reference signal); optional custom verifier model if "hey jarvis" false-accepts | 1–2 sessions | Talking over a reply stops it without the wake word, speakers on, no self-trigger |
-| **5. Offline brain (opt-in)** | `--offline`: Path B drives Ollama (`gpt-oss:20b`) directly through its streaming chat API instead of `claude -p`; same audio core, same sentence-streamed TTS | 1 session | A 5-turn spoken conversation with Wi-Fi off; README states the quality trade-off |
-| **D. Docs to flagship standard** (Ed, 2026-09-30) | README at the `claude-agent-team` bar, led by a **"Local-first by design (the point of this repo)"** section in the style of warden's "Safety model". It includes a data-flow table with three columns: stays on the Mac (mic audio, wake word, VAD, STT, TTS, all models), goes to Anthropic (the transcribed text of each turn, nothing else), never exists (API keys, cloud fallbacks — contrast VoiceMode's OpenAI defaults). Also: how to verify it yourself; a component and model license table (note: oWW-trained models carry **non-commercial** data terms); quick start; architecture diagram; status/roadmap; testing. Plus `docs/local-first.md`, `docs/architecture.md`, `docs/training.md`, `LICENSE`, `SECURITY.md` (mic access, local socket permissions), `CHANGELOG.md` | 1 session, `docs` agent; first pass after Phase 0 lands, then refreshed at every phase end | Every local-first claim is **demonstrable**: an offline test runs wake → VAD → STT → TTS in a `--network none` container, plus a documented `nettop`/`lsof -i` check that the daemon's only remote connection is Claude's |
+| Phase | Deliverable | Size | Exit criteria | Status |
+|---|---|---|---|---|
+| **0. Spike** (throwaway, scratchpad) | Measure `hey jarvis` (pymicro-wakeword) false accepts during 30 min of normal work (incl. a meeting/video) + CPU %; parakeet-mlx vs whisper.cpp on 10 recorded utterances; `say` vs Kokoro first audio; `claude -p` stream-json time to first token; **hello-world Channel** into a live session | 1 session | Numbers in this doc; Channels GO/NO-GO | ✓ done |
+| **1. Speak replies** (Path A out) | `undertone` speaker (unix socket + `say`) + async Stop hook + `/undertone on|off` + `SPOKEN:` extraction | 1 session | Opted-in session speaks a ≤2-sentence summary; other sessions stay silent; no speech on `stop_hook_active` turns | ✓ retired (replaced by Phase 3) |
+| **2. Listening core + Path B** | mic → wake → Silero VAD → STT → persistent `claude -p` → sentence-streamed TTS; wake-word barge-in; follow-up window; read-only tool policy | 1–2 sessions | 5-turn spoken conversation, hands-free, speech-end → first word ≤ 4 s | ✓ done |
+| **3. Path A in** | Channel MCP server fed by `undertone attach` (voice.sock); Claude calls `reply` tool; confirmation flow | 1 session | "Hey Jarvis, run the tests" lands as a turn in a running session and gets a spoken reply | ✓ done (PR #4) |
+| **4. Polish** | Kokoro resident voice; livekit AEC talk-over barge-in (TTS rendered + played by `undertone` for the reference signal); optional custom verifier model if "hey jarvis" false-accepts | 1–2 sessions | Talking over a reply stops it without the wake word, speakers on, no self-trigger | planned |
+| **5. Offline brain (opt-in)** | `--offline`: Path B drives Ollama (`gpt-oss:20b`) directly through its streaming chat API instead of `claude -p`; same audio core, same sentence-streamed TTS | 1 session | A 5-turn spoken conversation with Wi-Fi off; README states the quality trade-off | planned |
+| **D. Docs to flagship standard** (Ed, 2026-09-30) | README at the `claude-agent-team` bar, led by a **"Local-first by design (the point of this repo)"** section in the style of warden's "Safety model". It includes a data-flow table with three columns: stays on the Mac (mic audio, wake word, VAD, STT, TTS, all models), goes to Anthropic (the transcribed text of each turn, nothing else), never exists (API keys, cloud fallbacks — contrast VoiceMode's OpenAI defaults). Also: how to verify it yourself; a component and model license table (note: oWW-trained models carry **non-commercial** data terms); quick start; architecture diagram; status/roadmap; testing. Plus `docs/local-first.md`, `docs/architecture.md`, `docs/training.md`, `LICENSE`, `SECURITY.md` (mic access, local socket permissions), `CHANGELOG.md` | 1 session, `docs` agent; first pass after Phase 0 lands, then refreshed at every phase end | Every local-first claim is **demonstrable**: an offline test runs wake → VAD → STT → TTS in a `--network none` container, plus a documented `nettop`/`lsof -i` check that the daemon's only remote connection is Claude's | ✓ done |
 
 Ceremony: each phase is single-session → native plan mode + one implementer + `code-reviewer`; the Stop hook and anything under `scripts/` also gets `security` if it lands in CAST.
 

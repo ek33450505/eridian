@@ -17,8 +17,8 @@ In normal operation, `stt.py` does `os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 The `fetch_model()` function temporarily lifts the offline flag ONLY for the one-time download; loading never contacts the Hub again.
 
-### 2. **The `claude` Child**
-The persistent `claude -p` process in `undertone chat` connects to api.anthropic.com. It authenticates however your `claude` already does; undertone adds no key of its own. Transcribed text and anything Claude reads from your files leave here.
+### 2. **The `claude` Child** (Path B) and **Claude Code Session** (Path A)
+In Path B, the persistent `claude -p` process in `undertone chat` connects to api.anthropic.com. In Path A, a running Claude Code session receives voice transcripts via the MCP channel. Both authenticate however your `claude` already does; undertone adds no key of its own. Transcribed text and anything Claude reads from your files leave here.
 
 ### 3. **Optional: `training/` Docker Image**
 The Docker image `training/Dockerfile` (optional — the default "hey jarvis" is pretrained):

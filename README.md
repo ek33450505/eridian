@@ -1,6 +1,6 @@
 # undertone
 
-Hands-free, local-first voice loop for Claude Code on macOS (Apple Silicon). Say "hey jarvis", ask, and hear Claude's reply spoken sentence by sentence while it streams. Say "hey jarvis" again mid-reply to cut it off. For 6 seconds after a reply you can ask a follow-up without the wake word.
+Hands-free, local-first voice loop for Claude Code on macOS (Apple Silicon). Say "hey jarvis" and ask: either into your running interactive Claude Code session (`undertone attach` + `undertone session`), or in a standalone voice conversation (`undertone chat`). You hear Claude's answer, and saying "hey jarvis" again mid-reply cuts it off. For 6 seconds after an answer you can ask a follow-up without the wake word.
 
 ## Local-first by design (the point of this repo)
 
@@ -12,7 +12,7 @@ Hands-free, local-first voice loop for Claude Code on macOS (Apple Silicon). Say
 
 ## What it is
 
-undertone lets you talk with Claude without typing: microphone → wake word → silence detection → speech-to-text → Claude → sentence splitting → text-to-speech. Everything except Claude itself runs on your Mac. There are two front ends: **(A)** spoken replies from a real Claude Code session (via a Stop hook), and **(B)** the standalone `undertone chat` voice REPL. This README covers both; architecture details are in [`docs/architecture.md`](docs/architecture.md).
+undertone lets you talk with Claude without typing: microphone → wake word → silence detection → speech-to-text → Claude → sentence splitting → text-to-speech. Everything except Claude itself runs on your Mac. There are two front ends: **(A)** voice into a running Claude Code session (via a **Channel** MCP server), using `undertone attach` + `undertone session`, and **(B)** the standalone `undertone chat` voice REPL. This README covers both; architecture details are in [`docs/architecture.md`](docs/architecture.md).
 
 ### One-time network actions (the only Hugging Face contact)
 
@@ -71,7 +71,24 @@ Run `chat` from a project directory, because Claude's file tools are confined to
 
 ## Usage
 
-### Voice conversation (Path B)
+### Voice into a running Claude Code session (Path A)
+
+**Terminal 1:** Run the voice input listener.
+```bash
+uv run undertone attach [--no-beep] [--follow-up SECONDS]
+```
+- `--follow-up SECONDS`: seconds to keep listening after a reply without the wake word (default 6; 0 disables)
+- `--no-beep`: skip the audible wake/follow-up cues
+- Say "hey jarvis", then your question. It lands in the session, and Claude's `reply` is spoken aloud. The follow-up window opens only after an answer, never after an acknowledgement or a confirmation request.
+
+**Terminal 2:** from **your project directory**, start an interactive Claude Code session wired to receive voice turns. Use the venv's executable, because `uv run` only works inside the undertone checkout:
+```bash
+~/Projects/personal/undertone/.venv/bin/undertone session [claude args ...]
+```
+
+This launches `claude --mcp-config ~/.undertone/channel.mcp.json --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`, accepting the dev-channel warning once per launch. Your voice input from Terminal 1 arrives as `← undertone: <text>`, and Claude can call the `reply` tool to speak answers.
+
+### Standalone voice conversation (Path B)
 
 `undertone chat [--no-beep] [--resume] [--follow-up SECONDS]`
 - `--follow-up SECONDS`: how long after a reply you can ask a follow-up without the wake word (default 6; 0 disables)
@@ -79,40 +96,26 @@ Run `chat` from a project directory, because Claude's file tools are confined to
 - `--no-beep`: no cue sounds (normally Tink on wake, and Pop when the follow-up window opens)
 - Ctrl-C to quit
 
-### Spoken replies in Claude Code sessions (Path A)
-
-```bash
-uv run undertone serve            # run the speaker daemon in the foreground
-uv run undertone on               # opt this machine in to speaking replies
-uv run undertone off              # opt out
-uv run undertone status           # daemon up? opted in?
-UNDERTONE_SPEAK=1 claude          # opt one session in
-uv run undertone hooks-snippet    # print the hook registration JSON
-```
-
-The hooks wire a `Stop` hook (speaks the reply) and a `UserPromptSubmit` hook (tells Claude to end each reply with `SPOKEN: …`, used verbatim when present; otherwise the reply is stripped of code, markdown, links, and the first couple of sentences are spoken). The daemon never speaks on `stop_hook_active` turns (hook-forced continuations). Path A's hooks only speak; they never act on your code.
-
 ### Utilities
 
 - `undertone listen`: mic → wake word → VAD → STT; prints one JSON event per line (debugging)
-- `undertone say "text"`: speak text through the daemon
-- `undertone stop`: stop current speech
 - `undertone models fetch`: download the STT model (one-time ~2.5 GB)
 
 ## Architecture
 
 ```
-Path B (undertone chat)
-  mic → wake word → VAD (0.7 s silence) → STT → brain (persistent claude -p)
-                                                   │ streamed text
-                                                   ▼
-  speaker ← say ← speech queue ← sentence chunker ─┘
+Path A (undertone attach + undertone session)
+  mic → wake word → VAD → STT → voice.sock → channel (mcp_channel.py) → Claude Code session
+                                                                              │ reply tool
+  speaker ← say ← sentence chunker ← voice.sock ← channel ◄───────────────────┘
 
-Path A (Claude Code session)
-  Claude Code → Stop hook → speaker daemon (unix socket) → say → speaker
+Path B (undertone chat)
+  mic → wake word → VAD → STT → brain (persistent claude -p)
+                                    │ streamed text
+  speaker ← say ← sentence chunker ◄┘
 ```
 
-The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" again stops speech and interrupts the turn (barge-in).
+The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" again stops the speech (barge-in). In `chat` it also interrupts Claude's turn. A channel can't interrupt a running turn, so in Path A your new question queues until Claude finishes.
 
 ### Pipeline details
 
@@ -133,9 +136,18 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 
 ### Modules
 
-`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `hooks.py`, `paths.py`, `cli.py`.
+`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `paths.py`, `cli.py`.
 
 ## Safety model for voice
+
+### Path A: voice into a Claude Code session
+
+Voice turns keep full session power but are unverified input. Before anything destructive, irreversible or outward-facing, Claude must send a `reply` tool call asking the user to speak the wake word, then "confirm <word1> <word2>" with two uncommon nouns. undertone strips the wake word from every transcript, so Claude receives and accepts "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. "Yes" counts as a refusal. Each confirmation covers one action and the phrase is never reused.
+
+- **Wake word never spoken:** `speaker.build_say_argv()` runs `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any utterance of "hey jarvis" or obfuscated forms with "the wake word". Undertone's instructions also tell Claude never to say it.
+- **Residual soft control:** confirmation is enforced by Claude's instructions, not the system. CAST hooks and all session tools are available; verification is the user's responsibility while at the terminal.
+
+### Path B: standalone `undertone chat`
 
 Headless `claude -p` bypasses Claude Code's interactive confirm-pauses, and the microphone is open. This is fail-closed by design:
 
@@ -145,9 +157,9 @@ Headless `claude -p` bypasses Claude Code's interactive confirm-pauses, and the 
 - **Terminal safety:** control characters are stripped from model output. `say` always gets `--` before the text (guards against argv flag injection).
 - **Hook isolation:** CAST/user hooks don't run in the voice child.
 
-### Why voice can't change your code
+### Why voice can't change your code (Path B only)
 
-Code changes belong in Path A (a real session with its guards, and the diff on screen), not in voice. undertone has no way to edit files, and its child process has no Write or Edit tools.
+Code changes belong in Path A (a real session with its full tools and guards), not in standalone voice. `undertone chat` has no Write or Edit tools.
 
 ## Components and licenses
 
@@ -171,11 +183,11 @@ Code changes belong in Path A (a real session with its guards, and the diff on s
 | Phase | What | State |
 |---|---|---|
 | **0** | measurement spike (latency, CPU, false-accept rate) | ✓ done |
-| **1** | spoken replies in real Claude Code sessions (Path A output) | ✓ done |
+| **1** | spoken replies in real Claude Code sessions via Stop hook | ✓ retired, replaced by Phase 3 |
 | **2a** | listening core: `undertone listen` prints JSON events, `undertone models fetch` | ✓ done |
-| **2b** | `undertone chat [--no-beep] [--resume] [--follow-up SECONDS]` (Path B, standalone voice REPL) | ✓ done |
+| **2b** | `undertone chat [--no-beep] [--resume] [--follow-up SECONDS]` (standalone voice REPL) | ✓ done |
 | **D** | documentation: this README, local-first, architecture, training, SECURITY, CHANGELOG, offline check | ✓ done (refreshed at each phase end) |
-| **3** | voice into *running* Claude Code sessions (Channel MCP server) | planned |
+| **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
 | **4** | Kokoro voice + talking over replies without wake word (echo cancellation via livekit AEC) | planned |
 | **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
 
@@ -183,19 +195,16 @@ For the full research and component justification: see [`docs/plan.md`](docs/pla
 
 ## Testing
 
-169 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
+201 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
 
 Plus `bash scripts/verify-offline.sh` for the offline pipeline check (see "Verify it yourself" above).
 
-Known flake: two speaker-daemon tests with a 0.5 s ping timeout under heavy CPU load.
-
 ## Environment variables
 
-- `UNDERTONE_HOME` (default `~/.undertone`) — state directory for daemon socket and workspace
+- `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Samantha"`); empty string uses system voice
 - `UNDERTONE_SAY_CMD` (tests only) — override `say` with a stub
 - `UNDERTONE_CLAUDE_CMD` (tests only) — the binary the safety flags are applied to; `system/init` checks that it actually advertises the restricted tool set, so a wrapper that drops the flags is caught
-- `UNDERTONE_SPEAK=1` (per-session) — opt a single Claude Code session into speaking replies
 
 ## Documentation
 

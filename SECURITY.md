@@ -58,31 +58,37 @@ The start-up header prints the effective working directory and, when it substitu
 
 **Threat:** Claude's reply may contain control characters that, when printed to a terminal, could execute terminal sequences, switch color modes, or hide text.
 
-**Mitigation:** `chat.py` strips C0 (0x00–0x1F) and C1 (0x80–0x9F) control characters from all model output before printing, with the exception of newline (`\n`, 0x0A) and tab (`\t`, 0x09). See `chat.py` `_sanitize()`, which is applied to everything `ChatSession` prints.
+**Mitigation:** `chat.py` strips C0 (0x00–0x1F) and C1 (0x80–0x9F) control characters from all model output before printing, with the exception of newline (`\n`, 0x0A) and tab (`\t`, 0x09). See `spoken.sanitize_terminal()`, which `chat.py` and `voice.py` apply to everything they print.
 
-### 6. Local Speaker Socket (`speaker.py`, Path A only)
+### 6. Local Voice Socket (`voice.py`)
 
-**Threat:** The speaker daemon listens on a Unix domain socket. If the socket is world-writable or in a shared directory, any process could send commands to the speaker.
-
-**Mitigations:**
-- The socket is created at `~/.undertone/speaker.sock`, owned by the user, with mode 0600 inside a mode 0700 parent directory (`~/.undertone`).
-- The daemon refuses to start if a non-socket (e.g., a regular file) already exists at the socket path.
-- A stale socket is unlinked only after a failed ping attempt, reducing but not eliminating a small TOCTOU window.
-- Each connection has a 1-second overall deadline (guards against slow-loris attacks) and a 64 KB message cap.
-- Malformed JSON in a message receives an error response; a crash in one connection never kills the daemon (see `speaker.py` `_handle_connection()` and `serve()`).
-
-**Known low-severity TOCTOU windows:** bind-then-chmod and mkdir-then-chmod operations occur in sequence; an attacker with write access to `~/.undertone` (0700, so in practice the same user) could create a symlink between these steps. This is accepted for a single-user tool.
-
-### 7. Claude Code Hooks (Path A only)
-
-**Threat:** The `Stop` and `UserPromptSubmit` hooks run on every turn of every Claude Code session they are registered in. A hook that blocked or spoke everywhere would be disruptive.
+**Threat:** The `attach` process listens on a Unix domain socket for incoming voice turns. If the socket is world-writable or in a shared directory, any process could send commands.
 
 **Mitigations:**
-- The Stop hook is registered as async, so it never blocks the session. It fails silently if the speaker daemon is unreachable.
-- It speaks only for opted-in sessions (`UNDERTONE_SPEAK=1`, or every session after `undertone on`); otherwise it exits without speaking.
-- It never speaks on `stop_hook_active` turns (hook-forced continuations).
-- Hooks only send text to the local speaker daemon; they never act on your code.
-- User hooks remain isolated from the `undertone chat` voice child (see control #2; the child does not load CAST/user MCP servers or hooks).
+- The socket is created at `~/.undertone/voice.sock`, owned by the user, with mode 0600 inside a mode 0700 parent directory (`~/.undertone`).
+- `attach` refuses to start if something other than a socket sits at the path, or if another `attach` is already answering. A stale socket is unlinked only when nothing answers.
+- The socket is bound under `umask 0o177` and then chmod'd 0600, so it is never wider than owner-only.
+- Messages are newline-delimited JSON. A line over 64 KB drops that connection, and malformed or unknown lines are ignored. At most 16 connections are kept, and extras are closed.
+- Each connection has its own reader thread, so a failure in one never stops the mic loop or other connections.
+- "Latest session wins": a newer channel's `hello` sends `{"type":"detached"}` to the older one and closes it.
+
+### 7. Claude Code Channel MCP Server (`mcp_channel.py`)
+
+**Threat:** The channel is spawned as a stdio MCP server by Claude Code and receives voice transcripts from `undertone attach`. It is bidirectional: Claude can also call the `reply` tool to speak answers. All input is unverified spoken text.
+
+**Mitigations:**
+- **No permission relay:** the channel does not forward tool approvals to the voice process. Claude decides which tools to call in its running session, using all available context and its instructions.
+- **No module shadowing:** Claude Code starts the channel as `python -P -m undertone.cli channel`. `-P` keeps the session's working directory off `sys.path`, so a hostile checkout can't shadow undertone's modules.
+- **Input/output limits:** `reply` text over 4000 characters is rejected. Inbound utterances have `<` and `>` stripped before they are sent to the session, so a transcript can't close or forge the `<channel>` tag it arrives in.
+- **stdout is JSON-RPC only:** logs go to a 0600 `channel.log` and never include transcripts or reply text.
+- **No follow-up window after confirm:** `attach` opens the no-wake-word follow-up window only after an `answer` reply. After an `ack` or a `confirm`, the user must say the wake word again, so ambient audio can't answer a confirmation question.
+- **Confirmation is soft control:** it is enforced by Claude's instructions and choice of the reply tool, not the system. The session's full tools and CAST hooks remain available.
+
+### Undertone Never Speaks Its Own Wake Word
+
+**Threat:** If undertone speaks the phrase "hey jarvis" in a reply, it could trigger the wake word detector and capture unintended speech.
+
+**Mitigation:** `speaker.build_say_argv()` calls `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any text matching "hey jarvis", "jarvis", or obfuscated forms with "the wake word". undertone's instructions also explicitly tell Claude never to speak the wake phrase.
 
 ### 8. Local Files
 

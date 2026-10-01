@@ -1,8 +1,9 @@
 """An in-process, strictly sequential queue of speech.
 
-The speaker daemon's `say` op interrupts current speech, so it can't queue
-sentences. SpeechQueue plays them one after another via the same say argv
-(speaker.build_say_argv) and offers stop() for barge-in.
+SpeechQueue plays sentences one after another, so the first sentence can
+start while the rest of a reply is still streaming. Each `say` argv comes from
+speaker.build_say_argv, the single sanitizing argv builder, and stop() is
+there for barge-in.
 
 Test seams: UNDERTONE_SAY_CMD / UNDERTONE_VOICE (via build_say_argv); tests
 must point UNDERTONE_SAY_CMD at a stub (see tests/test_player.py).

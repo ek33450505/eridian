@@ -22,11 +22,6 @@ def home_dir() -> Path:
     return path
 
 
-def socket_path() -> Path:
-    """Unix socket the speaker daemon listens on."""
-    return home_dir() / "speaker.sock"
-
-
 def voice_socket_path() -> Path:
     """Unix socket the `undertone attach` voice process listens on; channel servers connect to it."""
     return home_dir() / "voice.sock"
@@ -37,13 +32,8 @@ def channel_config_path() -> Path:
     return home_dir() / "channel.mcp.json"
 
 
-def enabled_flag_path() -> Path:
-    """Flag file whose mere existence means 'speak replies is on'."""
-    return home_dir() / "enabled"
-
-
 def log_dir() -> Path:
-    """Directory for hook/daemon logs, created if missing."""
+    """Directory for logs, created if missing."""
     path = home_dir() / "logs"
     path.mkdir(mode=HOME_MODE, parents=True, exist_ok=True)
     return path
