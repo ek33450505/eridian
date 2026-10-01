@@ -82,13 +82,42 @@ The start-up header prints the effective working directory and, when it substitu
 - **Input/output limits:** `reply` text over 4000 characters is rejected. Inbound utterances have `<` and `>` stripped before they are sent to the session, so a transcript can't close or forge the `<channel>` tag it arrives in.
 - **stdout is JSON-RPC only:** logs go to a 0600 `channel.log` and never include transcripts or reply text.
 - **No follow-up window after confirm:** `attach` opens the no-wake-word follow-up window only after an `answer` reply. After an `ack` or a `confirm`, the user must say the wake word again, so ambient audio can't answer a confirmation question.
-- **Confirmation is soft control:** it is enforced by Claude's instructions and choice of the reply tool, not the system. The session's full tools and CAST hooks remain available.
+- **Confirmation is now a hard control:** see "Voice-turn guard (`voice_guard.py`)" below.
 
 ### Undertone Never Speaks Its Own Wake Word
 
 **Threat:** If undertone speaks the phrase "hey jarvis" in a reply, it could trigger the wake word detector and capture unintended speech.
 
 **Mitigation:** `speaker.build_say_argv()` calls `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any text matching "hey jarvis", "jarvis", or obfuscated forms with "the wake word". undertone's instructions also explicitly tell Claude never to speak the wake phrase.
+
+### 7a. Voice-turn guard (`voice_guard.py`)
+
+**Threat:** Voice turns are unverified spoken input. A stray wake word or misheard phrase could trigger destructive or outward-facing actions (delete or overwrite files, commit or push, call an MCP tool that changes remote state).
+
+**Mechanism:**
+- **Hooks:** Four hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `PreToolUse`) are injected into the session via `--settings` inline JSON. Each runs `python -P -m undertone.voice_guard <event> --home <UNDERTONE_HOME> --session <token>`. Events are: `sessionstart`, `userpromptsubmit`, `stop`, `pretooluse`.
+- **Arming:** The channel (`mcp_channel.py`) refuses a voice turn in three cases: the session token is missing, the `SessionStart` hook hasn't armed state for this launch, or recording the turn failed. When refused, the channel speaks "Voice turns are off:" instead of delivering the turn. This fails safe: if hooks don't load, voice is refused rather than unguarded.
+- **Provenance:** Claude Code fires `UserPromptSubmit` for channel events. Its prompt is `<channel source="undertone" input="voice">…</channel>`, so a prompt containing `<channel` counts as a voice turn. A prompt starting with `<` that is not a channel event (an injected envelope such as a background-task notification) changes nothing. Any other non-empty prompt counts as typed. A voice turn stays gated until its `Stop`, even if the user types mid-turn; after that, a typed prompt ungates. If a voice turn is interrupted (Esc, no `Stop`), the session stays gated until a later turn completes.
+- **Gating:** During an active voice turn, gated tool calls require confirmation. Never gated: `Read Grep Glob LS WebSearch TodoWrite Task Agent AskUserQuestion ToolSearch Skill EnterPlanMode ExitPlanMode BashOutput TaskOutput mcp__undertone__reply`. `Bash` goes through a fail-closed allowlist (read commands, `cd` to plain relative paths, `find` with read-only predicates only, read-only git, test runners with restricted args); any command using shell expansion or special characters, a redirect other than to `/dev/null` or an fd dup, a heredoc, an env-var assignment or a non-ASCII character is gated, and so is every other tool.
+- **Confirm flow:** Claude's `reply` with `kind="confirm"` must contain `confirm <word1> <word2>`. Both words ≥3 letters, uncommon, different, not used before in the session. Otherwise the reply tool returns an error. The channel records the challenge; one attempt, valid 300 s. If the next voice message contains `confirm <word1> <word2>` (case and punctuation ignored), that creates a grant. Any other message cancels the challenge. On a successful confirm, gated calls are allowed for the rest of that turn (until `Stop`, the next voice message, a typed prompt, or 300 s).
+
+**Fail-closed:**
+- `pretooluse` errors exit 2, and the hook command ends in `|| exit 2`, so a missing or crashing interpreter blocks the call instead of allowing it.
+- `userpromptsubmit` errors on voice prompts exit 2, which drops that voice turn. Typed prompts are never blocked.
+- `pretooluse` returns `permissionDecision: "deny"` with a reason starting `undertone voice guard:`. Claude is told to ask with `kind="confirm"`. Allowing a call means exit 0 with no output, so the user's normal permission prompts still apply. The guard never auto-approves.
+- `pretooluse` timeout is 10 s. Claude Code lets a call through on timeout (documented limitation).
+
+**Residual risks (stated plainly):**
+- `WebSearch` is ungated, so a query could carry data out under prompt injection.
+- `Read`/`Grep`/`Glob` and `cat`/`grep` can read secrets in the working directory.
+- A grant covers the rest of the turn, not one specific command.
+- Test runners execute repo code (`conftest.py`, `Makefile`, `package.json` scripts, `build.rs`).
+- Git config programs (`core.fsmonitor`, `diff.external`) need a prior write to `.git/config`.
+- `Task`/`Agent` are ungated on the assumption that subagent tool calls pass through the same hook (not yet live-verified).
+- Your shell aliases and functions are trusted, because Claude Code sources your shell snapshot. They can change what an allowlisted name runs: on the development machine `ls` is `eza`, `cat` is `bat`, `find` runs bfs and `grep` runs ugrep. The allowlist was probed against those, and `find` takes only an allowlist of read-only predicates for that reason (bfs adds actions such as `-rm`).
+- Narrow timing cases: a voice event queued during a typed turn, and a background-task turn after a voice turn's `Stop` when you had typed. Both require you at the keyboard.
+
+**Live test status:** Live verification of the hard control with real speech is **PENDING**.
 
 ### 8. Local Files
 
@@ -97,6 +126,8 @@ The start-up header prints the effective working directory and, when it substitu
 **Mitigations:**
 - **Chat session state:** `~/.undertone/chat_session` (stores the current session ID) is written atomically, opened with mode 0600 (user-read/write only), and validated on load with UUID format checks.
 - **Brain logs:** `~/.undertone/logs/brain.log` is opened with O_NOFOLLOW (refusing symlinks) and mode 0600. Log rotation occurs at 1 MB. See `brain.py` `_open_log()`.
+- **Voice-turn session state:** `~/.undertone/sessions/<token>.json` (file 0600, directory 0700) stores per-launch state for the voice guard. Atomic writes, symlinks refused, lock file `<token>.lock`.
+- **Voice-turn guard log:** `~/.undertone/logs/guard.log` (0600) records decisions only, never command text or prompt text.
 - No user secrets or API keys are stored in these files; Claude Code's login token is used to authenticate (inherited from the user's session).
 
 ### 9. Network

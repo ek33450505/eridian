@@ -6,12 +6,13 @@ import argparse
 import dataclasses
 import json
 import os
+import secrets
+import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Sequence
 
 from . import paths
 
@@ -189,7 +190,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
-def channel_mcp_config(executable: str, home: Path) -> dict:
+def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
     """MCP config that launches the channel server with the same UNDERTONE_HOME."""
     return {
         "mcpServers": {
@@ -197,46 +198,75 @@ def channel_mcp_config(executable: str, home: Path) -> dict:
                 "command": executable,
                 # -P: keep the session cwd off sys.path so a hostile checkout can't shadow us.
                 "args": ["-P", "-m", "undertone.cli", "channel"],
-                "env": {"UNDERTONE_HOME": str(home)},
+                "env": {"UNDERTONE_HOME": str(home), "UNDERTONE_SESSION": token},
             }
         }
     }
 
 
+def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
+    """Inline `--settings` JSON that installs the voice guard's hooks for one session."""
+
+    def _hook_cmd(event: str) -> str:
+        parts = [
+            executable, "-P", "-m", "undertone.voice_guard", event,
+            "--home", str(home), "--session", token,
+        ]
+        return " ".join(shlex.quote(x) for x in parts)
+
+    return {
+        # --settings outranks project/local/user settings, so this forces hooks on.
+        "disableAllHooks": False,
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": _hook_cmd("sessionstart"), "timeout": 30}]}
+            ],
+            "UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": _hook_cmd("userpromptsubmit"), "timeout": 30}]}
+            ],
+            # No `|| exit 2`: a Stop hook exiting 2 forces Claude to keep going.
+            "Stop": [
+                {"hooks": [{"type": "command", "command": _hook_cmd("stop"), "timeout": 30}]}
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            # Only exit 2 blocks; a missing interpreter or crash (1/127) must block too.
+                            "command": _hook_cmd("pretooluse") + " || exit 2",
+                            # A timeout fails open; this path takes no lock, so it is fast.
+                            "timeout": 10,
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
 def build_session_argv(
-    cfg_path: Path, rest: Sequence[str], claude_cmd: str = "claude"
+    mcp_json: str, settings_json: str, rest: Sequence[str], claude_cmd: str = "claude"
 ) -> list[str]:
     """argv for an interactive claude session with the undertone channel loaded.
 
-    Only the reply tool is pre-approved, so a voice-driven turn can speak
-    without a permission prompt but nothing else is auto-allowed.
+    The reply tool is pre-approved, so a voice-driven turn can speak without a
+    permission prompt but nothing else is auto-allowed. The voice guard's hooks
+    are injected via --settings.
     """
     return [
         claude_cmd,
         "--mcp-config",
-        str(cfg_path),
+        mcp_json,
+        "--settings",
+        settings_json,
         "--dangerously-load-development-channels",
         "server:undertone",
         "--allowedTools",
         "mcp__undertone__reply",
         *rest,
     ]
-
-
-def _write_private_json(path: Path, payload: Mapping) -> None:
-    """Atomically write JSON at 0600: exclusive mkstemp in the same dir, then os.replace."""
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2)
-            fh.write("\n")
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
 
 
 def _cmd_channel(args: argparse.Namespace) -> int:
@@ -246,23 +276,39 @@ def _cmd_channel(args: argparse.Namespace) -> int:
     return mcp_channel.main()
 
 
+_REFUSED_SESSION_FLAGS = ("--settings", "--bare", "--safe-mode")
+_HOOK_DISABLING_ENV = ("CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE")
+
+
 def _cmd_session(args: argparse.Namespace) -> int:
-    cfg = paths.channel_config_path()
-    _write_private_json(cfg, channel_mcp_config(sys.executable, paths.home_dir()))
+    rest = list(args.claude_args)
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    for arg in rest:
+        if arg in _REFUSED_SESSION_FLAGS or arg.startswith("--settings="):
+            flag = arg.split("=", 1)[0]
+            print(
+                f"undertone: remove {flag}: undertone session sets the voice guard's "
+                "settings itself",
+                file=sys.stderr,
+            )
+            return 2
+    token = secrets.token_hex(16)
+    home = paths.home_dir()
+    mcp_json = json.dumps(channel_mcp_config(sys.executable, home, token))
+    settings_json = json.dumps(voice_guard_settings(sys.executable, home, token))
     if not _voice_socket_present(paths.voice_socket_path()):
         print(
             "undertone: no voice process is listening -- start `undertone attach` "
             "in another terminal to talk",
             file=sys.stderr,
         )
-    rest = list(args.claude_args)
-    if rest[:1] == ["--"]:
-        rest = rest[1:]
     claude_cmd = os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"
-    argv = build_session_argv(cfg, rest, claude_cmd)
-    # Replies reach the user through the channel's `reply` tool; claude inherits
-    # our environment unchanged.
-    os.execvpe(claude_cmd, argv, os.environ)
+    argv = build_session_argv(mcp_json, settings_json, rest, claude_cmd)
+    # Replies reach the user through the channel's `reply` tool.
+    # Scrub the env vars that --bare / --safe-mode set, since they may disable hooks.
+    env = {k: v for k, v in os.environ.items() if k not in _HOOK_DISABLING_ENV}
+    os.execvpe(claude_cmd, argv, env)
     return 1  # unreachable: execvpe replaces the process
 
 

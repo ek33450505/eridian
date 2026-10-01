@@ -4,13 +4,16 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import cli, paths
+from undertone import cli, paths, voice_guard
 
 
 class CliTestCase(unittest.TestCase):
@@ -150,14 +153,18 @@ class ChatWorkdirTest(unittest.TestCase):
 
 
 class SessionHelpersTest(CliTestCase):
+    TOK = "0123456789abcdef0123456789abcdef"
+
     def test_build_session_argv_exact(self) -> None:
-        argv = cli.build_session_argv(Path("/h/channel.mcp.json"), ["--model", "opus"])
+        argv = cli.build_session_argv("{mcp}", "{set}", ["--model", "opus"])
         self.assertEqual(
             argv,
             [
                 "claude",
                 "--mcp-config",
-                "/h/channel.mcp.json",
+                "{mcp}",
+                "--settings",
+                "{set}",
                 "--dangerously-load-development-channels",
                 "server:undertone",
                 "--allowedTools",
@@ -168,11 +175,11 @@ class SessionHelpersTest(CliTestCase):
         )
 
     def test_build_session_argv_custom_command(self) -> None:
-        argv = cli.build_session_argv(Path("/c.json"), [], claude_cmd="/x/claude2")
+        argv = cli.build_session_argv("{}", "{}", [], claude_cmd="/x/claude2")
         self.assertEqual(argv[0], "/x/claude2")
 
     def test_channel_mcp_config_shape(self) -> None:
-        cfg = cli.channel_mcp_config("/py", Path("/home/u"))
+        cfg = cli.channel_mcp_config("/py", Path("/home/u"), self.TOK)
         self.assertEqual(
             cfg,
             {
@@ -180,35 +187,97 @@ class SessionHelpersTest(CliTestCase):
                     "undertone": {
                         "command": "/py",
                         "args": ["-P", "-m", "undertone.cli", "channel"],
-                        "env": {"UNDERTONE_HOME": "/home/u"},
+                        "env": {"UNDERTONE_HOME": "/home/u", "UNDERTONE_SESSION": self.TOK},
                     }
                 }
             },
         )
 
-    def test_write_private_json_cleans_up_on_failure(self) -> None:
-        target = Path(self._tmp.name) / "x.json"
-        with self.assertRaises(TypeError):
-            cli._write_private_json(target, {"bad": object()})
-        self.assertEqual(list(Path(self._tmp.name).glob("x.json*")), [])
+    def test_voice_guard_settings_shape(self) -> None:
+        st = cli.voice_guard_settings("/py", Path("/h o/me"), self.TOK)
+        self.assertIs(st["disableAllHooks"], False)
+        hooks = st["hooks"]
+        self.assertEqual(set(hooks), {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"})
+        for event, entries in hooks.items():
+            self.assertEqual(entries[0]["hooks"][0]["timeout"], 10 if event == "PreToolUse" else 30)
+            self.assertEqual(entries[0]["hooks"][0]["type"], "command")
+        stop = hooks["Stop"][0]["hooks"][0]["command"]
+        self.assertIn(self.TOK, shlex.split(stop))
+        self.assertIn("stop", shlex.split(stop))
+        self.assertNotIn("exit 2", stop)
+        self.assertEqual(hooks["PreToolUse"][0]["matcher"], "*")
+        self.assertTrue(hooks["PreToolUse"][0]["hooks"][0]["command"].endswith("|| exit 2"))
+        start = hooks["SessionStart"][0]["hooks"][0]["command"]
+        self.assertEqual(
+            shlex.split(start),
+            ["/py", "-P", "-m", "undertone.voice_guard", "sessionstart",
+             "--home", "/h o/me", "--session", self.TOK],
+        )
 
-    def test_session_writes_0600_config_and_execs(self) -> None:
+    def test_session_execs_with_inline_configs(self) -> None:
         with mock.patch.object(cli.os, "execvpe") as execvpe, mock.patch.dict(
-            os.environ, {"UNDERTONE_CLAUDE_CMD": "fakeclaude"}
+            os.environ,
+            {
+                "UNDERTONE_CLAUDE_CMD": "fakeclaude",
+                "CLAUDE_CODE_SIMPLE": "1",
+                "CLAUDE_CODE_SAFE_MODE": "1",
+            },
         ):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 cli.main(["session", "--model", "opus"])
-        cfg = paths.channel_config_path()
-        self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
-        data = json.loads(cfg.read_text())
-        self.assertEqual(data["mcpServers"]["undertone"]["env"]["UNDERTONE_HOME"], self._tmp.name)
         cmd, argv, env = execvpe.call_args.args
         self.assertEqual(cmd, "fakeclaude")
+        mcp = json.loads(argv[argv.index("--mcp-config") + 1])
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        envcfg = mcp["mcpServers"]["undertone"]["env"]
+        tok = envcfg["UNDERTONE_SESSION"]
+        self.assertRegex(tok, voice_guard.TOKEN_RE)
+        self.assertEqual(envcfg["UNDERTONE_HOME"], self._tmp.name)
+        for entries in settings["hooks"].values():
+            self.assertIn(tok, shlex.split(entries[0]["hooks"][0]["command"]))
+        self.assertFalse((Path(self._tmp.name) / "channel.mcp.json").exists())
         self.assertEqual(argv[-2:], ["--model", "opus"])
-        self.assertIs(env, os.environ)
+        self.assertNotIn("CLAUDE_CODE_SIMPLE", env)
+        self.assertNotIn("CLAUDE_CODE_SAFE_MODE", env)
+        self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+        self.assertEqual(env["UNDERTONE_HOME"], self._tmp.name)
         self.assertNotIn("UNDERTONE_SPEAK", env)
         self.assertIn("undertone attach", err.getvalue())
+
+    def test_session_refuses_flags_that_defeat_the_guard(self) -> None:
+        for flags in (["--settings", "x"], ["--settings=x"], ["--bare"], ["--safe-mode"]):
+            with self.subTest(flags=flags), mock.patch.object(cli.os, "execvpe") as execvpe:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = cli.main(["session", *flags])
+                self.assertEqual(rc, 2)
+                execvpe.assert_not_called()
+                self.assertIn("remove " + flags[0].split("=")[0], err.getvalue())
+
+    def _pretooluse(self, executable: str, home: str, tok: str) -> subprocess.CompletedProcess:
+        cmd = cli.voice_guard_settings(executable, Path(home), tok)["hooks"]["PreToolUse"][0][
+            "hooks"
+        ][0]["command"]
+        payload = {"tool_name": "Write", "tool_input": {"file_path": "x"}}
+        return subprocess.run(
+            ["/bin/sh", "-c", cmd], input=json.dumps(payload), capture_output=True, text=True
+        )
+
+    def test_pretooluse_command_end_to_end(self) -> None:
+        home = tempfile.mkdtemp(prefix="ut")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        voice_guard.record_armed(home, self.TOK)
+        voice_guard.record_voice(home, self.TOK, "delete it")
+        res = self._pretooluse(sys.executable, home, self.TOK)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("deny", res.stdout)
+
+    def test_pretooluse_blocks_when_interpreter_missing(self) -> None:
+        home = tempfile.mkdtemp(prefix="ut")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        res = self._pretooluse("/nonexistent/python", home, self.TOK)
+        self.assertEqual(res.returncode, 2)
 
     def test_new_commands_registered(self) -> None:
         parser = cli.build_parser()
