@@ -15,6 +15,11 @@ destructive, but that is a soft control. This module is the hard one:
     only a plain non-envelope prompt counts as typed;
   - a Stop hook marks the end of a turn: a voice turn stays gated until its own
     Stop, even if the user types mid-turn, and a grant ends there;
+  - subagents are tainted unless proven typed-origin: background subagents
+    outlive their turn, so an agent started during a voice turn (or while a
+    voice-born agent is alive, as its child) keeps the voice gate and any grant
+    it inherited. Only SubagentStart records agents; an agent_id PreToolUse
+    cannot find (missed start, eviction, early stop, invalid id) is tainted;
   - while the latest turn was spoken, any tool call outside a read-only
     allowlist is denied until the user speaks the exact confirm phrase.
 
@@ -23,7 +28,7 @@ Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
   - userpromptsubmit exits 2 on failure only when the input carries a channel
     tag (dropping a voice turn is the safe side); a typed prompt always gets
     exit 0, because exit 2 would erase what the user typed;
-  - sessionstart and stop ALWAYS exit 0 (exit 2 on Stop forces Claude to go on);
+  - sessionstart, stop, subagentstart and subagentstop ALWAYS exit 0 (exit 2 on Stop forces Claude to go on);
   - an allow is an empty exit 0, never an explicit "allow", so the user's
     normal permission prompts still apply.
 
@@ -55,6 +60,9 @@ CHALLENGE_TTL_S = 300.0
 LOCK_TIMEOUT_S = 2.0
 MAX_USED = 200
 MAX_STATE_BYTES = 64 * 1024
+MAX_AGENTS = 100
+MAX_AGENT_ID = 128
+_NO_AGENT: Any = object()  # payload had no agent_id key: the main thread
 
 STOPWORDS = frozenset({
     "the", "and", "yes", "okay", "then", "say", "now", "please", "go", "to",
@@ -168,11 +176,16 @@ def _default_state() -> dict[str, Any]:
         "challenge": None,
         "grant": None,
         "used_phrases": [],
+        "agents": {},
     }
 
 
 def _is_num(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _valid_agent_id(value: Any) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= MAX_AGENT_ID
 
 
 def _is_str_list(value: Any) -> bool:
@@ -203,6 +216,19 @@ def _validate(raw: Any) -> dict[str, Any]:
         if not (isinstance(grant, dict) and _is_num(grant.get("at"))):
             raise GuardError("state field grant has the wrong type")
     state["grant"] = grant
+    agents = raw.get("agents", {})
+    if not isinstance(agents, dict) or len(agents) > MAX_AGENTS:
+        raise GuardError("state field agents has the wrong type")
+    clean: dict[str, dict[str, Any]] = {}
+    for agent_id, rec in agents.items():
+        if not (_valid_agent_id(agent_id) and isinstance(rec, dict)
+                and isinstance(rec.get("voice"), bool)
+                and (rec.get("granted_at") is None or _is_num(rec.get("granted_at")))
+                and _is_num(rec.get("started_at"))):
+            raise GuardError("state field agents has the wrong type")
+        clean[agent_id] = {"voice": rec["voice"], "granted_at": rec.get("granted_at"),
+                           "started_at": rec["started_at"]}
+    state["agents"] = clean
     return state
 
 
@@ -381,6 +407,8 @@ def record_typed(home: Any, token: str, *, now: float | None = None) -> None:
         state["typed_at"] = stamp
         state["grant"] = None
         state["challenge"] = None
+        for rec in state["agents"].values():
+            rec["granted_at"] = None  # a typed "stop" revokes inherited grants
 
     _update(home, token, fn)
 
@@ -394,6 +422,37 @@ def record_stopped(home: Any, token: str, *, now: float | None = None) -> None:
         state["grant"] = None
 
     _update(home, token, fn)
+
+
+def _record_agent(state: dict[str, Any], agent_id: str, now: float) -> None:
+    """Record an agent's origin at SubagentStart; an existing entry is never overwritten."""
+    agents = state["agents"]
+    if agent_id in agents:
+        return
+    # A child of a live voice-born agent is voice-born, even after the user typed.
+    # No age limit: a voice-born agent can live arbitrarily long. A crashed one that
+    # never sends SubagentStop keeps tainting until the session restarts.
+    live_taint = any(r["voice"] for r in agents.values())
+    voice = voice_active(state) or live_taint
+    agents[agent_id] = {
+        "voice": voice,
+        "granted_at": now if voice and grant_valid(state, now) else None,
+        "started_at": now,
+    }
+    while len(agents) > MAX_AGENTS:
+        # Evict typed-origin entries first: an evicted agent becomes unknown, which
+        # is tainted, so dropping a voice entry would be the less safe loss.
+        victim = next((k for k, r in agents.items() if not r["voice"]), next(iter(agents)))
+        del agents[victim]
+
+
+def record_subagent_start(home: Any, token: str, agent_id: str, *, now: float | None = None) -> None:
+    stamp = _now(now)
+    _update(home, token, lambda state: _record_agent(state, agent_id, stamp))
+
+
+def record_subagent_stop(home: Any, token: str, agent_id: str, *, now: float | None = None) -> None:
+    _update(home, token, lambda state: state["agents"].pop(agent_id, None))
 
 
 # -- decision -------------------------------------------------------------
@@ -569,12 +628,36 @@ def gate_reason(tool_name: str, tool_input: Any) -> str | None:
     return tool_name
 
 
-def decide(state: dict[str, Any] | None, tool_name: str, tool_input: Any, now: float) -> str | None:
-    """Return a deny reason, or None to allow."""
-    if state is None or not voice_active(state):
+def _agent_tainted(state: dict[str, Any], agent_id: Any) -> bool:
+    """True for a subagent call that is voice-born or unknown; False for the main
+    thread and for an agent recorded as typed-origin."""
+    if agent_id is _NO_AGENT or state.get("voice_at") is None:
+        return False
+    rec = state["agents"].get(agent_id) if _valid_agent_id(agent_id) else None
+    return rec is None or rec["voice"]
+
+
+def decide(
+    state: dict[str, Any] | None, tool_name: str, tool_input: Any, now: float,
+    agent_id: Any = _NO_AGENT,
+) -> str | None:
+    """Return a deny reason, or None to allow.
+
+    A subagent call is ungated only if the agent was recorded as typed-origin;
+    an unknown or invalid agent_id is voice-tainted with no inherited grant.
+    """
+    if state is None:
+        return None
+    tainted = _agent_tainted(state, agent_id)
+    if not tainted and not voice_active(state):
         return None
     if gate_reason(tool_name, tool_input) is None:
         return None
+    if tainted and _valid_agent_id(agent_id):
+        rec = state["agents"].get(agent_id)
+        granted_at = rec["granted_at"] if rec else None
+        if granted_at is not None and 0 <= now - granted_at <= GRANT_TTL_S:
+            return None
     if grant_valid(state, now):
         return None
     return DENY_REASON.format(tool=tool_name)
@@ -657,6 +740,23 @@ def _userpromptsubmit(home: Any, token: str, raw: str) -> None:
         _log(home, "userpromptsubmit", "ok", "typed")
 
 
+def _agent_tag(agent_id: str | None) -> str:
+    """Log suffix identifying a subagent; sanitized so an id cannot forge log lines."""
+    return f" a:{re.sub(r'[^A-Za-z0-9_-]', '', agent_id)[:8]}" if agent_id else ""
+
+
+def _agent_event(event: str, home: Any, token: str, raw: str) -> None:
+    payload = _parse_payload(raw)
+    agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
+    if not _valid_agent_id(agent_id):
+        return
+    if event == "subagentstart":
+        record_subagent_start(home, token, agent_id)
+    else:
+        record_subagent_stop(home, token, agent_id)
+    _log(home, event, "ok", "-", _agent_tag(agent_id).strip())
+
+
 def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
     payload = _parse_payload(raw)
     if not isinstance(payload, dict):
@@ -665,14 +765,22 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
     if not isinstance(tool_name, str):
         raise GuardError("bad hook input")
     tool_input = payload.get("tool_input")
+    agent_id = payload["agent_id"] if "agent_id" in payload else _NO_AGENT
+    tag = _agent_tag(agent_id if _valid_agent_id(agent_id) else None) if agent_id is not _NO_AGENT else ""
+    if agent_id is not _NO_AGENT and not _valid_agent_id(agent_id):
+        tag = " a:invalid"
     state = load_state(home, token)
     now = time.time()
-    reason = decide(state, tool_name, tool_input, now)
+    reason = decide(state, tool_name, tool_input, now, agent_id)
     if reason is None:
-        gated = state is not None and voice_active(state) and gate_reason(tool_name, tool_input) is not None
-        _log(home, "pretooluse", "granted" if gated else "allow", tool_name)
+        gated = (
+            state is not None
+            and (voice_active(state) or _agent_tainted(state, agent_id))
+            and gate_reason(tool_name, tool_input) is not None
+        )
+        _log(home, "pretooluse", "granted" if gated else "allow", tool_name, f"-{tag}")
         return
-    _log(home, "pretooluse", "deny", tool_name, gate_reason(tool_name, tool_input) or "-")
+    _log(home, "pretooluse", "deny", tool_name, f"{gate_reason(tool_name, tool_input) or '-'}{tag}")
     stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -683,7 +791,7 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
     stdout.flush()
 
 
-_EVENTS = ("sessionstart", "userpromptsubmit", "stop", "pretooluse")
+_EVENTS = ("sessionstart", "userpromptsubmit", "stop", "subagentstart", "subagentstop", "pretooluse")
 
 
 def _event_of(argv: list[str]) -> str:
@@ -728,6 +836,8 @@ def main(
             _userpromptsubmit(home, args.session, raw)
         elif args.event == "stop":
             _stop(home, args.session)
+        elif args.event in ("subagentstart", "subagentstop"):
+            _agent_event(args.event, home, args.session, raw)
         else:
             _sessionstart(home, args.session)
         return 0
