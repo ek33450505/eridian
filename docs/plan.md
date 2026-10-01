@@ -1,6 +1,6 @@
 # undertone — research + plan
 
-> **Date:** 2026-09-30 · **Status:** PLAN (nothing built) · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
+> **Date:** 2026-09-30 · **Status:** Phase 0 DONE · Phase 1 (speak replies) built + reviewed (`feature/phase1-speak-replies`) · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
 > **Prior art:** `claude-agent-team/research/v8-phase-0-tauri-architecture-decision.md:65` (push-to-talk Voice MVP, never built)
 
 ## 1. Requirements (Ed, 2026-09-30)
@@ -35,7 +35,7 @@ Scope note: the *text* of each turn still goes to Anthropic — that's Claude. "
 |---|---|---|---|---|---|
 | Wake word | **pymicro-wakeword** 2.5.0, built-in `HEY_JARVIS` (see §7.2) | openWakeWord `hey_jarvis`; any custom phrase via the optional `training/` image | Apache-2.0 (oWW pretrained models and anything trained with its data: **CC BY-NC-SA 4.0**, fine for personal use) | pymicro pushed 2026-09-17; oWW last release v0.6.0 (2024-02) | pymicro wheel is `macosx_15_0_universal2`; 16 kHz mono, 10 ms frames |
 | VAD / end-of-turn | **Silero VAD** | WebRTC VAD | MIT | pushed 2026-09-29 | Skip **TEN VAD** — license `NOASSERTION` (custom terms). Lead (unverified): pykeio `earshot` on PyPI ("fast & accurate VAD", v1.2.2, 2026-08-19) |
-| STT | **parakeet-mlx** (`parakeet-tdt-0.6b-v3`, `transcribe_stream`) | **whisper.cpp** 1.9.4 (`brew install whisper-cpp`, Metal, built-in Silero `--vad`) | Apache-2.0 / MIT | 2026-08-29 / 2026-09-28 | No latency numbers verified from primary sources → measure in Phase 0 |
+| STT | **parakeet-mlx** (`parakeet-tdt-0.6b-v3`, `transcribe_stream`) | **whisper.cpp** 1.9.4 (`brew install whisper-cpp`, Metal, built-in Silero `--vad`) | Apache-2.0 / MIT | 2026-08-29 / 2026-09-28 | Measured in Phase 0: median 44 ms on synthetic speech, 87 ms on Ed's voice (§5) |
 | STT (future) | Apple SpeechAnalyzer (macOS 26, on-device) | — | — | — | `yap` (CC0, `brew install yap`) does files + **system audio** only, not the mic → would need a small Swift helper |
 | TTS | **macOS `say`** + Zoe (Premium) (installed) → **Kokoro-82M** via mlx-audio (`--stream`) or kokoro-onnx (~300 MB / ~80 MB int8) | — | Kokoro weights Apache-2.0; mlx-audio/kokoro-onnx MIT | active | Kokoro must stay resident (cold CLI start is seconds). Piper: `rhasspy/piper` **archived**, successor `piper1-gpl` is **GPL-3.0** — not needed |
 | Echo cancel | **livekit** 1.1.20 `AudioProcessingModule(echo_cancellation=True)` (`process_stream` mic / `process_reverse_stream` playback) | Apple VoiceProcessingIO via Swift helper | Apache-2.0 | active | Needs the playback PCM as reference (finding 4). Apple docs only say "voice processing features"; AEC detail comes from WWDC, not verified in docs |
@@ -63,10 +63,10 @@ State machine: `IDLE` (wake word only) → `LISTENING` (VAD, end-of-turn at ~0.7
 |---|---|---|
 | Out (speak replies) | `Stop` hook, `async: true` → reads `last_assistant_message` → posts text to `undertone` over a unix socket (hook never plays audio itself) | VERIFIED primitives |
 | Spoken summary | Opted-in sessions get an instruction (via `UserPromptSubmit` `additionalContext`) to end replies with `SPOKEN: <≤2 sentences, no code/paths>`; hook speaks that line, else falls back to stripping code blocks and speaking the first 2 sentences | Design inference |
-| In (voice → session) | Custom **Channel** MCP server: `undertone` transcript → channel event → running session | VERIFIED exists; research preview; availability on Ed's account UNTESTED |
+| In (voice → session) | Custom **Channel** MCP server: `undertone` transcript → channel event → running session | VERIFIED exists (research preview). **GO on Ed's account**, Phase 0 hello-world 2026-09-30 |
 | Barge-in | `undertone` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs | Gap |
 
-Must-haves: speak only for **opted-in sessions** (flag file per `session_id`, toggled by a `/jarvis` command) or every open session talks at once; skip when `stop_hook_active` is true (the CAST journal Stop hook blocks and causes a continuation turn).
+Must-haves: speak only for **opted-in sessions** (**as built in Phase 1:** `UNDERTONE_SPEAK=1 claude` per session, or `undertone on` for every session) or every open session talks at once; skip when `stop_hook_active` is true (the CAST journal Stop hook blocks and causes a continuation turn).
 
 ### Path B — standalone voice REPL
 
@@ -92,14 +92,20 @@ Must-haves: speak only for **opted-in sessions** (flag file per `session_id`, to
 
 | Stage | Target | Measured | Note |
 |---|---|---|---|
-| Wake word fires | ≤ 0.3 s | — | Phase 0 item for Ed: needs mic permission and 30 min of real use |
+| Wake word fires | ≤ 0.3 s | **30-min live run: 6/6 intentional "hey jarvis" detected, 0 false accepts** in ~26 min of normal activity (whether there was background speech is unknown); CPU **2.3%** average, 3.2% max | pymicro-wakeword `HEY_JARVIS`, cutoff 0.97, MacBook Pro mic. Rerun with a podcast or call playing before calling false accepts solved |
 | End-of-turn silence | 0.6–0.8 s | — | Biggest local lever; VoiceMode's 3.0 s is why it feels slow |
-| STT, 1.8–3.8 s utterances | ≤ 0.3 s | **parakeet-mlx: median 44 ms** (34–127 ms), 5/5 correct (one comma dropped), 1.2 GB RSS. mlx-whisper large-v3-turbo: median 217 ms, 5/5 exact, 1.9 GB | Input was clean synthetic `say` speech. Real voice through the built-in mic is still untested. Feed **in-memory arrays**: both libraries shell out to `ffmpeg` for file input, and ffmpeg isn't needed for mic audio. parakeet needs float32 input; a bf16 cast breaks its STFT |
+| STT, 1.8–4.2 s utterances | ≤ 0.3 s | **Ed's real voice via the built-in mic: median 87 ms** (68–145 ms), 4/6 transcripts correct; the 2 misses are spike bugs (see the carry-overs below). Synthetic speech: | **parakeet-mlx: median 44 ms** (34–127 ms), 5/5 correct (one comma dropped), 1.2 GB RSS. mlx-whisper large-v3-turbo: median 217 ms, 5/5 exact, 1.9 GB | Input was clean synthetic `say` speech. Real voice through the built-in mic is still untested. Feed **in-memory arrays**: both libraries shell out to `ffmpeg` for file input, and ffmpeg isn't needed for mic audio. parakeet needs float32 input; a bf16 cast breaks its STFT |
 | Claude first token | 1–3 s | **Persistent `claude -p` stream-json: 0.9–3.1 s per turn, median ~1.2 s**, turn 1 including spawn 1.6–1.9 s. Cold one-shot `claude -p` per turn: **5.5–13 s** | One-shot is ruled out: Path B must keep one process alive. `--strict-mcp-config` / `--setting-sources project` gave no clear gain. `--bare` is unusable because it accepts only `ANTHROPIC_API_KEY` and never reads the OAuth login. Why one-shot is slower is not isolated (stdin was ruled out) |
 | TTS first audio | ≤ 0.3 s | **`say` + Zoe Premium: 0.73 s** to render one sentence to a file (includes process start). Kokoro via mlx-audio: **BLOCKED** | Kokoro: `espeakng-loader` 0.2.4 (macOS arm64) `exit(1)`s on a data path compiled in on its CI machine and ignores `ESPEAK_DATA_PATH` (mlx-audio 0.5.7, misaki 0.9.4). Try kokoro-onnx or Homebrew espeak-ng in Phase 4. A resident `NSSpeechSynthesizer`/AVSpeech process should beat `say`'s per-call process start |
 | **Speech end → first spoken word** | **~2–4 s** (Path B) | ≈ 0.7 s end-of-turn + 0.05 s STT + ~1.2 s Claude + ≤ 0.7 s TTS ≈ **2.7 s** estimated from parts | Not yet measured end to end. Path A adds the full reply-generation time |
 
-**Channels (Path A input), checked against `channels-reference`:** a custom channel needs `claude --dangerously-load-development-channels server:<name>`, which shows a full-screen warning **that must be accepted interactively**, so testing can't be automated. The documented runtime is Node/Bun/Deno with `@modelcontextprotocol/sdk`; Node v26 is installed, and Python is unverified. Two-way channels also expose a **reply tool**, which could replace the Stop hook as Path A output, and *permission relay* forwards tool approvals to the channel. The hello-world test is a Phase 0 item for Ed.
+**Channels (Path A input): GO, verified 2026-09-30 on Ed's account.** A minimal Node channel (`server:undertone-hello`, localhost:8788) delivered a POSTed message into a live session, and Claude replied "PONG". From `channels-reference`: a custom channel needs `claude --dangerously-load-development-channels server:<name>`, which shows a full-screen warning **that must be accepted interactively**, so testing can't be automated. The documented runtime is Node/Bun/Deno with `@modelcontextprotocol/sdk`; Node v26 is installed, and Python is unverified. Two-way channels also expose a **reply tool**, which could replace the Stop hook as Path A output, and *permission relay* forwards tool approvals to the channel. The hello-world test passed (see above).
+
+**Carry-overs from the Phase 0 listener spike into Phase 2:**
+- Strip a leading wake phrase from transcripts. One utterance came back as just "Hey Jarvis.", because the tail of the wake phrase spills into the recording.
+- Drop empty transcripts. VAD fired once on noise, possibly the wake beep.
+- Set `HF_HUB_OFFLINE=1`. parakeet's `from_pretrained` contacts the Hugging Face Hub on every start, even with a warm cache, and that breaks the local-first promise.
+- Measured speech-end → text is 780–850 ms: 700 ms of end-of-turn silence plus STT. The silence wait is the lever to tune.
 
 ## 6. Phased plan
 
