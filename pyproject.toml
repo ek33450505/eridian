@@ -3,6 +3,7 @@ name = "undertone"
 version = "0.1.0"
 description = "Hands-free, local-first voice conversation with Claude Code on macOS."
 requires-python = ">=3.12"
+license = "Apache-2.0"
 dependencies = [
     "numpy",
     "sounddevice",
