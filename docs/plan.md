@@ -1,6 +1,6 @@
 # undertone — research + plan
 
-> **Date:** 2026-09-30, updated 2026-10-01 · **Status:** Phases 0–3 complete (PR #4 merged) · Phase 1 retired on `feature/retire-stop-hook` · voice-turn hard control built (live test pending) · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
+> **Date:** 2026-09-30, updated 2026-10-01 · **Status:** Phases 0–3 complete (PR #4 merged) · Phase 1 retired on `feature/retire-stop-hook` · voice-turn hard control built and live-verified (PR #6, follow-ups) · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
 > **Prior art:** `claude-agent-team/research/v8-phase-0-tauri-architecture-decision.md:65` (push-to-talk Voice MVP, never built)
 
 ## 1. Requirements (Ed, 2026-09-30)
@@ -63,7 +63,7 @@ State machine: `IDLE` (wake word only) → `LISTENING` (VAD, end-of-turn at ~0.7
 |---|---|---|
 | In (voice → session) | Custom **Channel** MCP server: `undertone attach` sends transcripts via `~/.undertone/voice.sock` → channel event → running session as `← undertone: <text>` | ✓ BUILT (2026-10-01): a stdlib Python stdio server works as a channel; verified live in Ed's interactive session. Claude Code first sends `server/discover` (protocol 2026-07-28); answering -32601 makes it fall back to `initialize` 2025-11-25, which a channel must use. In `claude -p`, dev-channel events are dropped, because the dev flag needs its interactive warning accepted. |
 | Out via the channel | Claude calls the `reply` tool with `kind` = `ack` (early: "Running the tests now."), `answer` (default), or `confirm` (ask for confirmation) | ✓ BUILT: confirmed live test showed `confirm walnut lantern` (deleted a file after spoken "yes"). |
-| Confirmation flow | User says wake word → "confirm <word1> <word2>" (uncommon nouns, fresh each time, one attempt; the grant covers the rest of that turn). Wake word is stripped from transcript. Enforced by `voice_guard.py` hooks. | ✓ BUILT: hard control injected via `--settings`, live test pending. |
+| Confirmation flow | User says wake word → "confirm <word1> <word2>" (uncommon nouns, fresh each time, one attempt; the grant covers the rest of that turn). Wake word is stripped from transcript. Enforced by `voice_guard.py` hooks. | ✓ BUILT and live-verified 2026-10-01: hard control injected via `--settings`. Subagents started by a voice turn stay gated after it ends. |
 | Barge-in | `undertone attach` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs. Channel events queue while Claude is busy and arrive on the next turn | Gap (by design) |
 | Phase 1 (retired) | Stop hook + UserPromptSubmit hook for opted-in sessions — **removed 2026-10-01** | ✓ Retired, replaced by Phase 3 channel |
 

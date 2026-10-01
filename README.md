@@ -194,7 +194,7 @@ For the full research and component justification: see [`docs/plan.md`](docs/pla
 
 ## Testing
 
-266 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
+281 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
 
 Plus `bash scripts/verify-offline.sh` for the offline pipeline check (see "Verify it yourself" above).
 

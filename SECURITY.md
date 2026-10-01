@@ -95,7 +95,8 @@ The start-up header prints the effective working directory and, when it substitu
 **Threat:** Voice turns are unverified spoken input. A stray wake word or misheard phrase could trigger destructive or outward-facing actions (delete or overwrite files, commit or push, call an MCP tool that changes remote state).
 
 **Mechanism:**
-- **Hooks:** Four hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `PreToolUse`) are injected into the session via `--settings` inline JSON. Each runs `python -P -m undertone.voice_guard <event> --home <UNDERTONE_HOME> --session <token>`. Events are: `sessionstart`, `userpromptsubmit`, `stop`, `pretooluse`.
+- **Hooks:** Six hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `SubagentStart`, `SubagentStop`, `PreToolUse`) are injected into the session via `--settings` inline JSON. Each runs `python -P -m undertone.voice_guard <event> --home <UNDERTONE_HOME> --session <token>`. Events are: `sessionstart`, `userpromptsubmit`, `stop`, `subagentstart`, `subagentstop`, `pretooluse`. `pretooluse` can block a tool call, and `userpromptsubmit` can drop a voice turn it cannot record. `sessionstart`, `stop`, `subagentstart` and `subagentstop` always exit 0, because exit 2 on `Stop` or `SubagentStop` would keep Claude or the subagent running.
+- **Subagents:** Subagents can run in the background, so a voice turn can end (`Stop`) while a subagent it started keeps working. Each subagent is recorded by its `agent_id` at `SubagentStart`, as voice-born if a voice turn is active or any voice-born subagent is still recorded (until its `SubagentStop`). That rule also catches a nested child started after the user typed. A voice-born subagent stays gated until `SubagentStop`, even after the user types. Its gated calls are allowed only if it started while a grant was valid (inherited for 300 s, revoked by a typed prompt) or if a new grant is valid. In a session that has had a voice turn, a subagent whose `agent_id` is unknown or invalid is treated as voice-born; this covers a missed `SubagentStart`, an early `SubagentStop` and an evicted record. Only a subagent positively recorded as typed-origin runs ungated.
 - **Arming:** The channel (`mcp_channel.py`) refuses a voice turn in three cases: the session token is missing, the `SessionStart` hook hasn't armed state for this launch, or recording the turn failed. When refused, the channel speaks "Voice turns are off:" instead of delivering the turn. This fails safe: if hooks don't load, voice is refused rather than unguarded.
 - **Provenance:** Claude Code fires `UserPromptSubmit` for channel events. Its prompt is `<channel source="undertone" input="voice">…</channel>`, so a prompt containing `<channel` counts as a voice turn. A prompt starting with `<` that is not a channel event (an injected envelope such as a background-task notification) changes nothing. Any other non-empty prompt counts as typed. A voice turn stays gated until its `Stop`, even if the user types mid-turn; after that, a typed prompt ungates. If a voice turn is interrupted (Esc, no `Stop`), the session stays gated until a later turn completes.
 - **Gating:** During an active voice turn, gated tool calls require confirmation. Never gated: `Read Grep Glob LS WebSearch TodoWrite Task Agent AskUserQuestion ToolSearch Skill EnterPlanMode ExitPlanMode BashOutput TaskOutput mcp__undertone__reply`. `Bash` goes through a fail-closed allowlist (read commands, `cd` to plain relative paths, `find` with read-only predicates only, read-only git, test runners with restricted args); any command using shell expansion or special characters, a redirect other than to `/dev/null` or an fd dup, a heredoc, an env-var assignment or a non-ASCII character is gated, and so is every other tool.
@@ -113,11 +114,21 @@ The start-up header prints the effective working directory and, when it substitu
 - A grant covers the rest of the turn, not one specific command.
 - Test runners execute repo code (`conftest.py`, `Makefile`, `package.json` scripts, `build.rs`).
 - Git config programs (`core.fsmonitor`, `diff.external`) need a prior write to `.git/config`.
-- `Task`/`Agent` are ungated on the assumption that subagent tool calls pass through the same hook (not yet live-verified).
+- `Task`/`Agent` are ungated. That is safe because a subagent's own tool calls pass through the same `PreToolUse` hook (verified live).
 - Your shell aliases and functions are trusted, because Claude Code sources your shell snapshot. They can change what an allowlisted name runs: on the development machine `ls` is `eza`, `cat` is `bat`, `find` runs bfs and `grep` runs ugrep. The allowlist was probed against those, and `find` takes only an allowlist of read-only predicates for that reason (bfs adds actions such as `-rm`).
+- The subagent rules assume Claude Code delivers `SubagentStart` before the voice turn's `Stop`. The live test was consistent with that, but it is not documented. If `SubagentStart` arrived after a typed prompt with no other voice-born subagent recorded, that subagent would be recorded typed-origin.
+- A voice-born subagent that crashes without `SubagentStop` keeps new subagents gated until `undertone session` restarts or the user speaks a confirm phrase. That is the safe direction.
 - Narrow timing cases: a voice event queued during a typed turn, and a background-task turn after a voice turn's `Stop` when you had typed. Both require you at the keyboard.
 
-**Live test status:** Live verification of the hard control with real speech is **PENDING**.
+**Live test (2026-10-01, Claude Code 2.1.286, real speech):**
+- Arming worked.
+- `voice`, `typed` and `other` classification all appeared (`other` was a background-task notification).
+- Read-only commands went through and a risky `Bash` call was denied.
+- `confirm` then a spoken phrase gave a grant, and the gated test run went through. The grant ended at `Stop`.
+- Answering "never mind" cancelled a pending challenge.
+- A subagent's `Write`, and its `touch` workaround, were both denied.
+- A typed turn after the voice turn ended was ungated.
+- The test found that a background subagent could outlive its voice turn. Subagent tracking (above) was added for it.
 
 ### 8. Local Files
 

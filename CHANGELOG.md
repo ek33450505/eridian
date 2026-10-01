@@ -4,6 +4,18 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-01 — Voice guard follow-ups (from the live test)
+
+- **Live-verified** with real speech on Claude Code 2.1.286. See SECURITY.md §7a for the results.
+- **Voice-started subagents stay gated.**
+  - New `SubagentStart` and `SubagentStop` hooks (events `subagentstart`, `subagentstop`).
+  - Agents are recorded only at `SubagentStart`. A subagent started while a voice turn is active, or while any voice-born subagent is still recorded, is voice-born. That includes nested children.
+  - Once a session has had a voice turn, an unknown or invalid `agent_id` counts as voice-born; only subagents recorded as typed-origin run ungated.
+  - A typed prompt revokes grants that subagents inherited.
+  - Without this, a background subagent started by a voice turn ran ungated once the user typed after the turn ended.
+- **Plain shell commands during voice turns.** The channel instructions now tell Claude to run shell commands in their plainest form (no file redirects, no `$?`, no globs). Otherwise a spoken "run the tests" asked for a confirm phrase every time.
+- **Known, undiagnosed:** the startup banner shows `server:undertone · no MCP server configured with that name` with the inline `--mcp-config`, although channel events and the `reply` tool work.
+
 ### 2026-10-01 — Voice-turn hard control (voice_guard)
 
 **Added**
@@ -15,7 +27,7 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 - Fail-closed: `SessionStart` must arm state, a failed `UserPromptSubmit` on a voice prompt drops that turn, and an unarmed state or failed recording makes the channel refuse voice turns. `PreToolUse` errors exit 2 (`|| exit 2` on the command). `PreToolUse` timeout is 10 s (documented limitation: Claude Code lets a call through on timeout).
 - Gating allowlist includes read (`ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `which`, `type`, `whoami`, `uname`, `basename`, `dirname`, `realpath`, `stat`, `du`, `df`), `cd` to plain relative paths, `find` with read-only predicates only, read-only git (`status log diff show blame rev-parse ls-files describe shortlog branch remote tag` listing), and test runners with restricted args (`npm|pnpm|yarn|bun test`, `pytest`, `bats`, `make test|check`, `just test|check`, `cargo test`, `go test`).
 - Never gated: `Read Grep Glob LS WebSearch TodoWrite Task Agent AskUserQuestion ToolSearch Skill EnterPlanMode ExitPlanMode BashOutput TaskOutput mcp__undertone__reply`.
-- **Live test pending** for real speech interaction with the hard control.
+- Live test: done; see the follow-up entry above.
 
 ### 2026-10-01 — Phase 1 retired (Stop hook and speaker daemon)
 
