@@ -4,6 +4,19 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-01 — Voice-turn hard control (voice_guard)
+
+**Added**
+- `voice_guard.py`: hooks that gate tool calls made on a spoken turn. Hooks (`SessionStart`, `UserPromptSubmit`, `Stop`, `PreToolUse`) are injected via `claude --settings '<inline json>'` and run `python -P -m undertone.voice_guard <event> --home <UNDERTONE_HOME> --session <token>`.
+- Session state at `~/.undertone/sessions/<token>.json` (0600, atomic writes). Session token: `secrets.token_hex(16)`.
+- Session log at `~/.undertone/logs/guard.log` (0600). Records decisions only, never command text or prompt text.
+- Token per `undertone session` launch is generated and passed to the channel as `UNDERTONE_SESSION` env var and to hooks as `--session`.
+- Confirmation flow now a hard control: gated calls require a confirm phrase (`confirm <word1> <word2>`, one attempt, 300 s valid, case and punctuation ignored). Both words ≥3 letters, uncommon, fresh. Valid words unlock gated calls for the rest of the turn.
+- Fail-closed: `SessionStart` must arm state, a failed `UserPromptSubmit` on a voice prompt drops that turn, and an unarmed state or failed recording makes the channel refuse voice turns. `PreToolUse` errors exit 2 (`|| exit 2` on the command). `PreToolUse` timeout is 10 s (documented limitation: Claude Code lets a call through on timeout).
+- Gating allowlist includes read (`ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `which`, `type`, `whoami`, `uname`, `basename`, `dirname`, `realpath`, `stat`, `du`, `df`), `cd` to plain relative paths, `find` with read-only predicates only, read-only git (`status log diff show blame rev-parse ls-files describe shortlog branch remote tag` listing), and test runners with restricted args (`npm|pnpm|yarn|bun test`, `pytest`, `bats`, `make test|check`, `just test|check`, `cargo test`, `go test`).
+- Never gated: `Read Grep Glob LS WebSearch TodoWrite Task Agent AskUserQuestion ToolSearch Skill EnterPlanMode ExitPlanMode BashOutput TaskOutput mcp__undertone__reply`.
+- **Live test pending** for real speech interaction with the hard control.
+
 ### 2026-10-01 — Phase 1 retired (Stop hook and speaker daemon)
 
 **Removed**

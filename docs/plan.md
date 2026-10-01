@@ -1,6 +1,6 @@
 # undertone — research + plan
 
-> **Date:** 2026-09-30, updated 2026-10-01 · **Status:** Phases 0–3 complete (PR #4 merged) · Phase 1 retired on `feature/retire-stop-hook` · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
+> **Date:** 2026-09-30, updated 2026-10-01 · **Status:** Phases 0–3 complete (PR #4 merged) · Phase 1 retired on `feature/retire-stop-hook` · voice-turn hard control built (live test pending) · **Machine:** M4 Max, 64 GB, macOS 26.6.2, Claude Code 2.1.286
 > **Prior art:** `claude-agent-team/research/v8-phase-0-tauri-architecture-decision.md:65` (push-to-talk Voice MVP, never built)
 
 ## 1. Requirements (Ed, 2026-09-30)
@@ -63,7 +63,7 @@ State machine: `IDLE` (wake word only) → `LISTENING` (VAD, end-of-turn at ~0.7
 |---|---|---|
 | In (voice → session) | Custom **Channel** MCP server: `undertone attach` sends transcripts via `~/.undertone/voice.sock` → channel event → running session as `← undertone: <text>` | ✓ BUILT (2026-10-01): a stdlib Python stdio server works as a channel; verified live in Ed's interactive session. Claude Code first sends `server/discover` (protocol 2026-07-28); answering -32601 makes it fall back to `initialize` 2025-11-25, which a channel must use. In `claude -p`, dev-channel events are dropped, because the dev flag needs its interactive warning accepted. |
 | Out via the channel | Claude calls the `reply` tool with `kind` = `ack` (early: "Running the tests now."), `answer` (default), or `confirm` (ask for confirmation) | ✓ BUILT: confirmed live test showed `confirm walnut lantern` (deleted a file after spoken "yes"). |
-| Confirmation flow | User says wake word → "confirm <word1> <word2>" (uncommon nouns, fresh each time, one-shot per action). Wake word is stripped from transcript. | ✓ BUILT: soft control via Claude's instructions and choice of reply tool. |
+| Confirmation flow | User says wake word → "confirm <word1> <word2>" (uncommon nouns, fresh each time, one attempt; the grant covers the rest of that turn). Wake word is stripped from transcript. Enforced by `voice_guard.py` hooks. | ✓ BUILT: hard control injected via `--settings`, live test pending. |
 | Barge-in | `undertone attach` stops playback locally. Interrupting Claude's in-flight turn from outside: **NOT FOUND** in docs. Channel events queue while Claude is busy and arrive on the next turn | Gap (by design) |
 | Phase 1 (retired) | Stop hook + UserPromptSubmit hook for opted-in sessions — **removed 2026-10-01** | ✓ Retired, replaced by Phase 3 channel |
 
@@ -128,7 +128,7 @@ Ceremony: each phase is single-session → native plan mode + one implementer + 
 4. **Path B tool policy — BUILT (2026-10-01), tighter than first advised: Read/Grep/Glob/WebSearch only, cwd-confined, no spoken confirmation in v1.** The first advice also allowed WebFetch and `git status/log/diff`. Both were dropped. WebFetch is an exfiltration channel for prompt-injected content. `git diff --output=<file>` writes files, so a git prefix allowlist isn't read-only, and the user's settings allow bare `Bash` anyway. Either can be re-added later as a one-line change to `ALLOWED_TOOLS`. Why not spoken confirmation: STT can mishear "yes", voice confirms get rubber-stamped, and CAST's confirm-pauses don't run in headless. Changes go through Path A, where the real session's guards run and the diff is on screen. Revisit after a week of use.
 5. **`/voice` — ADVISED: keep as a stopgap, turn it off when Phase 3 lands.** It only records while space is held (no ambient capture), and Anthropic already receives the transcript text. The raw audio (voiceprint, background) is the real difference. If "no audio off the Mac" is absolute rather than a build requirement, turn it off now.
 6. **Model behind it (the "brain") — DECIDED (Ed, 2026-09-30): Claude via Anthropic by default, for quality.** "I would prefer better quality. Offline off by default and we go through anthropic." Offline mode is an **opt-in** for Path B (`--offline`): Ollama `gpt-oss:20b` (already installed) driven directly, which makes the whole loop local and lets it work with Wi-Fi off. Path A can only go fully local through `ccr`, which is not recommended for agentic work. The brain adapter stays pluggable either way.
-7. **Voice into a real session — DECIDED (Ed, 2026-10-01): confirm risky actions.** Voice turns keep full session power, so "run the tests" works. They are tagged as unverified spoken input. Before anything destructive, irreversible or outward-facing, Claude must ask aloud and get a spoken "yes". This is a soft control: CAST hooks still run, and Ed is at the terminal.
+7. **Voice into a real session — DECIDED (Ed, 2026-10-01): confirm risky actions.** Voice turns keep full session power, so "run the tests" works. They are tagged as unverified spoken input. Before anything destructive, irreversible or outward-facing, Claude must ask aloud and get a spoken "yes". The confirmation is now a hard control: `voice_guard.py` hooks (added 2026-10-01) enforce the gating, live test pending.
 
 ## 8. Sources
 

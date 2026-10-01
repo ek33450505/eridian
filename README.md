@@ -86,7 +86,7 @@ uv run undertone attach [--no-beep] [--follow-up SECONDS]
 ~/Projects/personal/undertone/.venv/bin/undertone session [claude args ...]
 ```
 
-This launches `claude --mcp-config ~/.undertone/channel.mcp.json --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`, accepting the dev-channel warning once per launch. Your voice input from Terminal 1 arrives as `← undertone: <text>`, and Claude can call the `reply` tool to speak answers.
+This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`, with the voice-turn hard control (`voice_guard`) injected via `--settings`. Your voice input from Terminal 1 arrives as `← undertone: <text>`, and Claude can call the `reply` tool to speak answers. The command generates a session token and refuses `--settings`, `--settings=…`, `--bare` and `--safe-mode`, since each would override the guard.
 
 ### Standalone voice conversation (Path B)
 
@@ -136,16 +136,15 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 
 ### Modules
 
-`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `paths.py`, `cli.py`.
+`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `voice_guard.py`, `paths.py`, `cli.py`.
 
 ## Safety model for voice
 
 ### Path A: voice into a Claude Code session
 
-Voice turns keep full session power but are unverified input. Before anything destructive, irreversible or outward-facing, Claude must send a `reply` tool call asking the user to speak the wake word, then "confirm <word1> <word2>" with two uncommon nouns. undertone strips the wake word from every transcript, so Claude receives and accepts "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. "Yes" counts as a refusal. Each confirmation covers one action and the phrase is never reused.
+Voice turns keep full session power but are unverified input. A hard control (`voice_guard.py`) gates tool calls during spoken turns: before anything destructive, irreversible or outward-facing, Claude must send a `reply` tool with `kind="confirm"` asking the user to speak the wake word, then "confirm <word1> <word2>" with two uncommon nouns. The listener strips the wake word from every transcript, so Claude receives "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. Both words must be at least 3 letters, uncommon, and fresh (not used before in the session); one attempt, valid 300 s. Any other message cancels the challenge. On a successful confirm, gated calls are allowed for the rest of the turn. The confirm flow is enforced by hooks injected into the session; see [`SECURITY.md`](SECURITY.md) §7a for the gating rules and residual risks.
 
 - **Wake word never spoken:** `speaker.build_say_argv()` runs `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any utterance of "hey jarvis" or obfuscated forms with "the wake word". Undertone's instructions also tell Claude never to say it.
-- **Residual soft control:** confirmation is enforced by Claude's instructions, not the system. CAST hooks and all session tools are available; verification is the user's responsibility while at the terminal.
 
 ### Path B: standalone `undertone chat`
 
@@ -195,13 +194,14 @@ For the full research and component justification: see [`docs/plan.md`](docs/pla
 
 ## Testing
 
-201 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
+266 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
 
 Plus `bash scripts/verify-offline.sh` for the offline pipeline check (see "Verify it yourself" above).
 
 ## Environment variables
 
 - `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
+- `UNDERTONE_SESSION` (set by `undertone session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Samantha"`); empty string uses system voice
 - `UNDERTONE_SAY_CMD` (tests only) — override `say` with a stub
 - `UNDERTONE_CLAUDE_CMD` (tests only) — the binary the safety flags are applied to; `system/init` checks that it actually advertises the restricted tool set, so a wrapper that drops the flags is caught
