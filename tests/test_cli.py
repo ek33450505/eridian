@@ -186,5 +186,76 @@ class ChatWorkdirTest(unittest.TestCase):
             self._workdir(self.home)
 
 
+class SessionHelpersTest(CliTestCase):
+    def test_build_session_argv_exact(self) -> None:
+        argv = cli.build_session_argv(Path("/h/channel.mcp.json"), ["--model", "opus"])
+        self.assertEqual(
+            argv,
+            [
+                "claude",
+                "--mcp-config",
+                "/h/channel.mcp.json",
+                "--dangerously-load-development-channels",
+                "server:undertone",
+                "--allowedTools",
+                "mcp__undertone__reply",
+                "--model",
+                "opus",
+            ],
+        )
+
+    def test_build_session_argv_custom_command(self) -> None:
+        argv = cli.build_session_argv(Path("/c.json"), [], claude_cmd="/x/claude2")
+        self.assertEqual(argv[0], "/x/claude2")
+
+    def test_channel_mcp_config_shape(self) -> None:
+        cfg = cli.channel_mcp_config("/py", Path("/home/u"))
+        self.assertEqual(
+            cfg,
+            {
+                "mcpServers": {
+                    "undertone": {
+                        "command": "/py",
+                        "args": ["-P", "-m", "undertone.cli", "channel"],
+                        "env": {"UNDERTONE_HOME": "/home/u"},
+                    }
+                }
+            },
+        )
+
+    def test_write_private_json_cleans_up_on_failure(self) -> None:
+        target = Path(self._tmp.name) / "x.json"
+        with self.assertRaises(TypeError):
+            cli._write_private_json(target, {"bad": object()})
+        self.assertEqual(list(Path(self._tmp.name).glob("x.json*")), [])
+
+    def test_session_writes_0600_config_and_execs(self) -> None:
+        with mock.patch.object(cli.os, "execvpe") as execvpe, mock.patch.dict(
+            os.environ, {"UNDERTONE_CLAUDE_CMD": "fakeclaude"}
+        ):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                cli.main(["session", "--model", "opus"])
+        cfg = paths.channel_config_path()
+        self.assertEqual(cfg.stat().st_mode & 0o777, 0o600)
+        data = json.loads(cfg.read_text())
+        self.assertEqual(data["mcpServers"]["undertone"]["env"]["UNDERTONE_HOME"], self._tmp.name)
+        cmd, argv, env = execvpe.call_args.args
+        self.assertEqual(cmd, "fakeclaude")
+        self.assertEqual(argv[-2:], ["--model", "opus"])
+        self.assertEqual(env["UNDERTONE_SPEAK"], "0")
+        self.assertIn("undertone attach", err.getvalue())
+
+    def test_new_commands_registered(self) -> None:
+        parser = cli.build_parser()
+        self.assertIs(parser.parse_args(["channel"]).func, cli._cmd_channel)
+        self.assertIs(parser.parse_args(["session"]).func, cli._cmd_session)
+        args = parser.parse_args(["attach", "--no-beep", "--follow-up", "0"])
+        self.assertIs(args.func, cli._cmd_attach)
+        self.assertTrue(args.no_beep)
+        self.assertEqual(args.follow_up, 0.0)
+        self.assertEqual(parser.parse_args(["attach"]).follow_up, 6.0)
+
+
 if __name__ == "__main__":
     unittest.main()
