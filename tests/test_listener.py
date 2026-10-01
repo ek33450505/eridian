@@ -399,6 +399,15 @@ class ListenerTalkOverTest(unittest.TestCase):
         for i in range(n):
             listener.process_frame(_chunk(i))
 
+    def test_reset_to_idle_clears_talk_over_state(self) -> None:
+        listener, _, _, _, _ = self._setup([1.0])
+        self._feed(listener, 5)
+        self.assertTrue(listener._preroll)
+        listener._reset_to_idle()
+        self.assertEqual(listener._to_run, 0)
+        self.assertFalse(listener._to_buf)
+        self.assertFalse(listener._preroll)
+
     def test_off_never_calls_vad_while_idle(self) -> None:
         listener, _, events, vad, _ = self._setup([1.0], mode="off")
         self._feed(listener, 50)

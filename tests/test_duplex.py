@@ -163,6 +163,49 @@ class DuplexTests(unittest.TestCase):
         self.assertIsNone(d._apm)
         d.close()  # idempotent
 
+    def test_blocks_are_rechunked_into_frames(self):
+        d, stream, _ = make()
+        stream.callback(bytearray(b"\x01\x00" * 320), bytearray(2 * BLOCK), 320, None, None)
+        it = d.frames()
+        self.assertEqual([len(next(it)), len(next(it))], [BLOCK, BLOCK])
+        self.assertTrue(d._pairs.empty())
+
+    def test_partial_block_is_carried(self):
+        d, stream, apm = make()
+        stream.callback(bytearray(b"\x01\x00" * 240), bytearray(480), 240, None, None)
+        stream.callback(bytearray(b"\x01\x00" * 80), bytearray(160), 80, None, None)
+        it = d.frames()
+        self.assertEqual(len(next(it)), BLOCK)  # 480 bytes -> 1 frame, 160 carried
+        self.assertEqual(len(next(it)), BLOCK)  # 160 carried + 160 -> 1 frame
+        self.assertEqual(sum(1 for c in apm.calls if c[0] == "capture"), 2)
+
+    def test_stream_start_failure_cleans_up(self):
+        holder = {}
+
+        class BadStream(FakeStream):
+            def start(self):
+                raise OSError("no device")
+
+        def factory(cb):
+            holder["s"] = BadStream(cb)
+            return holder["s"]
+
+        d = DuplexAudio(stream_factory=factory, apm_factory=lambda ns: FakeAPM())
+        with self.assertRaises(OSError):
+            d.start()
+        self.assertTrue(holder["s"].closed)
+        self.assertIsNone(d._apm)
+        self.assertIsNone(d._stream)
+
+    def test_stream_factory_failure_drops_apm(self):
+        def factory(cb):
+            raise OSError("no device")
+
+        d = DuplexAudio(stream_factory=factory, apm_factory=lambda ns: FakeAPM())
+        with self.assertRaises(OSError):
+            d.start()
+        self.assertIsNone(d._apm)
+
     def test_close_wakes_wait_drained(self):
         d, _, _ = make()
         d.play(b"\x01\x00" * 10)

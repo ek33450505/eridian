@@ -284,6 +284,7 @@ class Listener:
         self._state = "IDLE"
         self._utterance = bytearray()
         self._vad_buf = bytearray()
+        self._clear_talk_over()
 
     def _emit(self, event: ListenerEvent) -> None:
         self._on_event(event)

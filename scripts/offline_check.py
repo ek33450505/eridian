@@ -5,13 +5,15 @@ Run inside a network-denying sandbox (see verify-offline.sh):
     offline_check.py <clip.wav> <out.aiff> [--expect "text"]
 
 Feeds a recorded clip through wake word -> VAD -> STT, then TTS (`say -o` to a
-file, never the speakers). A network canary runs first so the check proves its
+file, never the speakers), then echo cancellation (a rendered sentence plus a
+simulated room echo through the real WebRTC AEC). A network canary runs first so the check proves its
 own premise: if the network is reachable, the result is meaningless.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import socket
@@ -41,6 +43,74 @@ def network_canary() -> list[str]:
     except OSError:
         pass
     return reachable
+
+
+def check_echo_cancellation(out: str, check, vad_cls) -> None:
+    """Prove WebRTC AEC (livekit) runs locally: ERLE >= 20 dB and the VAD stays quiet."""
+    import numpy as np
+
+    from undertone import duplex, speaker
+    from undertone.listener import ListenerConfig
+
+    text = (
+        "The quick brown fox jumps over the lazy dog while the morning sun rises "
+        "slowly over the quiet hills and the river runs on."
+    )
+    wav_path = os.path.splitext(out)[0] + "-aec.wav"
+    argv = speaker.build_say_argv(text, out_path=wav_path)
+    proc = subprocess.run(argv, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(wav_path):
+        check("echo cancellation", False, f"say rc={proc.returncode} {proc.stderr.strip()}".strip())
+        return
+    with wave.open(wav_path) as w:
+        far = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float64)
+
+    rng = np.random.default_rng(0)
+    rir = np.zeros(int(0.045 * 16000) + int(0.15 * 16000))
+    rir[int(0.045 * 16000)] = 0.5
+    tail_n = np.arange(int(0.15 * 16000))
+    rir[int(0.045 * 16000) :] += 0.08 * rng.standard_normal(len(tail_n)) * np.exp(-tail_n / (0.04 * 16000))
+    echo = np.convolve(far, rir)[: len(far)] + 30 * rng.standard_normal(len(far))
+    far_i = far.astype(np.int16)
+    near_i = np.clip(echo, -32768, 32767).astype(np.int16)
+
+    from livekit.rtc import AudioFrame
+
+    apm = duplex._default_apm_factory(True)
+    step = 160
+    residual = bytearray()
+    for i in range(0, len(far_i) - step + 1, step):
+        apm.set_stream_delay_ms(45)
+        apm.process_reverse_stream(AudioFrame(far_i[i : i + step].tobytes(), 16000, 1, step))
+        frame = AudioFrame(bytearray(near_i[i : i + step].tobytes()), 16000, 1, step)
+        apm.process_stream(frame)
+        residual += bytes(frame.data)
+    del apm  # livekit complains if it outlives the interpreter
+
+    skip = 16000  # let AEC3 converge for the first second
+    n = len(residual) // 2
+    res = np.frombuffer(bytes(residual), dtype=np.int16).astype(np.float64)
+    raw = near_i[:n].astype(np.float64)
+    erle = 10 * np.log10((np.mean(raw[skip:] ** 2) + 1e-9) / (np.mean(res[skip:] ** 2) + 1e-9))
+
+    vad = vad_cls()
+    chunk = 1024
+    pcm = bytes(residual)[skip * 2 :]
+    chunks = [pcm[i : i + chunk] for i in range(0, len(pcm) - chunk + 1, chunk)]
+    probs = [vad(c) for c in chunks]
+    fired = sum(1 for p in probs if p >= 0.5)
+    cfg = ListenerConfig()
+    needed = math.ceil(cfg.talk_over_min_s / (1024 / 2 / 16000) - 1e-9)  # as in listener.py
+    longest_run = run = 0
+    for p in probs:
+        run = run + 1 if p >= cfg.talk_over_threshold else 0
+        longest_run = max(longest_run, run)
+    check(
+        "echo cancellation",
+        erle >= 20 and longest_run < needed,
+        f"ERLE {erle:.1f} dB (need >= 20); longest speech-like run {longest_run} chunks "
+        f"(talk-over needs {needed}); VAD>=0.5 on {fired}/{len(chunks)} chunks",
+    )
 
 
 def main() -> int:
@@ -116,6 +186,8 @@ def main() -> int:
     check("TTS exit", proc.returncode == 0, f"say rc={proc.returncode} {proc.stderr.strip()}".strip())
     size = os.path.getsize(args.out) if os.path.exists(args.out) else 0
     check("TTS output", size > 0, f"{size} bytes")
+
+    check_echo_cancellation(args.out, check, SileroVoiceActivityDetector)
 
     ok = all(r[1] for r in results)
     print("RESULT: " + ("PASS" if ok else "FAIL"))

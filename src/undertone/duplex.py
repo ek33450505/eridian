@@ -13,6 +13,7 @@ a real stream needs real devices, which tests must never open.
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import threading
 from typing import Any, Callable, Iterator
@@ -72,10 +73,18 @@ class DuplexAudio:
 
     def start(self) -> None:
         self._apm = self._apm_factory(self._noise_suppression)
-        self._stream = self._stream_factory(self._callback)
-        if self._delay_ms is None:
-            self._delay_ms = self._derive_delay_ms(self._stream)
-        self._stream.start()
+        try:
+            self._stream = self._stream_factory(self._callback)
+            if self._delay_ms is None:
+                self._delay_ms = self._derive_delay_ms(self._stream)
+            self._stream.start()
+        except BaseException:
+            stream, self._stream = self._stream, None
+            if stream is not None:
+                with contextlib.suppress(Exception):
+                    stream.close()
+            self._apm = None
+            raise
 
     @staticmethod
     def _derive_delay_ms(stream: Any) -> int:
@@ -103,19 +112,31 @@ class DuplexAudio:
         from livekit.rtc import AudioFrame
 
         samples = FRAME_BYTES // 2
+        # Callback blocks need not be exactly one frame; re-chunk, since livekit
+        # raises on any other size. mic and ref grow in lockstep.
+        mic_buf = bytearray()
+        ref_buf = bytearray()
         while True:
             item = self._pairs.get()
-            apm = self._apm
-            if item is _STOP or apm is None:
+            if item is _STOP:
                 return
-            mic, ref = item
-            apm.set_stream_delay_ms(self._delay_ms)
-            # Far end must be seen before its paired capture so AEC3 can
-            # model the echo path.
-            apm.process_reverse_stream(AudioFrame(ref, SAMPLE_RATE, 1, samples))
-            frame = AudioFrame(bytearray(mic), SAMPLE_RATE, 1, samples)  # writable: AEC edits in place
-            apm.process_stream(frame)  # modifies in place
-            yield bytes(frame.data)
+            mic_buf += item[0]
+            ref_buf += item[1]
+            while len(mic_buf) >= FRAME_BYTES and len(ref_buf) >= FRAME_BYTES:
+                apm = self._apm
+                if apm is None:
+                    return
+                mic = bytes(mic_buf[:FRAME_BYTES])
+                ref = bytes(ref_buf[:FRAME_BYTES])
+                del mic_buf[:FRAME_BYTES]
+                del ref_buf[:FRAME_BYTES]
+                apm.set_stream_delay_ms(self._delay_ms)
+                # Far end must be seen before its paired capture so AEC3 can
+                # model the echo path.
+                apm.process_reverse_stream(AudioFrame(ref, SAMPLE_RATE, 1, samples))
+                frame = AudioFrame(bytearray(mic), SAMPLE_RATE, 1, samples)  # writable: AEC edits in place
+                apm.process_stream(frame)  # modifies in place
+                yield bytes(frame.data)
 
     # --- PlaybackSink: called from the player's thread ---
 

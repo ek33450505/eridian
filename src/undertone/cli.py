@@ -89,6 +89,65 @@ def chat_workdir(cwd: Path, home: Path, undertone_home: Path) -> tuple[Path, boo
     return workspace.resolve(), True
 
 
+class AudioIO:
+    """The audio plumbing a voice command runs on: frame source + speech player."""
+
+    def __init__(
+        self,
+        *,
+        player_factory: Callable[..., object],
+        talk_over: bool,
+        engine: object | None = None,
+    ) -> None:
+        self.player_factory = player_factory
+        self.talk_over = talk_over
+        self.engine = engine
+
+    def frames(self):
+        if self.engine is not None:
+            return self.engine.frames()
+        from . import audio
+
+        return audio.frame_source()
+
+    def start(self) -> None:
+        if self.engine is not None:
+            self.engine.start()
+
+    def close(self) -> None:
+        if self.engine is not None:
+            self.engine.close()
+
+
+def make_audio_io(no_aec: bool, *, engine_factory: Callable[[], object] | None = None) -> AudioIO:
+    """Echo-cancelled full-duplex audio by default; plain mic + `say` with no_aec."""
+    from .player import RenderedSpeechQueue, SpeechQueue
+
+    if no_aec:
+        return AudioIO(
+            player_factory=lambda on_start=None: SpeechQueue(on_start), talk_over=False
+        )
+    if engine_factory is None:
+        from .duplex import DuplexAudio as engine_factory
+    engine = engine_factory()
+    return AudioIO(
+        player_factory=lambda on_start=None: RenderedSpeechQueue(on_start, sink=engine),
+        talk_over=True,
+        engine=engine,
+    )
+
+
+def banner_line(io: AudioIO) -> str:
+    if io.talk_over:
+        return "Echo cancellation on: talk over a reply to stop it."
+    return "Echo cancellation off: say 'hey jarvis' to stop a reply."
+
+
+AUDIO_START_ERROR = (
+    "undertone: cannot open the audio devices for echo cancellation: {exc}. Try --no-aec."
+)
+
+
 def _cmd_listen(args: argparse.Namespace) -> int:
     # Imported lazily -- these pull in numpy/sounddevice/pymicro-wakeword/
     # pysilero-vad/parakeet-mlx, which other commands (notably `hook stop`)
@@ -131,7 +190,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     # Lazy imports for the same reason as `listen`.
     import time
 
-    from . import audio, brain
+    from . import brain
     from .chat import ChatSession
     from .stt import ModelNotCachedError, ParakeetSTT
 
@@ -158,6 +217,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     cues = {"wake": _WAKE_CUE, "follow_up": _FOLLOW_UP_CUE}
 
+    io = make_audio_io(args.no_aec)
     session = ChatSession(
         wake_factory=_make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -168,6 +228,8 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         vad_reset=vad.reset,
         follow_up_s=args.follow_up,
         cue=None if args.no_beep else (lambda kind: _play_cue(cues[kind])),
+        player_factory=io.player_factory,
+        talk_over=io.talk_over,
     )
 
     print(f"undertone chat: working in {workdir}")
@@ -180,13 +242,21 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         "Claude can read and search files under it and search the web; "
         "it cannot run commands or edit files."
     )
+    print(banner_line(io))
     print("Say 'hey jarvis'. Ctrl-C to quit.", flush=True)
     try:
-        session.run(audio.frame_source())
+        try:
+            io.start()
+        except Exception as exc:  # noqa: BLE001 - any device/engine failure
+            print(AUDIO_START_ERROR.format(exc=exc), file=sys.stderr)
+            return 1
+        session.run(io.frames())
     except KeyboardInterrupt:
         pass
     finally:
+        # Session first: that stops the player, which clears the sink.
         session.close()
+        io.close()
     return 0
 
 
@@ -333,7 +403,9 @@ def _voice_socket_present(sock_path: Path) -> bool:
 def _cmd_attach(args: argparse.Namespace) -> int:
     from . import voice
 
-    return voice.run_attach(no_beep=args.no_beep, follow_up_s=args.follow_up)
+    return voice.run_attach(
+        no_beep=args.no_beep, follow_up_s=args.follow_up, no_aec=args.no_aec
+    )
 
 
 def _cmd_models_fetch(args: argparse.Namespace) -> int:
@@ -375,6 +447,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to keep listening after a reply without the wake word "
         "(default 6; 0 disables)",
     )
+    chat_parser.add_argument(
+        "--no-aec",
+        action="store_true",
+        help="play speech with `say` directly; no echo cancellation, so only the "
+        "wake word interrupts a reply (use if AEC misbehaves)",
+    )
     chat_parser.set_defaults(func=_cmd_chat)
 
     sub.add_parser(
@@ -400,6 +478,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="seconds to keep listening after a reply without the wake word "
         "(default 6; 0 disables)",
+    )
+    attach_parser.add_argument(
+        "--no-aec",
+        action="store_true",
+        help="play speech with `say` directly; no echo cancellation, so only the "
+        "wake word interrupts a reply (use if AEC misbehaves)",
     )
     attach_parser.set_defaults(func=_cmd_attach)
 

@@ -534,14 +534,14 @@ def _server_answers(path: Path) -> bool:
         probe.close()
 
 
-def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
+def run_attach(*, no_beep: bool, follow_up_s: float, no_aec: bool = False) -> int:
     """The real wiring behind `undertone attach` (real mic; not unit-tested)."""
     # Lazy imports for the same reason as cli._cmd_chat: keep `--help` fast and
     # the heavy audio/model deps out of import time. cli is imported lazily too
     # (it imports this module).
     import time
 
-    from . import audio, cli
+    from . import cli
     from .stt import ModelNotCachedError, ParakeetSTT
 
     try:
@@ -555,6 +555,7 @@ def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
     vad = SileroVoiceActivityDetector()
     cues = {"wake": cli._WAKE_CUE, "follow_up": cli._FOLLOW_UP_CUE}
 
+    io = cli.make_audio_io(no_aec)
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -564,10 +565,14 @@ def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
         vad_reset=vad.reset,
         follow_up_s=follow_up_s,
         cue=None if no_beep else (lambda kind: cli._play_cue(cues[kind])),
+        player_factory=io.player_factory,
+        talk_over=io.talk_over,
     )
     if bridge.start() != 0:
         bridge.close()
+        io.close()
         return 1
+    print(cli.banner_line(io))
 
     print(
         "undertone attach: listening for 'hey jarvis'. Start a Claude session with "
@@ -575,9 +580,16 @@ def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
         flush=True,
     )
     try:
-        bridge.run(audio.frame_source())
+        try:
+            io.start()
+        except Exception as exc:  # noqa: BLE001 - any device/engine failure
+            print(cli.AUDIO_START_ERROR.format(exc=exc), file=sys.stderr)
+            return 1
+        bridge.run(io.frames())
     except KeyboardInterrupt:
         pass
     finally:
+        # Bridge first: that stops the player, which clears the sink.
         bridge.close()
+        io.close()
     return 0
