@@ -4,16 +4,24 @@
 
 ```
 Path A (undertone attach + undertone session):
-  mic → wake ("hey jarvis") → VAD (0.7 s silence) → STT → voice.sock → channel (mcp_channel.py) → Claude Code session
-                                                                                       │ reply tool
-  speaker ← say ← speech queue (player.py) ← sentence chunker ← voice.sock ← channel ◄─┘
+  mic ──┬─→ AEC ─→ wake ("hey jarvis") → VAD (0.7 s silence) → STT → voice.sock → channel (mcp_channel.py) → Claude Code session
+        │                                                                                             │ reply tool
+  duplex engine ◄──────────────────────────────────────────────────────────────────────────────────┘
+        │     speech queue (RenderedSpeechQueue) ← sentence chunker ← voice.sock ← channel
+        └──→ speaker (duplex sink)
 
 Path B (undertone chat):
-  mic → wake ("hey jarvis") → VAD (0.7 s silence) → STT → brain (persistent claude -p)
-  speaker ← say ← speech queue (player.py) ← sentence chunker ◄─ streamed text ─┘
-```
+  mic ──┬─→ AEC ─→ wake ("hey jarvis") → VAD (0.7 s silence) → STT → brain (persistent claude -p)
+        │
+  duplex engine ◄───────────────────────────────────────────────────────┐
+        │     speech queue ← sentence chunker ◄─ streamed text ──────────┘
+        └──→ speaker (duplex sink)
 
-The wake detector stays live while Claude is thinking or speaking. Saying "hey jarvis" again stops the speech and interrupts the turn (barge-in).
+Note: AEC (WebRTC echo cancellation) uses the speaker signal as reference.
+The wake detector and VAD stay live while Claude is thinking or speaking.
+Saying "hey jarvis" again stops the speech and interrupts the turn (barge-in).
+Talk-over: sustained speech during playback without wake word opens a turn (gated by voice guard).
+```
 
 ### Brain Adapters
 
@@ -31,7 +39,8 @@ There are two brains:
 | `stt.py` | ParakeetSTT: warm-up on load (first call ~823 ms → 54 ms after warm-up, Phase 2a); HF_HUB_OFFLINE forced at import | Model: mlx-community/parakeet-tdt-0.6b-v3. Float32 in-memory, never written to disk. |
 | `brain.py` | ClaudeBrain: one persistent child; reader thread → queue; `ask()` yields TextDelta/ToolUse/TurnEnd; `interrupt()` writes control_request JSON (~10 ms response) | 120 s turn timeout; stderr → 0600 log; atomic 0600 session file. Process startup cost eliminated (one-shot `claude -p` is 5.5–13 s; persistent child gives ~1.0–2.0 s to first token, measured on M4 Max). |
 | `chunker.py` | SentenceChunker: stream of text deltas → sentences | `.!?` + whitespace, or newline; skips decimals and abbreviations (e.g., "e.g.", "etc."); fenced code → "Code's on screen." once per turn; 240-char soft cap. |
-| `player.py` | SpeechQueue: sequential `say` per sentence; `stop()` for barge-in with generation counter | Closes race between dequeue and spawn via generation counter. Worker thread owned by SpeechQueue. |
+| `player.py` | SpeechQueue: sequential `say` per sentence; `stop()` for barge-in with generation counter. RenderedSpeechQueue: renders TTS via `say -o`, validates 1 channel / 16-bit / 16 kHz, unlinks after reading. Timeout: RENDER_TIMEOUT_S = 20 s. | Closes race between dequeue and spawn via generation counter. Worker thread owned by SpeechQueue. Render files in mode-0700 temp directory, deleted in finally. In-memory buffers ~32 KB/s. |
+| `duplex.py` | DuplexAudio: full-duplex sounddevice RawStream (16 kHz, mono, int16, 10 ms blocks). Audio callback writes to speaker, queues (mic, exactly-what-was-played). Main thread runs WebRTC AudioProcessingModule (AEC3) with echo_cancellation, noise_suppression, high_pass_filter. Delay hint: the stream's input+output latency, or 40 ms. Implements PlaybackSink. | Lazy import for light commands. Stream delay set via set_stream_delay_ms. Cleaned frames to listener. Tests inject stream_factory and apm_factory. |
 | `chat.py` | ChatSession: main thread owns mic and Listener; ONE brain worker thread runs turns sequentially | An interrupted turn drains to its end before the next message is written. Generation counter bumped on every utterance and barge-in discards stale output. After a completed reply, worker waits for player idle, then posts to control queue; main thread drains → follow-up window. |
 | `speaker.py` | build_say_argv: constructs `say` argv with `--` to guard against flag injection | Single point where `say` text is prepared; speaks replies in Path A (via reply tool) and Path B (via player queue). Runs `spoken.sanitize_for_tts()` to filter wake word. |
 | `spoken.py` | Reply sanitization for TTS: strips invisible characters, removes `[`/`]`, replaces wake word forms with "the wake word" | Used by speaker.build_say_argv. |
@@ -46,20 +55,26 @@ There are two brains:
 ```
 IDLE ── wake word ──► LISTENING
 LISTENING
-  ├─ no speech within 4 s           → IDLE
-  ├─ 0.7 s silence after speech      → STT → utterance → THINKING
-  └─ 15 s max utterance              → STT → utterance → THINKING
+  ├─ no speech within 4 s                           → IDLE
+  ├─ 0.7 s silence after speech                      → STT → utterance → THINKING
+  └─ 15 s max utterance                              → STT → utterance → THINKING
+
 THINKING (brain turn) → SPEAKING (sentences queued and played)
-  └─ reply finished playing          → FOLLOW-UP: LISTENING without the wake word, 6 s
-                                        (no speech → IDLE)
-THINKING / SPEAKING ── wake word ──► barge-in: stop speech, interrupt turn → LISTENING
+  ├─ wake word during speech                         → barge-in: stop speech, interrupt turn → LISTENING
+  ├─ talk-over, mode "turn" (ack/answer; all chat)  → barge-in → LISTENING (talk_over turn, 0.5 s pre-roll)
+  ├─ talk-over, mode "stop" (confirm/unknown kind)   → stop speech only (talk_over_stop); answering needs the wake word
+  └─ reply finished playing                          → FOLLOW-UP: LISTENING without the wake word, 6 s
+                                                        (no speech → IDLE)
 ```
 
-`listener.py:Listener` covers IDLE and LISTENING, with timings from `ListenerConfig`. `chat.py:ChatSession` adds THINKING, SPEAKING, barge-in and the follow-up window (`Listener.listen_now()`).
+- `Listener.talk_over`: set by owner before each frame: `"off"` (no VAD while IDLE), `"stop"` (emit event, stay IDLE), `"turn"` (open turn).
+- Talk-over turn pre-seeded with `talk_over_preroll_s=0.5` s of audio; sustained speech is 10 consecutive 32 ms chunks at ≥ `talk_over_threshold=0.6`.
+- Wake word always checked first.
+- `listener.py:Listener` covers IDLE and LISTENING. `chat.py:ChatSession` and `voice.py:VoiceBridge` add THINKING, SPEAKING, barge-in, follow-up, and talk-over modes (via `Listener.talk_over`).
 
 ## Lock Order
 
-Session lock → player lock. The player's `on_start` callback is invoked without the lock held (avoiding deadlock).
+`VoiceBridge` session lock → player lock (`RenderedSpeechQueue`'s condition) → the duplex engine's buffer lock. On the main thread, `VoiceBridge._talk_over_mode()` takes the session lock and then reads `player.busy`, and the result is assigned to `Listener.talk_over` before the frame is processed. The player calls `sink.play` under its own condition; the sink never calls back into the player. The audio callback only takes the buffer lock, briefly, and never waits. The player's `on_start` callback runs with no lock held. No lock is held across `player.stop()`.
 
 ## Latency Budget (M4 Max, measured 2026-10-01)
 
@@ -81,18 +96,62 @@ Target: ≤ 4 s from speech end to reply start.
 - **Clock:** injected callable; the CLI uses `time.monotonic`, and tests use a fake clock they advance by hand
 - **Fake Claude:** `tests/fake_claude.py` is a protocol-faithful CLI that does not require Claude Code login
 - **Say override:** `UNDERTONE_SAY_CMD` stubs `say` with a test binary
-- **Undertone home:** `UNDERTONE_HOME` temp dir for each test (socket, logs, cache)
+- **DuplexAudio:** `stream_factory` and `apm_factory` injected for fakes; the CLI uses the real sounddevice and livekit
+- **RenderedSpeechQueue:** `sink` injected (PlaybackSink) for testing without audio output
+- **Undertone home:** `UNDERTONE_HOME` temp dir for each test (socket, logs, cache, render temp files)
 - **Session isolation:** Each test runs in its own `UNDERTONE_HOME` and fake Claude session
 
 Tests run with `uv run python -m unittest discover -s tests`. No microphone, no speakers, no real `claude`, never touches `~/.undertone`.
 
-## Phase 4 Note: Echo Cancellation for Barge-In
+## Phase 4: Echo Cancellation for Talk-Over (2026-10-01)
 
-Today, barge-in requires the wake word. Talking over a reply without the wake word is planned for Phase 4 (Kokoro voice + livekit echo cancellation).
+**Talk-over:** Users can now interrupt an undertone reply by speaking, without saying the wake word. `Listener.talk_over`, set by the owner before each frame, controls the behavior: `"off"` (default; no VAD while idle), `"stop"` (emit `talk_over_stop`, stay IDLE), or `"turn"` (open a turn pre-seeded with 0.5 s of audio).
 
-The challenge is telling the user's speech apart from undertone's own playback when both reach the microphone. Echo cancellation needs the playback signal as a reference, so Phase 4 will render TTS audio and play it from undertone's own process. That requires:
-- A resident TTS model whose audio undertone plays itself (Kokoro or similar)
-- An echo canceller fed the playback signal as reference (livekit `AudioProcessingModule`)
-- Barge-in detection on the echo-cancelled mic signal
+**Echo Cancellation:** Undertone now renders TTS itself, capturing the playback signal to feed WebRTC's `AudioProcessingModule` (AEC3) as a reference. The audio callback runs in the sounddevice RawStream; the main thread runs the echo canceller on each frame.
 
-Today `say` plays its audio directly, so undertone never sees the playback signal and has nothing to use as an echo reference.
+### Rendered TTS
+- `player.RenderedSpeechQueue` replaces `SpeechQueue` when AEC is on (default; `--no-aec` to disable).
+- It renders each sentence with `say -o` (argv from `speaker.build_say_argv(text, out_path=...)`) into a private `tempfile.mkdtemp(prefix="undertone-tts-")` directory (0700) as `<counter>.wav`, then validates (1 channel, 16-bit, 16 kHz), plays via the duplex sink, and unlinks the file in a `finally`.
+- `RENDER_TIMEOUT_S = 20.0`: a hung render is killed and skipped.
+- Each reply line (64 KB text max) buffers roughly 10 MB of audio in memory at most, about 32 KB per second of speech.
+
+### Duplex Engine
+- `duplex.DuplexAudio` runs one full-duplex sounddevice `RawStream`: 16 kHz, mono, int16, 10 ms blocks (160 samples).
+- The audio callback: (1) copies up to one block from the playback buffer (zero-padded), (2) writes it to the speaker, (3) queues (mic frame, exactly-what-was-played).
+- The main thread runs `AudioProcessingModule(echo_cancellation=True, noise_suppression=True, high_pass_filter=True)` on each frame:
+  - `set_stream_delay_ms`: the stream's input+output latency, or 40 ms
+  - `process_reverse_stream`: the speaker signal
+  - `process_stream`: the mic signal, edited in-place
+- Cleaned frames go to the listener (wake word and VAD).
+- The engine is also the `PlaybackSink` (`play`, `clear`, `playing`, `wait_drained`).
+- Lazy imports keep light commands free of sounddevice and livekit.
+
+### Talk-Over Detection and Control
+- Sustained speech: 10 consecutive 32 ms VAD chunks at ≥ 0.6 (`ListenerConfig.talk_over_threshold=0.6`, `talk_over_min_s=0.3`).
+- In `"turn"` mode, opens a `talk_over` turn pre-seeded with `talk_over_preroll_s=0.5` s of audio.
+- In `"stop"` mode, emits `talk_over_stop` and stays IDLE, keeping the wake detector running.
+- The wake word is always checked first.
+- With mode `"off"` (default, and whenever the player is idle), no VAD runs while IDLE.
+
+### Hard Control: Voice Provenance
+Every utterance now carries `"via": "wake"|"follow_up"|"talk_over"` on the voice socket:
+- `mcp_channel` passes `can_grant = (via == "wake")` to the voice guard.
+- `voice_guard.record_voice()` consumes the pending challenge (one attempt), but only `can_grant=True` plus the phrase grants.
+- **Before this fix:** a talk-over turn could capture undertone's own spoken "confirm <w1> <w2>" through imperfect AEC and grant it. A talk-over turn already listening when a confirm reply was spoken could capture it. A follow-up window could open after a confirm reply followed by an answer.
+- **Verified end-to-end** (2026-10-01): via `talk_over`, `follow_up`, or missing → no grant, Write denied; via `wake` → granted.
+
+### Echo Filter (Defence in Depth)
+- `spoken.looks_like_echo(heard, spoken, threshold=0.6, min_words=3)` uses difflib, matching in-order word blocks.
+- A talk-over transcript that mostly repeats the reply being spoken is dropped with `[ignored: that sounded like my own reply]`.
+- Not applied to wake or follow-up turns.
+
+### Residual Risks
+- Talk-over widens no-wake-word input: it was the 6 s follow-up window after an answer; now it is also the whole playback of every ack or answer.
+- Ambient speech during playback can open a turn. That turn is gated by voice_guard and cannot confirm.
+- If the wake detector ever fired on undertone's own speech, that turn would carry `via: "wake"`. The TTS scrub prevents the wake phrase from being spoken; that pre-existing control covers this.
+- **Imperfect AEC in a real room** (speaker nonlinearity, loud volume) is **not yet live-tested**. `--no-aec` turns talk-over off.
+
+### Measurement (offline simulation, M4 Max, 2026-10-01)
+- **ERLE (Echo Return Loss Enhancement):** ≈ 35 dB
+- **VAD on residual chunks:** 0/217 chunks (vs. 189/217 raw)
+- **Processing time:** ~60 µs per 10 ms frame

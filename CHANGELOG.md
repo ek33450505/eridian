@@ -4,6 +4,27 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-01 — Phase 4a: echo cancellation and talk-over
+
+**Added**
+- `DuplexAudio` (duplex.py): full-duplex sounddevice `RawStream` (16 kHz mono int16, 10 ms blocks). Pairs each mic frame with the speaker frame it just wrote. WebRTC AEC3 via livekit's `AudioProcessingModule(echo_cancellation=True, noise_suppression=True, high_pass_filter=True)`: the speaker frame goes to `process_reverse_stream`, then the mic frame to `process_stream`. The delay hint is the stream's input+output latency or 40 ms if unknown. Offline simulation (2026-10-01): ERLE ≈ 35 dB, Silero VAD fired on residual in 0/217 chunks (vs 189/217 without AEC), user voice still detected at max probability 0.9999, ~60 µs per 10 ms frame. **NOT yet live-tested with real speakers and mic.**
+- `RenderedSpeechQueue` (player.py): renders each sentence with `say -o <file> --file-format=WAVE --data-format=LEI16@16000` to a private temp dir (prefix `undertone-tts-`, mode 0700; file deleted after reading). Rendering time: 0.62 s for a 4.7 s sentence (measured 2026-10-01). Sentences render ahead so playback is gapless. `SpeechQueue` (direct `say`) remains for `--no-aec`.
+- Talk-over (AEC on only): sustained speech stops playback without the wake word — 10 consecutive 32 ms VAD chunks at probability ≥ 0.6 (`ListenerConfig.talk_over_threshold=0.6`, `talk_over_min_s=0.3`). Your speech becomes your next turn; `talk_over_preroll_s=0.5` keeps your first words. Exception: during a confirm prompt (or reply of unknown kind), talk-over stops the speech but you still say the wake word plus the phrase to answer. In `chat`, talk-over also interrupts Claude's in-flight turn.
+- Hard control (`via` field): every utterance carries `via` = `wake` | `follow_up` | `talk_over`. `voice_guard.record_voice(..., can_grant=False)` lets ONLY a wake-word turn (`via: "wake"`, exact match) satisfy a confirm challenge. Any voice turn still uses up the one attempt. Enforced end to end through the channel and PreToolUse hook. An old `undertone attach` paired with a new session sends no `via`, so confirmations fail closed.
+- Echo filter (defence in depth): a talk-over transcript that mostly repeats the reply being spoken is dropped (`spoken.looks_like_echo`, ≥60% of ≥3 words matching in order). Prints `[ignored: that sounded like my own reply]`. Does not apply to wake or follow-up turns.
+- CLI: `undertone attach` and `undertone chat` use echo cancellation by default. New flag `--no-aec` (both commands) plays speech with `say` directly: no echo cancellation, no talk-over, wake-word barge-in only. Startup banner: `Echo cancellation on: talk over a reply to stop it.` / `Echo cancellation off: say 'hey jarvis' to stop a reply.` If audio devices can't be opened: `undertone: cannot open the audio devices for echo cancellation: <error>. Try --no-aec.`
+- `scripts/verify-offline.sh` gains an "echo cancellation" check (ERLE ≥ 20 dB, and no speech-like run on the residual long enough to trigger talk-over; 43.9 dB and a 3-chunk longest run on 2026-10-01).
+
+**Changed**
+- `speaker.build_say_argv(text, *, out_path=None)`, still the single sanitizing argv builder, gains a render-to-file mode for `RenderedSpeechQueue`; every flag stays before `--`.
+- `undertone listen` is unchanged (raw mic).
+
+**Security**
+- Confirm challenges: only wake-word turns (`via: "wake"`) can satisfy them. Talk-over and follow-up turns cannot grant gated calls: such a turn could be undertone's own speech leaking through imperfect echo cancellation, or ambient audio. Found by the security review of talk-over (CHANGES_REQUESTED, fixed, then APPROVED).
+
+**Dependency**
+- livekit 1.1.20 (Apache-2.0; pulls in protobuf, types-protobuf, aiofiles). Only its local `AudioProcessingModule` is used, with no LiveKit server or network.
+
 ### 2026-10-01 — Voice guard follow-ups (from the live test)
 
 - **Live-verified** with real speech on Claude Code 2.1.286. See SECURITY.md §7a for the results.

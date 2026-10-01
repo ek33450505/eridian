@@ -6,7 +6,7 @@ This is the deep version of the README's lead section. undertone's promise is: *
 
 | Stays on your Mac | Goes to Anthropic | Never exists |
 |---|---|---|
-| Mic audio; wake word (pymicro-wakeword); VAD (Silero, 32 ms chunks); STT (parakeet-mlx, float32 in memory); TTS (macOS `say`); all models | The transcribed text of each turn, plus normal Claude Code traffic: the contents of files Claude reads (working directory only) and its WebSearch queries, which run server-side | API keys of undertone's own (it uses however your `claude` is logged in); audio uploads; cloud STT/TTS fallbacks |
+| Mic audio; wake word (pymicro-wakeword); VAD (Silero, 32 ms chunks); STT (parakeet-mlx, float32 in memory); TTS (macOS `say`, rendered to 16 kHz PCM in temp files, then deleted); AEC (livekit WebRTC AudioProcessingModule, local-only); all models | The transcribed text of each turn, plus normal Claude Code traffic: the contents of files Claude reads (working directory only) and its WebSearch queries, which run server-side | API keys of undertone's own (it uses however your `claude` is logged in); audio uploads; cloud STT/TTS fallbacks |
 
 ## Every Network Touchpoint, Listed Honestly
 
@@ -41,7 +41,10 @@ Run `bash scripts/verify-offline.sh`.
 2. Runs `.venv/bin/python scripts/offline_check.py <clip> <out.aiff>` inside a macOS `sandbox-exec` profile that **denies all network access** with the policy `(version 1)(allow default)(deny network*)`
 3. Inside that sandbox, feeds the real wake word detector, VAD, and STT through `Listener` with a simulated clock
 4. Calls `say -o` to render a reply to an AIFF file
-5. Asserts:
+5. **Echo cancellation check (Phase 4):** Simulates room echo on the rendered reply and runs it through the real `AudioProcessingModule` (WebRTC AEC3). Asserts:
+   - ERLE (Echo Return Loss Enhancement) ≥ 20 dB
+   - No speech-like run on the residual (echo-cancelled) audio long enough to trigger talk-over: the longest run of chunks with Silero VAD ≥ `talk_over_threshold` must be shorter than the 10 chunks talk-over needs. On 2026-10-01: ERLE 43.9 dB, longest run 3 chunks. With echo cancellation switched off, the check fails (ERLE 0.7 dB, longest run 92 chunks).
+6. Asserts:
    - Network canary fails (TCP to 1.1.1.1 and DNS lookup both blocked)
    - Wake word fired exactly once
    - Transcript contains "capital of france" (case-insensitive, punctuation-ignored)
@@ -53,6 +56,7 @@ Run `bash scripts/verify-offline.sh`.
 - `say` rc 0: ✓
 - Inside the sandbox, a TCP connect to 1.1.1.1:443 failed: ✓
 - Inside the sandbox, a DNS lookup of example.com failed: ✓
+- Echo cancellation inside the sandbox: ERLE 43.9 dB, longest speech-like run 3 chunks (talk-over needs 10): ✓
 
 **Why not Docker `--network none`?**
 MLX (the ML framework) and macOS `say` are macOS-only; Docker can't run them.
@@ -99,8 +103,10 @@ This is a snapshot of one session, not a proof for all sessions. Run it yourself
 Your terminal app needs microphone permission (macOS → System Settings → Privacy & Security → Microphone).
 
 ### Audio Buffering and Storage
-- Audio is buffered in RAM only after the wake word fires (or during the 6-second follow-up window)
-- Nothing is recorded to disk
+- Audio is buffered in RAM only after the wake word fires, during the 6-second follow-up window, or during talk-over playback
+- TTS audio is rendered into a transient temp directory (mode 0700) created with `tempfile.mkdtemp(prefix="undertone-tts-")`, validated for format (1 channel, 16-bit, 16 kHz), read into the playback buffer, and immediately unlinked. The directory is deleted when `RenderedSpeechQueue` closes.
+- Playback audio buffers in RAM (~32 KB/s of speech); replies up to 64 KB of text can buffer ~10 MB in memory at most
+- Nothing else is recorded to disk
 - The session ID is stored in `~/.undertone/chat_session` (mode 0600) for `--resume`
 
 ### Claude Code Logs
