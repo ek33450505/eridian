@@ -82,7 +82,7 @@ def build_say_argv(text: str) -> list[str] | None:
     if not text:
         return None
     say_cmd = os.environ.get("UNDERTONE_SAY_CMD", "say")
-    voice = os.environ.get("UNDERTONE_VOICE", "Zoe (Premium)")
+    voice = os.environ.get("UNDERTONE_VOICE", "Evan (Enhanced)")
     cmd = [say_cmd]
     if voice:
         cmd += ["-v", voice]
