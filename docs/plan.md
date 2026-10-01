@@ -88,16 +88,18 @@ Must-haves: speak only for **opted-in sessions** (flag file per `session_id`, to
 | Risk | Research-preview dependency | Headless bypasses CAST confirm-pauses |
 | Best for | "Read me what you did" while coding | Conversational Jarvis |
 
-## 5. Latency budget (targets — none measured yet)
+## 5. Latency budget (Phase 0 measurements, 2026-09-30, M4 Max)
 
-| Stage | Target | Note |
-|---|---|---|
-| Wake word fires | ≤ 0.3 s | |
-| End-of-turn silence | 0.6–0.8 s | Biggest local lever; VoiceMode's 3.0 s is why it feels slow |
-| STT (5 s utterance) | ≤ 0.3 s | Measure parakeet-mlx vs whisper.cpp |
-| Claude first token | 1–3 s? | Unmeasured; network + model, not local |
-| TTS first audio | `say` ≈ instant; Kokoro warm ~0.3 s | Kokoro figure from a blog, unverified |
-| **Speech end → first spoken word** | **~2–4 s** (Path B) | Path A adds full reply-generation time |
+| Stage | Target | Measured | Note |
+|---|---|---|---|
+| Wake word fires | ≤ 0.3 s | — | Phase 0 item for Ed: needs mic permission and 30 min of real use |
+| End-of-turn silence | 0.6–0.8 s | — | Biggest local lever; VoiceMode's 3.0 s is why it feels slow |
+| STT, 1.8–3.8 s utterances | ≤ 0.3 s | **parakeet-mlx: median 44 ms** (34–127 ms), 5/5 correct (one comma dropped), 1.2 GB RSS. mlx-whisper large-v3-turbo: median 217 ms, 5/5 exact, 1.9 GB | Input was clean synthetic `say` speech. Real voice through the built-in mic is still untested. Feed **in-memory arrays**: both libraries shell out to `ffmpeg` for file input, and ffmpeg isn't needed for mic audio. parakeet needs float32 input; a bf16 cast breaks its STFT |
+| Claude first token | 1–3 s | **Persistent `claude -p` stream-json: 0.9–3.1 s per turn, median ~1.2 s**, turn 1 including spawn 1.6–1.9 s. Cold one-shot `claude -p` per turn: **5.5–13 s** | One-shot is ruled out: Path B must keep one process alive. `--strict-mcp-config` / `--setting-sources project` gave no clear gain. `--bare` is unusable because it accepts only `ANTHROPIC_API_KEY` and never reads the OAuth login. Why one-shot is slower is not isolated (stdin was ruled out) |
+| TTS first audio | ≤ 0.3 s | **`say` + Zoe Premium: 0.73 s** to render one sentence to a file (includes process start). Kokoro via mlx-audio: **BLOCKED** | Kokoro: `espeakng-loader` 0.2.4 (macOS arm64) `exit(1)`s on a data path compiled in on its CI machine and ignores `ESPEAK_DATA_PATH` (mlx-audio 0.5.7, misaki 0.9.4). Try kokoro-onnx or Homebrew espeak-ng in Phase 4. A resident `NSSpeechSynthesizer`/AVSpeech process should beat `say`'s per-call process start |
+| **Speech end → first spoken word** | **~2–4 s** (Path B) | ≈ 0.7 s end-of-turn + 0.05 s STT + ~1.2 s Claude + ≤ 0.7 s TTS ≈ **2.7 s** estimated from parts | Not yet measured end to end. Path A adds the full reply-generation time |
+
+**Channels (Path A input), checked against `channels-reference`:** a custom channel needs `claude --dangerously-load-development-channels server:<name>`, which shows a full-screen warning **that must be accepted interactively**, so testing can't be automated. The documented runtime is Node/Bun/Deno with `@modelcontextprotocol/sdk`; Node v26 is installed, and Python is unverified. Two-way channels also expose a **reply tool**, which could replace the Stop hook as Path A output, and *permission relay* forwards tool approvals to the channel. The hello-world test is a Phase 0 item for Ed.
 
 ## 6. Phased plan
 
