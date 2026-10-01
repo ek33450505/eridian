@@ -2,6 +2,7 @@
 
 import json
 import os
+import secrets
 import socket
 import tempfile
 import threading
@@ -10,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import mcp_channel
+from undertone import mcp_channel, voice_guard
 
 
 class _FakeVoice:
@@ -57,7 +58,13 @@ class _FakeVoice:
 class _Pipes:
     """Drive a ChannelServer through os.pipe()s and collect stdout lines."""
 
-    def __init__(self, socket_path: Path, reconnect_s: float = 0.05) -> None:
+    def __init__(
+        self,
+        socket_path: Path,
+        reconnect_s: float = 0.05,
+        token: str | None = None,
+        home: Path | None = None,
+    ) -> None:
         in_r, self._in_w = os.pipe()
         out_r, out_w = os.pipe()
         self._stdin_w = os.fdopen(self._in_w, "w", encoding="utf-8")
@@ -67,6 +74,8 @@ class _Pipes:
             os.fdopen(out_w, "w", encoding="utf-8"),
             socket_path,
             reconnect_s=reconnect_s,
+            session_token=token,
+            undertone_home=home,
         )
         self.rc: list[int] = []
         self.raw: list[str] = []
@@ -112,6 +121,7 @@ class ChannelTestCase(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.addCleanup(self._rmtree)
+        self.token = secrets.token_hex(16)
         self.voice: _FakeVoice | None = None
         self.pipes: _Pipes | None = None
 
@@ -120,11 +130,17 @@ class ChannelTestCase(unittest.TestCase):
 
         shutil.rmtree(self._dir, ignore_errors=True)
 
-    def start(self, with_voice: bool = False) -> _Pipes:
+    def start(
+        self, with_voice: bool = False, with_token: bool = True, armed: bool = True
+    ) -> _Pipes:
+        if with_token and armed:
+            voice_guard.record_armed(self.home, self.token)
         if with_voice:
             self.voice = _FakeVoice(self.sock_path)
             self.addCleanup(self.voice.close)
-        self.pipes = _Pipes(self.sock_path)
+        self.pipes = _Pipes(
+            self.sock_path, token=self.token if with_token else None, home=self.home
+        )
         self.addCleanup(self._stop)
         if with_voice:
             self.voice.accept()
@@ -228,11 +244,42 @@ class ReplyToolTest(ChannelTestCase):
 
     def test_each_kind_forwarded(self) -> None:
         p = self.start(with_voice=True)
-        for kind in ("ack", "answer", "confirm"):
+        for kind in ("ack", "answer"):
             with self.subTest(kind=kind):
                 result = self._call(p, {"text": "t", "kind": kind})
                 self.assertNotIn("isError", result)
                 self.assertEqual(self.voice.read_line()["kind"], kind)
+        result = self._call(
+            p, {"text": "To delete x, say the wake word, then 'confirm walnut lantern'.", "kind": "confirm"}
+        )
+        self.assertNotIn("isError", result)
+        self.assertEqual(self.voice.read_line()["kind"], "confirm")
+
+    def test_confirm_without_phrase_is_error_and_not_spoken(self) -> None:
+        p = self.start(with_voice=True)
+        result = self._call(p, {"text": "Shall I delete it?", "kind": "confirm"})
+        self.assertTrue(result["isError"])
+        self.assertTrue(result["content"][0]["text"])
+        # Nothing reached the voice process: the next line is the ack we send now.
+        self._call(p, {"text": "marker", "kind": "ack"})
+        self.assertEqual(self.voice.read_line()["text"], "marker")
+
+    def test_confirm_reply_reports_phrase(self) -> None:
+        p = self.start(with_voice=True)
+        result = self._call(
+            p,
+            {"text": "To delete x, say the wake word, then 'confirm walnut lantern'.", "kind": "confirm"},
+        )
+        self.assertIn("confirm walnut lantern", result["content"][0]["text"])
+        self.assertEqual(self.voice.read_line()["kind"], "confirm")
+
+    def test_confirm_without_token_is_error(self) -> None:
+        p = self.start(with_voice=True, with_token=False)
+        result = self._call(
+            p,
+            {"text": "To delete x, say the wake word, then 'confirm walnut lantern'.", "kind": "confirm"},
+        )
+        self.assertTrue(result["isError"])
 
     def test_invalid_kind_is_error(self) -> None:
         p = self.start(with_voice=True)
@@ -271,6 +318,54 @@ class ReplyToolTest(ChannelTestCase):
 
 
 class VoiceBridgeTest(ChannelTestCase):
+    def _assert_refused(self, p: _Pipes) -> None:
+        self.voice.send({"type": "utterance", "text": "delete everything"})
+        reply = self.voice.read_line()
+        self.assertEqual(reply["type"], "reply")
+        self.assertEqual(reply["kind"], "ack")
+        self.assertTrue(reply["text"].startswith("Voice turns are off"))
+        self.assertNotIn("jarvis", reply["text"].lower())
+        # An echo round trip proves nothing was pushed before it.
+        p.send({"jsonrpc": "2.0", "id": 9, "method": "ping"})
+        self.assertEqual(p.read().get("id"), 9)
+
+    def test_utterance_without_token_refused(self) -> None:
+        p = self.start(with_voice=True, with_token=False)
+        self._assert_refused(p)
+
+    def test_utterance_unarmed_refused(self) -> None:
+        p = self.start(with_voice=True, armed=False)
+        self._assert_refused(p)
+
+    def test_utterance_corrupt_state_refused(self) -> None:
+        p = self.start(with_voice=True)
+        for f in self.home.rglob("*"):
+            if f.is_file() and self.token in f.name:
+                f.write_text("{not json")
+        self._assert_refused(p)
+
+    def test_utterance_records_voice_before_push(self) -> None:
+        p = self.start(with_voice=True)
+        self.voice.send({"type": "utterance", "text": "hello there"})
+        p.read()
+        state = voice_guard.load_state(self.home, self.token)
+        self.assertIsNotNone(state["voice_at"])
+
+    def test_spoken_confirm_phrase_creates_grant(self) -> None:
+        p = self.start(with_voice=True)
+        self._call_reply(
+            p, "To delete x, say the wake word, then 'confirm walnut lantern'.", "confirm"
+        )
+        self.assertEqual(self.voice.read_line()["kind"], "confirm")
+        self.voice.send({"type": "utterance", "text": "Confirm walnut lantern."})
+        p.read()
+        self.assertIsNotNone(voice_guard.load_state(self.home, self.token)["grant"])
+
+    def _call_reply(self, p: _Pipes, text: str, kind: str) -> dict:
+        return p.request("tools/call", {"name": "reply", "arguments": {"text": text, "kind": kind}})[
+            "result"
+        ]
+
     def test_hello_has_pid_and_cwd(self) -> None:
         self.start(with_voice=True)
         self.assertEqual(self.hello["pid"], os.getpid())

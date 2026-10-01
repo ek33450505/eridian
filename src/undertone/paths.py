@@ -27,11 +27,6 @@ def voice_socket_path() -> Path:
     return home_dir() / "voice.sock"
 
 
-def channel_config_path() -> Path:
-    """MCP config `undertone session` writes and passes to `claude --mcp-config`."""
-    return home_dir() / "channel.mcp.json"
-
-
 def log_dir() -> Path:
     """Directory for logs, created if missing."""
     path = home_dir() / "logs"
