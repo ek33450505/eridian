@@ -37,7 +37,7 @@ def _extract_spoken_line(reply: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _strip_markdown(text: str) -> str:
+def strip_markdown(text: str) -> str:
     """Drop fenced code, inline code, and common markdown punctuation/noise."""
     text = _FENCED_CODE_RE.sub(" ", text)
     text = _INLINE_CODE_RE.sub(" ", text)
@@ -80,7 +80,7 @@ def spoken_text(reply: str, max_chars: int = 300) -> str:
         collapsed = _WHITESPACE_RE.sub(" ", spoken_line).strip()
         return _cap_at_word_boundary(collapsed, max_chars)
 
-    stripped = _strip_markdown(reply)
+    stripped = strip_markdown(reply)
     collapsed = _WHITESPACE_RE.sub(" ", stripped).strip()
     if not collapsed:
         return ""
