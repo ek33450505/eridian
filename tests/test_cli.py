@@ -32,57 +32,20 @@ class CliTestCase(unittest.TestCase):
         return rc, buf.getvalue()
 
 
-class HooksSnippetTest(CliTestCase):
-    def test_prints_valid_json_with_both_hooks(self) -> None:
-        rc, out = self._run("hooks-snippet")
-        self.assertEqual(rc, 0)
-        payload = json.loads(out)
-        stop_hooks = payload["hooks"]["Stop"][0]["hooks"][0]
-        self.assertEqual(stop_hooks["command"], "undertone hook stop")
-        self.assertTrue(stop_hooks["async"])
-        prompt_hooks = payload["hooks"]["UserPromptSubmit"][0]["hooks"][0]
-        self.assertEqual(prompt_hooks["command"], "undertone hook prompt")
+class RetiredCommandsTest(CliTestCase):
+    def test_phase1_commands_are_gone(self) -> None:
+        parser = cli.build_parser()
+        for name in ("serve", "say", "stop", "on", "off", "status", "hook", "hooks-snippet"):
+            with self.subTest(command=name):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+                    parser.parse_args([name])
+                self.assertEqual(ctx.exception.code, 2)
 
-
-class OnOffStatusTest(CliTestCase):
-    def test_on_creates_flag_off_removes_it(self) -> None:
-        rc, _ = self._run("on")
-        self.assertEqual(rc, 0)
-        self.assertTrue(paths.enabled_flag_path().exists())
-
-        rc, _ = self._run("off")
-        self.assertEqual(rc, 0)
-        self.assertFalse(paths.enabled_flag_path().exists())
-
-    def test_status_reports_down_and_disabled_by_default(self) -> None:
-        rc, out = self._run("status")
-        self.assertEqual(rc, 0)
-        self.assertIn("daemon: down", out)
-        self.assertIn("enabled: no", out)
-
-    def test_status_reports_enabled_after_on(self) -> None:
-        self._run("on")
-        rc, out = self._run("status")
-        self.assertEqual(rc, 0)
-        self.assertIn("enabled: yes", out)
-
-
-class HookCommandTest(CliTestCase):
-    def test_hook_stop_reads_stdin_and_returns_zero(self) -> None:
-        with mock.patch("sys.stdin", io.StringIO(json.dumps({"last_assistant_message": "hi"}))):
-            rc = cli.main(["hook", "stop"])
-        self.assertEqual(rc, 0)
-
-    def test_hook_prompt_reads_stdin_and_returns_zero(self) -> None:
-        with mock.patch("sys.stdin", io.StringIO("{}")):
-            rc, _out = self._run_hook_prompt()
-        self.assertEqual(rc, 0)
-
-    def _run_hook_prompt(self) -> tuple[int, str]:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = cli.main(["hook", "prompt"])
-        return rc, buf.getvalue()
+    def test_help_lists_exactly_the_remaining_commands(self) -> None:
+        sub = next(a for a in cli.build_parser()._actions if a.dest == "command")
+        self.assertEqual(
+            sorted(sub.choices), ["attach", "channel", "chat", "listen", "models", "session"]
+        )
 
 
 class ChatParserTest(unittest.TestCase):
@@ -243,7 +206,8 @@ class SessionHelpersTest(CliTestCase):
         cmd, argv, env = execvpe.call_args.args
         self.assertEqual(cmd, "fakeclaude")
         self.assertEqual(argv[-2:], ["--model", "opus"])
-        self.assertEqual(env["UNDERTONE_SPEAK"], "0")
+        self.assertIs(env, os.environ)
+        self.assertNotIn("UNDERTONE_SPEAK", env)
         self.assertIn("undertone attach", err.getvalue())
 
     def test_new_commands_registered(self) -> None:
