@@ -160,6 +160,11 @@ class ProtocolTest(ChannelTestCase):
         self.assertIn("confirm", result["instructions"])
         self.assertIn("hey jarvis, confirm", result["instructions"])
         self.assertIn("Never reuse a phrase", result["instructions"])
+        self.assertIn('strips the wake word "hey jarvis"', result["instructions"])
+        self.assertIn("ignores case, punctuation and extra whitespace", result["instructions"])
+        self.assertIn("followed immediately by the two words as consecutive words", result["instructions"])
+        self.assertIn("uncommon-but-easy-to-pronounce nouns", result["instructions"])
+        self.assertIn('avoid high-frequency words such as "the"', result["instructions"])
 
     def test_initialize_unsupported_version_falls_back(self) -> None:
         p = self.start()
