@@ -2,7 +2,7 @@
 
 import unittest
 
-from undertone.spoken import sanitize_for_tts, sanitize_terminal, scrub_wake_word, strip_markdown
+from undertone.spoken import looks_like_echo, sanitize_for_tts, sanitize_terminal, scrub_wake_word, strip_markdown
 
 
 class StripMarkdownTest(unittest.TestCase):
@@ -104,6 +104,24 @@ class SanitizeForTtsTest(unittest.TestCase):
                 out = sanitize_for_tts(text)
                 self.assertNotIn("[", out)
                 self.assertNotIn("]", out)
+
+
+class LooksLikeEchoTest(unittest.TestCase):
+    SPOKEN = "I finished the refactor and all the tests pass. Want me to open a pull request?"
+
+    def test_echo_with_stt_word_errors_is_detected(self) -> None:
+        heard = "I finished the refactor and all the test pass want me to open a pull quest"
+        self.assertTrue(looks_like_echo(heard, self.SPOKEN))
+
+    def test_user_interruption_sharing_a_few_words_is_not_echo(self) -> None:
+        spoken = "The subagent finished and reported two failing checks in the build."
+        self.assertFalse(looks_like_echo("wait, what about the subagent", spoken))
+
+    def test_short_heard_is_not_echo(self) -> None:
+        self.assertFalse(looks_like_echo("open a", self.SPOKEN))
+
+    def test_empty_spoken_is_not_echo(self) -> None:
+        self.assertFalse(looks_like_echo("one two three four", ""))
 
 
 if __name__ == "__main__":

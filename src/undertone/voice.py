@@ -13,7 +13,9 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
     channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"}   (first line)
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"}
                                                                     (any number)
-    voice -> channel   {"type":"utterance","text":"..."}
+    voice -> channel   {"type":"utterance","text":"...","via":"wake"|"follow_up"|"talk_over"}
+                       (`via` = what opened the turn; the channel lets only "wake"
+                        satisfy a confirm phrase)
                        {"type":"detached"}   (sent to the OLD connection when a
                                               newer channel says hello; "latest
                                               session wins", then it is closed)
@@ -24,6 +26,17 @@ early "running the tests now") never does, and neither does `confirm` -- a
 spoken confirmation prompt must not be answerable by ambient audio (a video
 saying "yes") inside an open mic window, so it needs a fresh wake word. An
 unknown `kind` fails closed: it is spoken but opens no window.
+
+Talk-over (`talk_over=True`, only when echo cancellation is on): while a reply
+plays, sustained user speech stops it without the wake word and becomes the
+next utterance. Confirm (and unknown-kind) speech is stop-only: the speech
+stops but the user must still say the wake word to answer, for the same
+reason as above -- ambient audio must not be able to answer a confirm prompt.
+That rule is enforced downstream too: every utterance carries `via`, and only a
+wake-word turn can grant a confirmation (a talk-over turn could be our own
+speech leaking through imperfect echo cancellation). A talk-over transcript
+that mostly repeats the reply being spoken (`spoken.looks_like_echo`) is
+dropped instead of sent.
 
 Unknown types and malformed lines are ignored; a failure in one connection never
 takes the process down.
@@ -62,7 +75,7 @@ from . import paths
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
-from .spoken import sanitize_terminal
+from .spoken import looks_like_echo, sanitize_terminal
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
@@ -135,9 +148,11 @@ class VoiceBridge:
         follow_up_s: float = 6.0,
         cue: Callable[[str], None] | None = None,
         out: TextIO = sys.stdout,
+        talk_over: bool = False,
     ) -> None:
         self._socket_path = Path(socket_path)
         self._follow_up_s = follow_up_s
+        self._talk_over = talk_over
         self._cue = cue or (lambda kind: None)
         self._out = out
 
@@ -145,6 +160,11 @@ class VoiceBridge:
         self._print_lock = threading.Lock()
         self._chunk_lock = threading.Lock()
         self._gen = 0
+        self._stop_only_gen = -1  # gen whose speech talk-over may only stop
+        self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
+        self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
+        self._turn_via = ""  # main thread: what opened the current turn
+        self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._conn: _Conn | None = None  # the attached (latest-hello) channel
         self._conns: set[_Conn] = set()
         self._closed = False
@@ -257,7 +277,17 @@ class VoiceBridge:
 
     def process_frame(self, frame: bytes) -> None:
         self._drain_control()
+        self._listener.talk_over = self._talk_over_mode()
         self._listener.process_frame(frame)
+
+    def _talk_over_mode(self) -> str:
+        if not self._talk_over:
+            return "off"
+        # Session lock, then the player's (documented order).
+        with _bounded(self._lock):
+            if not self._player.busy:
+                return "off"
+            return "stop" if self._stop_only_gen == self._gen else "turn"
 
     def run(self, frames: Iterable[bytes]) -> None:
         for frame in frames:
@@ -281,17 +311,39 @@ class VoiceBridge:
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
+            self._turn_via, self._echo_ref = "wake", ""
             self._cue("wake")
             self._maybe_barge_in()
+        elif event.kind in ("talk_over", "talk_over_stop"):
+            if event.kind == "talk_over":
+                self._turn_via = "talk_over"
+                # Snapshot before the barge-in bumps the generation.
+                with _bounded(self._lock):
+                    self._echo_ref = (
+                        self._spoken_text if self._spoken_gen == self._gen else ""
+                    )
+            self._maybe_barge_in()  # no cue: the user is already talking
+            if event.kind == "talk_over_stop":
+                self._print('[confirmation needed: say "hey jarvis" and the phrase]\n')
         elif event.kind == "follow_up":
+            self._turn_via, self._echo_ref = "follow_up", ""
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
+            if (
+                self._turn_via == "talk_over"
+                and self._echo_ref
+                and looks_like_echo(text, self._echo_ref)
+            ):
+                self._print("[ignored: that sounded like my own reply]\n")
+                return
             self._print(f"you: {text}\n")
             with _bounded(self._lock):
                 self._gen += 1
                 conn = self._conn
-            if conn is not None and conn.send({"type": "utterance", "text": text}):
+            if conn is not None and conn.send(
+                {"type": "utterance", "text": text, "via": self._turn_via}
+            ):
                 return
             self._print("[no Claude session attached]\n")
             self._player.enqueue(NO_SESSION_SPEECH)
@@ -305,6 +357,9 @@ class VoiceBridge:
         with _bounded(self._lock):
             if not self._player.busy:
                 return
+            if self._stop_only_gen == self._gen:
+                # `busy` can lag the stop; keep the confirm speech stop-only
+                self._stop_only_gen = self._gen + 1
             self._gen += 1
         self._player.stop()
         self._print("[interrupted]\n")
@@ -440,6 +495,11 @@ class VoiceBridge:
             sentences = self._chunker.feed(text) + self._chunker.flush()
         with _bounded(self._lock):
             gen = self._gen
+            if kind not in ("answer", "ack"):
+                self._stop_only_gen = gen  # set before enqueuing: never "turn"
+            if self._spoken_gen != gen:
+                self._spoken_gen, self._spoken_text = gen, ""
+            self._spoken_text += " ".join(sentences) + " "
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":

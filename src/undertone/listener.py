@@ -5,10 +5,17 @@ Pure state machine, no I/O of its own -- it's driven by an iterable of 10 ms
 `stt`) plus a `clock`. audio.py supplies the real mic frames and stt.py the
 real Parakeet wrapper; tests inject fakes so this module never touches a
 microphone, a model, or the network. See tests/test_listener.py.
+
+Talk-over: while IDLE, an owner that has echo-cancelled audio can set
+`Listener.talk_over` to "stop" or "turn" (default "off"). Sustained speech
+(consecutive VAD chunks over `talk_over_threshold` for `talk_over_min_s`) then
+emits "talk_over_stop" (stay IDLE) or opens a "talk_over" turn pre-seeded with
+the last `talk_over_preroll_s` of audio. The wake word is always checked first.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from typing import Callable, Iterable, Protocol
@@ -50,6 +57,9 @@ class ListenerConfig:
     wake_ignore_window_s: float = 0.15  # skip VAD right after wake (the beep)
     vad_threshold: float = 0.5
     sample_rate: int = SAMPLE_RATE
+    talk_over_threshold: float = 0.6  # VAD prob that counts as talk-over speech
+    talk_over_min_s: float = 0.3  # sustained speech needed to trigger talk-over
+    talk_over_preroll_s: float = 0.5  # audio kept so the first words aren't lost
 
 
 @dataclass
@@ -57,7 +67,10 @@ class ListenerEvent:
     """One emitted event. `kind` selects which other fields are populated."""
 
     # "wake" | "follow_up" | "utterance" | "wake_no_speech" | "dropped_empty"
-    # ("follow_up" = a turn opened by listen_now, with no wake word)
+    # | "talk_over" | "talk_over_stop"
+    # ("follow_up" = a turn opened by listen_now, with no wake word;
+    #  "talk_over" = a turn opened by sustained speech during playback;
+    #  "talk_over_stop" = same speech, but the owner only wanted a stop)
     kind: str
     text: str | None = None
     audio_s: float | None = None
@@ -105,6 +118,20 @@ class Listener:
         self._last_voice = 0.0
         self._no_speech_timeout_s = self._config.no_speech_timeout_s
 
+        # Talk-over: the owner sets this before each process_frame -- "off"
+        # | "stop" | "turn"; anything else behaves as "off" (fail closed).
+        self.talk_over = "off"
+        self._to_run = 0
+        self._to_buf = bytearray()
+        self._preroll = bytearray()
+        chunk_s = VAD_CHUNK_BYTES / 2 / self._config.sample_rate
+        self._to_chunks_needed = max(
+            1, math.ceil(self._config.talk_over_min_s / chunk_s - 1e-9)
+        )
+        self._preroll_max = int(
+            self._config.talk_over_preroll_s * self._config.sample_rate
+        ) * 2
+
     @property
     def state(self) -> str:
         """"IDLE" or "LISTENING" (read-only)."""
@@ -135,7 +162,50 @@ class Listener:
 
     def _process_idle(self, frame: bytes) -> None:
         if self._wake(frame):
+            self._clear_talk_over()
             self._start_turn("wake")
+            return
+        mode = self.talk_over
+        if mode not in ("stop", "turn"):
+            self._clear_talk_over()
+            return
+        self._preroll += frame
+        if len(self._preroll) > self._preroll_max:
+            del self._preroll[: len(self._preroll) - self._preroll_max]
+        self._to_buf += frame
+        while len(self._to_buf) >= VAD_CHUNK_BYTES:
+            chunk = bytes(self._to_buf[:VAD_CHUNK_BYTES])
+            del self._to_buf[:VAD_CHUNK_BYTES]
+            if self._vad(chunk) >= self._config.talk_over_threshold:
+                self._to_run += 1
+            else:
+                self._to_run = 0
+            if self._to_run >= self._to_chunks_needed:
+                self._trigger_talk_over(mode)
+                return
+
+    def _clear_talk_over(self) -> None:
+        self._to_run = 0
+        self._to_buf = bytearray()
+        self._preroll = bytearray()
+
+    def _trigger_talk_over(self, mode: str) -> None:
+        preroll = bytes(self._preroll)
+        self._clear_talk_over()
+        if mode == "stop":
+            # Stay IDLE and keep the wake detector: the user may be mid-"hey
+            # jarvis" and it must still fire.
+            self._emit(ListenerEvent(kind="talk_over_stop"))
+            return
+        # The VAD has been tracking this speech continuously, so no vad_reset.
+        self._no_speech_timeout_s = self._config.no_speech_timeout_s
+        self._state = "LISTENING"
+        self._utterance = bytearray(preroll)
+        self._vad_buf = bytearray()
+        self._speech_started = True
+        self._t_wake = self._clock()
+        self._last_voice = self._t_wake
+        self._emit(ListenerEvent(kind="talk_over"))
 
     def _start_turn(self, kind: str, no_speech_timeout_s: float | None = None) -> None:
         self._no_speech_timeout_s = (

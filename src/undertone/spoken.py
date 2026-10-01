@@ -5,6 +5,7 @@ Pure, stdlib-only, no I/O — easy to test in isolation (see tests/test_spoken.p
 
 from __future__ import annotations
 
+import difflib
 import re
 
 _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -73,3 +74,25 @@ def strip_markdown(text: str) -> str:
     text = _URL_RE.sub(" ", text)
     text = _FILE_PATH_RE.sub(" ", text)
     return text
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def looks_like_echo(
+    heard: str, spoken: str, *, threshold: float = 0.6, min_words: int = 3
+) -> bool:
+    """True when `heard` (an STT transcript) is mostly our own `spoken` reply.
+
+    Guards talk-over against imperfect echo cancellation: the fraction of
+    `heard` words that line up (in order) with `spoken` must reach `threshold`.
+    Short transcripts are never treated as echo -- "stop" is a real interruption.
+    """
+    heard_words = _WORD_RE.findall(heard.lower())
+    spoken_words = _WORD_RE.findall(spoken.lower())
+    if len(heard_words) < min_words or not spoken_words:
+        return False
+    blocks = difflib.SequenceMatcher(
+        None, heard_words, spoken_words, autojunk=False
+    ).get_matching_blocks()
+    return sum(b.size for b in blocks) / len(heard_words) >= threshold

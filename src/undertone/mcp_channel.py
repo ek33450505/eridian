@@ -12,7 +12,9 @@ so all diagnostics go to <UNDERTONE_HOME>/logs/channel.log.
 
 Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
   channel -> voice  {"type":"hello","pid":N,"cwd":"..."}  (first line)
-  voice -> channel  {"type":"utterance","text":"..."}
+  voice -> channel  {"type":"utterance","text":"...","via":"wake"|"follow_up"|"talk_over"}
+                    (only a "wake" turn can satisfy a confirm challenge; a missing
+                    or unknown `via` cannot -- fail closed)
   channel -> voice  {"type":"reply","text":"...","kind":"ack|answer|confirm"}
   voice -> channel  {"type":"detached"}  (a newer session won; stop retrying)
 
@@ -262,7 +264,7 @@ class ChannelServer:
                 # Content is wrapped in a <channel> tag; no angle brackets, no tag spoofing.
                 text = text.replace("\x00", "").replace("<", "").replace(">", "").strip()
                 if text:
-                    refusal = self._admit_voice(text)
+                    refusal = self._admit_voice(text, can_grant=msg.get("via") == "wake")
                     if refusal is None:
                         self._push_utterance(text)
                     else:
@@ -272,7 +274,7 @@ class ChannelServer:
             self._log("detached: a newer session attached")
             self._detached.set()
 
-    def _admit_voice(self, text: str) -> str | None:
+    def _admit_voice(self, text: str, can_grant: bool = False) -> str | None:
         """Record a voice turn in the guard state; None if admitted, else a refusal sentence."""
         if not self._token:
             return "Voice turns are off: this session was not started with undertone session."
@@ -283,7 +285,7 @@ class ChannelServer:
         if state is None or state.get("armed_at") is None:
             return "Voice turns are off: undertone's safety hook did not load in this session."
         try:
-            voice_guard.record_voice(self._home, self._token, text)
+            voice_guard.record_voice(self._home, self._token, text, can_grant=can_grant)
         except (voice_guard.GuardError, OSError):
             return "Voice turns are off: undertone could not record this voice turn."
         return None

@@ -358,9 +358,33 @@ class VoiceBridgeTest(ChannelTestCase):
             p, "To delete x, say the wake word, then 'confirm walnut lantern'.", "confirm"
         )
         self.assertEqual(self.voice.read_line()["kind"], "confirm")
-        self.voice.send({"type": "utterance", "text": "Confirm walnut lantern."})
+        self.voice.send({"type": "utterance", "text": "Confirm walnut lantern.", "via": "wake"})
         p.read()
         self.assertIsNotNone(voice_guard.load_state(self.home, self.token)["grant"])
+
+    def _assert_cannot_confirm(self, **extra) -> None:
+        p = self.start(with_voice=True)
+        self._call_reply(
+            p, "To delete x, say the wake word, then 'confirm walnut lantern'.", "confirm"
+        )
+        self.assertEqual(self.voice.read_line()["kind"], "confirm")
+        self.voice.send({"type": "utterance", "text": "Confirm walnut lantern.", **extra})
+        p.read()
+        state = voice_guard.load_state(self.home, self.token)
+        self.assertIsNone(state["grant"])
+        self.assertIsNone(state["challenge"])  # the attempt was still consumed
+
+    def test_talk_over_turn_cannot_confirm(self) -> None:
+        self._assert_cannot_confirm(via="talk_over")
+
+    def test_follow_up_turn_cannot_confirm(self) -> None:
+        self._assert_cannot_confirm(via="follow_up")
+
+    def test_missing_via_cannot_confirm(self) -> None:
+        self._assert_cannot_confirm()
+
+    def test_non_string_via_cannot_confirm(self) -> None:
+        self._assert_cannot_confirm(via=123)
 
     def _call_reply(self, p: _Pipes, text: str, kind: str) -> dict:
         return p.request("tools/call", {"name": "reply", "arguments": {"text": text, "kind": kind}})[

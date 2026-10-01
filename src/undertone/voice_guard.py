@@ -350,8 +350,16 @@ def record_armed(home: Any, token: str, *, now: float | None = None) -> None:
     _update(home, token, fn)
 
 
-def record_voice(home: Any, token: str, text: str, *, now: float | None = None) -> bool:
-    """Note a spoken turn; True when it carried the pending confirm phrase."""
+def record_voice(
+    home: Any, token: str, text: str, *, can_grant: bool = False, now: float | None = None
+) -> bool:
+    """Note a spoken turn; True when it carried the pending confirm phrase.
+
+    Every voice turn consumes the pending challenge (one attempt), but only a
+    turn with `can_grant` (opened by the wake word) may satisfy it -- a
+    talk-over or follow-up turn could be our own speech or ambient audio.
+    Defaults to False so a caller that forgets fails closed.
+    """
     stamp = _now(now)
     norm = normalize(text)
 
@@ -359,7 +367,8 @@ def record_voice(home: Any, token: str, text: str, *, now: float | None = None) 
         state["voice_at"] = stamp
         challenge = state["challenge"]
         granted = bool(
-            challenge
+            can_grant
+            and challenge
             and stamp - challenge["at"] <= CHALLENGE_TTL_S
             and f" confirm {challenge['phrase']} " in f" {norm} "
         )

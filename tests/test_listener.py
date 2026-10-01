@@ -378,5 +378,146 @@ class ListenerListenNowTest(unittest.TestCase):
         self.assertEqual(listener.state, "IDLE")
 
 
+class ListenerTalkOverTest(unittest.TestCase):
+    def _setup(self, script, mode="turn", triggers=frozenset(), stt=None, resets=None):
+        clock = _FakeClock(0.0)
+        wake_factory = _CountingWakeFactory(triggers_on_call=set(triggers))
+        vad = _ScriptedVad(script)
+        events: list = []
+        listener = Listener(
+            wake_factory=wake_factory,
+            vad=vad,
+            stt=stt or (lambda audio: "never mind that"),
+            clock=clock,
+            on_event=events.append,
+            vad_reset=(lambda: resets.append(1)) if resets is not None else None,
+        )
+        listener.talk_over = mode
+        return listener, clock, events, vad, wake_factory
+
+    def _feed(self, listener, n):
+        for i in range(n):
+            listener.process_frame(_chunk(i))
+
+    def test_off_never_calls_vad_while_idle(self) -> None:
+        listener, _, events, vad, _ = self._setup([1.0], mode="off")
+        self._feed(listener, 50)
+        self.assertEqual(vad.calls, 0)
+        self.assertEqual(events, [])
+
+    def test_invalid_mode_behaves_as_off(self) -> None:
+        listener, _, events, vad, _ = self._setup([1.0], mode="bogus")
+        self._feed(listener, 50)
+        self.assertEqual(vad.calls, 0)
+        self.assertEqual(events, [])
+        self.assertEqual(listener.state, "IDLE")
+
+    def test_turn_triggers_after_ten_chunks_exactly_once(self) -> None:
+        listener, _, events, vad, _ = self._setup([1.0])
+        self._feed(listener, 9)
+        self.assertEqual(events, [])
+        self._feed(listener, 1)
+        self.assertEqual([e.kind for e in events], ["talk_over"])
+        self.assertEqual(listener.state, "LISTENING")
+        self.assertEqual(vad.calls, 10)
+
+    def test_turn_utterance_includes_preroll(self) -> None:
+        heard = []
+
+        def stt(audio):
+            heard.append(audio)
+            return "Hey Jarvis, what about this"
+
+        script = [1.0] * 10 + [0.0]
+        listener, clock, events, _, _ = self._setup(script, stt=stt)
+        self._feed(listener, 10)
+        clock.now = 1.0
+        listener.process_frame(_chunk(0))  # silence past end_silence_s
+        self.assertEqual([e.kind for e in events], ["talk_over", "utterance"])
+        self.assertEqual(events[-1].text, "what about this")
+        # 10 pre-roll chunks + the closing silence chunk, in int16 samples
+        self.assertEqual(len(heard[0]), 11 * VAD_CHUNK_BYTES // 2)
+        self.assertEqual(listener.state, "IDLE")
+
+    def test_preroll_is_bounded(self) -> None:
+        heard = []
+
+        def stt(audio):
+            heard.append(audio)
+            return "hello"
+
+        script = [0.0] * 10 + [1.0] * 10 + [0.0]
+        listener, clock, _, _, _ = self._setup(script, stt=stt)
+        self._feed(listener, 20)
+        clock.now = 1.0
+        listener.process_frame(_chunk(0))
+        # 0.5 s of pre-roll = 8000 samples, plus the closing chunk's 512
+        self.assertEqual(len(heard[0]), 8000 + VAD_CHUNK_BYTES // 2)
+
+    def test_low_chunk_resets_the_run(self) -> None:
+        listener, _, events, _, _ = self._setup([1.0] * 9 + [0.0] + [1.0] * 9 + [0.0])
+        self._feed(listener, 19)
+        self.assertEqual(events, [])
+        self.assertEqual(listener.state, "IDLE")
+
+    def test_threshold_boundary(self) -> None:
+        listener, _, events, _, _ = self._setup([0.6])
+        self._feed(listener, 10)
+        self.assertEqual([e.kind for e in events], ["talk_over"])
+        listener, _, events, _, _ = self._setup([0.59])
+        self._feed(listener, 30)
+        self.assertEqual(events, [])
+
+    def test_stop_mode_stays_idle_and_keeps_wake_detector(self) -> None:
+        # the wake detector fires on its 13th call (index 12)
+        listener, clock, events, _, wake = self._setup(
+            [1.0], mode="stop", triggers={12}
+        )
+        self._feed(listener, 10)
+        self.assertEqual([e.kind for e in events], ["talk_over_stop"])
+        self.assertEqual(listener.state, "IDLE")
+        self.assertEqual(wake.detectors_created, 1)
+        listener.talk_over = "off"
+        self._feed(listener, 2)
+        listener.process_frame(_chunk(0))  # call index 12 -> wake
+        self.assertEqual([e.kind for e in events], ["talk_over_stop", "wake"])
+
+    def test_stop_mode_rearms_after_trigger(self) -> None:
+        listener, _, events, _, _ = self._setup([1.0], mode="stop")
+        self._feed(listener, 20)
+        self.assertEqual([e.kind for e in events], ["talk_over_stop"] * 2)
+
+    def test_switching_off_clears_the_counter(self) -> None:
+        listener, _, events, _, _ = self._setup([1.0])
+        self._feed(listener, 9)
+        listener.talk_over = "off"
+        self._feed(listener, 1)
+        listener.talk_over = "turn"
+        self._feed(listener, 9)
+        self.assertEqual(events, [])
+        self._feed(listener, 1)
+        self.assertEqual([e.kind for e in events], ["talk_over"])
+
+    def test_wake_on_same_frame_wins(self) -> None:
+        listener, _, events, vad, _ = self._setup([1.0], triggers={9})
+        self._feed(listener, 10)
+        self.assertEqual([e.kind for e in events], ["wake"])
+        self.assertEqual(vad.calls, 9)
+
+    def test_vad_reset_skipped_for_talk_over_but_not_wake(self) -> None:
+        resets: list = []
+        listener, _, events, _, _ = self._setup([1.0], resets=resets)
+        self._feed(listener, 10)
+        self.assertEqual([e.kind for e in events], ["talk_over"])
+        self.assertEqual(resets, [])
+        resets2: list = []
+        listener, _, events, _, _ = self._setup(
+            [1.0], mode="off", triggers={0}, resets=resets2
+        )
+        self._feed(listener, 1)
+        self.assertEqual([e.kind for e in events], ["wake"])
+        self.assertEqual(resets2, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

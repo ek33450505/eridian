@@ -256,7 +256,7 @@ class ConversationTest(VoiceTestCase):
         self.assertEqual(self.cues, ["wake"])
         self.speak("what is the status")
         self.assertEqual(
-            channel.read_line(), {"type": "utterance", "text": "what is the status"}
+            channel.read_line(), {"type": "utterance", "text": "what is the status", "via": "wake"}
         )
         self.assertIn("you: what is the status", self.out.getvalue())
         self.assertEqual(self.player.enqueued, [])
@@ -448,6 +448,146 @@ class ReplyKindTest(VoiceTestCase):
         self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
 
 
+class TalkOverTest(VoiceTestCase):
+    def _bridge(self, talk_over: bool = True) -> list:
+        calls: list = []
+
+        def vad(chunk):
+            calls.append(1)
+            return self.vad_value
+
+        self.bridge = self.make_bridge(talk_over=talk_over, vad=vad)
+        self.addCleanup(self.bridge.close)
+        return calls
+
+    def _reply(self, channel: _Channel, text: str = "Okay then.", **extra) -> None:
+        before = len(self.player.enqueued)
+        self.player.idle.clear()  # still speaking: no follow-up from the watcher
+        channel.send_obj({"type": "reply", "text": text, **extra})
+        self.assertTrue(_wait_for(lambda: len(self.player.enqueued) > before))
+        self.player.busy = True
+
+    def _talk(self, n: int = 10) -> None:
+        self.vad_value = 1.0
+        for _ in range(n):
+            self.bridge.process_frame(FRAME)
+
+    def test_answer_talk_over_stops_player_and_sends_utterance(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, kind="answer")
+        self.transcript = "actually never mind"
+        self._talk()
+        self.assertEqual(self.player.stops, 1)
+        self.assertEqual(self.state, "LISTENING")
+        self.assertEqual(self.cues, [])  # no cue: the user is already talking
+        self.player.busy = False
+        self.vad_value = 0.0
+        self.clock.now += 1.0
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(
+            channel.read_line(),
+            {"type": "utterance", "text": "actually never mind", "via": "talk_over"},
+        )
+        self.assertIn("you: actually never mind", self.out.getvalue())
+
+    def test_confirm_talk_over_only_stops(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, kind="confirm")
+        self.transcript = "yes"
+        self._talk(25)
+        self.assertGreaterEqual(self.player.stops, 1)
+        self.assertEqual(self.state, "IDLE")
+        self.assertNotIn("you:", self.out.getvalue())
+        self.assertEqual(self.out.getvalue().count("[confirmation needed:"), 3)
+
+    def test_unknown_kind_is_stop_only(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, kind="shout")
+        self._talk()
+        self.assertEqual(self.player.stops, 1)
+        self.assertEqual(self.state, "IDLE")
+
+    def test_stop_only_does_not_outlive_the_generation(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, kind="confirm")
+        self._talk()
+        self.player.busy = False
+        self.wake()  # a fresh wake + utterance bumps the generation
+        self.speak("yes")
+        self.assertEqual(
+            channel.read_line(), {"type": "utterance", "text": "yes", "via": "wake"}
+        )
+        self._reply(channel, kind="answer")
+        self._talk()
+        self.assertEqual(self.state, "LISTENING")
+
+    def test_follow_up_turn_is_tagged_follow_up(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self.player.busy = False
+        channel.send_obj({"type": "reply", "text": "Okay then.", "kind": "answer"})
+        self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
+        self.speak("one more thing")
+        self.assertEqual(
+            channel.read_line(),
+            {"type": "utterance", "text": "one more thing", "via": "follow_up"},
+        )
+
+    def test_echo_like_talk_over_is_dropped(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(
+            channel,
+            "I finished the refactor and all the tests pass. Want me to open a pull request?",
+            kind="answer",
+        )
+        self.transcript = "I finished the refactor and all the test pass"
+        self._talk()
+        self.player.busy = False
+        self.vad_value = 0.0
+        self.clock.now += 1.0
+        self.bridge.process_frame(FRAME)
+        self.assertIn("[ignored: that sounded like my own reply]", self.out.getvalue())
+        self.assertNotIn("you:", self.out.getvalue())
+        channel.sock.settimeout(0.3)
+        self.assertIsNone(channel.read_line())
+
+    def test_wake_turn_is_never_echo_filtered(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, "I finished the refactor and all the tests pass.", kind="answer")
+        self.wake()  # barge-in by wake word
+        self.speak("I finished the refactor and all the tests pass")
+        self.assertEqual(channel.read_line()["via"], "wake")
+
+    def test_disabled_never_arms(self) -> None:
+        calls = self._bridge(talk_over=False)
+        self.start()
+        channel = self.attach()
+        self._reply(channel, kind="answer")
+        self._talk(30)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.player.stops, 0)
+        self.assertEqual(self.state, "IDLE")
+
+    def test_idle_player_is_off(self) -> None:
+        calls = self._bridge()
+        self._talk(30)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.state, "IDLE")
+
+
 class MultiChannelTest(VoiceTestCase):
     def test_second_hello_detaches_the_first_and_wins_routing(self) -> None:
         self.start()
@@ -457,7 +597,7 @@ class MultiChannelTest(VoiceTestCase):
         self.assertIsNone(first.read_line())  # closed after detached
         self.wake()
         self.speak("which one")
-        self.assertEqual(second.read_line(), {"type": "utterance", "text": "which one"})
+        self.assertEqual(second.read_line(), {"type": "utterance", "text": "which one", "via": "wake"})
 
     def test_replaced_connection_cannot_speak(self) -> None:
         self.start()
@@ -488,7 +628,7 @@ class RobustnessTest(VoiceTestCase):
         # Process survived; the good channel and new connections still work.
         self.wake()
         self.speak("still alive")
-        self.assertEqual(good.read_line(), {"type": "utterance", "text": "still alive"})
+        self.assertEqual(good.read_line(), {"type": "utterance", "text": "still alive", "via": "wake"})
         self.attach(pid=3)
 
     def test_connection_cap_closes_the_extra_connection(self) -> None:
@@ -502,7 +642,7 @@ class RobustnessTest(VoiceTestCase):
         self.assertEqual(len(others), MAX_CONNECTIONS - 1)
         self.wake()
         self.speak("still routed")
-        self.assertEqual(first.read_line(), {"type": "utterance", "text": "still routed"})
+        self.assertEqual(first.read_line(), {"type": "utterance", "text": "still routed", "via": "wake"})
 
     def test_oversized_partial_line_without_newline_is_dropped(self) -> None:
         self.start()
