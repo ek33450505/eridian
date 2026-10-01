@@ -2,7 +2,7 @@
 
 import unittest
 
-from undertone.spoken import spoken_text
+from undertone.spoken import sanitize_terminal, spoken_text
 
 
 class SpokenLineWinsTest(unittest.TestCase):
@@ -118,3 +118,11 @@ class FallbackExtractionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SanitizeTerminalTest(unittest.TestCase):
+    def test_strips_escape_bell_and_c1_controls(self) -> None:
+        self.assertEqual(sanitize_terminal("a\x1b[2Jb\x07c\x9bd\x00e\x7f"), "a[2Jbcde")
+
+    def test_keeps_tab_newline_and_plain_text(self) -> None:
+        self.assertEqual(sanitize_terminal("x\ty\nz \u2192 ok"), "x\ty\nz \u2192 ok")

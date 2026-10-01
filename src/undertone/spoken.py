@@ -19,6 +19,15 @@ _URL_RE = re.compile(r"https?://\S+")
 _FILE_PATH_RE = re.compile(r"(?<!\w)(?:~|\.{1,2})?/[\w./\-]+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _WHITESPACE_RE = re.compile(r"\s+")
+# C0/C1 control characters except \t and \n: model text, tool names and error
+# strings are untrusted, and a raw ESC/BEL would let them drive the terminal
+# (clear screen, OSC 52 clipboard writes, ...).
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_terminal(text: str) -> str:
+    """Strip terminal control characters (keeps \\t and \\n) from untrusted text."""
+    return _CONTROL_RE.sub("", text)
 
 
 def _extract_spoken_line(reply: str) -> str | None:
