@@ -24,6 +24,7 @@ import traceback
 from pathlib import Path
 
 from . import paths
+from .spoken import sanitize_for_tts
 
 SOCKET_BACKLOG = 5
 _ACCEPT_POLL_TIMEOUT = 0.5
@@ -75,10 +76,16 @@ def _log_error(context: str, exc: BaseException) -> None:
 
 
 def build_say_argv(text: str) -> list[str] | None:
-    """NUL-strip text; return None if empty; else [say_cmd, (-v voice), "--", text]."""
+    """NUL-strip and sanitize_for_tts text; return None if empty; else [say_cmd, (-v voice), "--", text]."""
     # subprocess.Popen raises ValueError on an embedded NUL byte -- strip it
     # rather than letting one malformed "say" bring down the whole daemon.
     text = text.replace("\x00", "")
+    # Hard control, not model compliance: the wake detector stays live while
+    # we speak and there is no echo cancellation yet, so TTS saying the wake
+    # phrase could self-trigger it (cut off speech, or capture the tail as a
+    # command and confirm its own action). This is the single choke point for
+    # all undertone speech (the daemon and SpeechQueue both go through here).
+    text = sanitize_for_tts(text)
     if not text:
         return None
     say_cmd = os.environ.get("UNDERTONE_SAY_CMD", "say")

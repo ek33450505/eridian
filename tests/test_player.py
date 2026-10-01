@@ -82,6 +82,14 @@ class SpeechQueueTest(unittest.TestCase):
         self.assertTrue(q.wait_idle(5.0))
         self.assertEqual(self._lines(), ["-- one", "-- two", "-- three"])
 
+    def test_wake_phrase_is_never_spoken(self) -> None:
+        q = self._queue()
+        q.enqueue("Say hey jarvis now.")
+        self.assertTrue(q.wait_idle(5.0))
+        lines = self._lines()
+        self.assertEqual(lines, ["-- Say the wake word now."])
+        self.assertNotIn("jarvis", " ".join(lines).lower())
+
     def test_stop_kills_current_and_drops_pending(self) -> None:
         self._use_sleepy()
         q = self._queue()

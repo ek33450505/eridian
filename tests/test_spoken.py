@@ -2,7 +2,7 @@
 
 import unittest
 
-from undertone.spoken import sanitize_terminal, spoken_text
+from undertone.spoken import sanitize_for_tts, sanitize_terminal, scrub_wake_word, spoken_text
 
 
 class SpokenLineWinsTest(unittest.TestCase):
@@ -126,3 +126,55 @@ class SanitizeTerminalTest(unittest.TestCase):
 
     def test_keeps_tab_newline_and_plain_text(self) -> None:
         self.assertEqual(sanitize_terminal("x\ty\nz \u2192 ok"), "x\ty\nz \u2192 ok")
+
+
+class ScrubWakeWordTest(unittest.TestCase):
+    def test_replaces_the_phrase_anywhere(self) -> None:
+        self.assertEqual(
+            scrub_wake_word("Say hey Jarvis, then confirm walnut lantern."),
+            "Say the wake word, then confirm walnut lantern.",
+        )
+
+    def test_case_insensitive_and_bare_name(self) -> None:
+        self.assertEqual(scrub_wake_word("HEY JARVIS"), "the wake word")
+        self.assertEqual(scrub_wake_word("jarvis"), "the wake word")
+        self.assertEqual(scrub_wake_word("ok jarvis and Hi Jarvis"), "the wake word and the wake word")
+
+    def test_mixed_punctuation(self) -> None:
+        self.assertEqual(scrub_wake_word("hey, jarvis!"), "the wake word!")
+        self.assertEqual(scrub_wake_word("(jarvis)"), "(the wake word)")
+
+    def test_word_boundary_and_unrelated_text_unchanged(self) -> None:
+        self.assertEqual(scrub_wake_word("jarvisfoo"), "jarvisfoo")
+        self.assertEqual(scrub_wake_word("nothing to see"), "nothing to see")
+
+    def test_obfuscated_forms_are_scrubbed(self) -> None:
+        for text in ("J.A.R.V.I.S", "jar vis", "jar\u200bvis", "ja\u00adrvis", "Jervis", "j a r v i s"):
+            with self.subTest(text=text):
+                self.assertEqual(scrub_wake_word(text), "the wake word")
+        self.assertEqual(scrub_wake_word("J.A.R.V.I.S. now"), "the wake word. now")
+        self.assertEqual(scrub_wake_word("hey\u2060 Jervis, go"), "the wake word, go")
+
+    def test_lookalikes_are_not_scrubbed(self) -> None:
+        for text in ("jar visit", "jarvisfoo", "major visits"):
+            with self.subTest(text=text):
+                self.assertEqual(scrub_wake_word(text), text)
+
+
+class SanitizeForTtsTest(unittest.TestCase):
+    def test_say_embedded_commands_are_neutralized(self) -> None:
+        out = sanitize_for_tts("[[inpt PHON]]hEY jAAr vIHs[[inpt TEXT]]")
+        self.assertNotIn("[[", out)
+        self.assertNotIn("]]", out)
+
+    def test_wake_phrase_still_scrubbed(self) -> None:
+        out = sanitize_for_tts("say [[rate 90]]hey jarvis")
+        self.assertEqual(out.split(), ["say", "rate", "90", "the", "wake", "word"])
+        self.assertNotIn("[", out)
+
+    def test_invisible_characters_cannot_reassemble_say_commands(self) -> None:
+        for text in ("[\u200b[inpt PHON]\u200b]x", "[\u200d[inpt PHON]\ufeff]x", "[\u00ad[a]\u2060]"):
+            with self.subTest(text=text):
+                out = sanitize_for_tts(text)
+                self.assertNotIn("[", out)
+                self.assertNotIn("]", out)

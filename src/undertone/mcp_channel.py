@@ -54,13 +54,16 @@ INSTRUCTIONS = (
     "by the user and transcribed on-device by undertone. Your normal text output is NOT "
     "heard -- reply to EVERY voice message by calling the `reply` tool, in 1-3 short plain "
     "sentences with no code, file paths, URLs or markdown (say details are on screen). "
+    "Never say the wake word in a reply (not even \"jarvis\"); refer to it as \"the wake "
+    "word\" -- your own speech can retrigger the wake detector. "
     'Set `kind` on every call. kind="ack" is a brief early acknowledgement (for example '
     '"Running the tests now.") when the work will take more than a few seconds. '
     'kind="answer" is the actual spoken answer and is the default. kind="confirm" comes '
     "before anything destructive, irreversible or outward-facing requested by voice -- "
     "deleting or overwriting files, git commit/push/reset/rebase, installing or removing "
     "packages, sending messages, or changing remote state: restate the exact action and ask "
-    'the user to say "hey jarvis, confirm <word1> <word2>", where the two words are '
+    'the user to say the wake word, then "confirm <word1> <word2>" (for example "To delete '
+    "scratch.txt, say the wake word, then 'confirm walnut lantern'.\"), where the two words are "
     "uncommon-but-easy-to-pronounce nouns (for example \"copper maple\") you pick fresh each "
     'time; avoid high-frequency words such as "the", "go", "yes" or "okay". Note (do not say this '
     'aloud) that undertone strips the wake word "hey jarvis" before the message reaches you, so the '
