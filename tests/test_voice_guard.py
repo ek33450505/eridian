@@ -456,6 +456,154 @@ class ConfirmPhraseTests(GuardTestCase):
         self.assertTrue(state is None or state["challenge"] is None)
 
 
+class SubagentTaintTests(GuardTestCase):
+    def agent(self, event, agent_id, token=TOKEN):
+        return self.hook(event, {"agent_id": agent_id}, token=token)
+
+    def pre_as(self, agent_id, tool, tool_input=None):
+        return self.hook("pretooluse", {"tool_name": tool, "tool_input": tool_input or {},
+                                        "agent_id": agent_id})
+
+    def assertAgentDenied(self, agent_id, tool="Write"):
+        rc, out, _ = self.pre_as(agent_id, tool)
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def assertAgentAllowed(self, agent_id, tool="Write"):
+        self.assertEqual(self.pre_as(agent_id, tool)[:2], (0, ""))
+
+    def voice_then_typed_with_agent(self, agent_id="A"):
+        vg.record_voice(self.home, TOKEN, "spawn a helper")
+        self.assertEqual(self.agent("subagentstart", agent_id)[:2], (0, ""))
+        self.stop()
+        self.hook("userpromptsubmit", {"prompt": "typed now"})
+
+    def test_voice_spawned_agent_stays_gated_after_typing(self):
+        self.voice_then_typed_with_agent()
+        self.assertAgentDenied("A")
+        self.assertAllowed("Write")  # main thread, no agent_id
+
+    def test_nested_child_after_typing_is_tainted(self):
+        self.voice_then_typed_with_agent()
+        self.agent("subagentstart", "B")
+        self.assertAgentDenied("B")
+
+    def test_missed_start_is_tainted(self):
+        self.voice_then_typed_with_agent()
+        self.assertAgentDenied("C")
+
+    def test_early_stop_is_tainted(self):
+        self.voice_then_typed_with_agent()
+        self.agent("subagentstop", "A")
+        self.assertAgentDenied("A")
+
+    def test_invalid_agent_id_is_tainted(self):
+        self.voice_then_typed_with_agent()
+        for bad in ("x" * 200, "", 5, None, ["a"]):
+            with self.subTest(bad=bad):
+                self.assertAgentDenied(bad)
+        # never a voice turn: nothing to taint
+        other = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        vg.record_typed(other, TOKEN)
+        out = io.StringIO()
+        rc = vg.main(["pretooluse", "--home", other, "--session", TOKEN],
+                     stdin=io.StringIO(json.dumps({"tool_name": "Write", "tool_input": {}, "agent_id": ""})),
+                     stdout=out, stderr=io.StringIO())
+        self.assertEqual((rc, out.getvalue()), (0, ""))
+
+    def test_never_voice_session_allows_agents(self):
+        vg.record_typed(self.home, TOKEN)
+        self.assertAgentAllowed("Z")
+
+    def test_typed_origin_agent_follows_main_logic(self):
+        vg.record_typed(self.home, TOKEN)
+        self.agent("subagentstart", "D")
+        self.assertAgentAllowed("D")
+        vg.record_voice(self.home, TOKEN, "now speak")
+        self.assertAgentDenied("D")
+
+    def test_live_taint_has_no_age_limit(self):
+        vg.record_voice(self.home, TOKEN, "spawn", now=T0)
+        vg.record_subagent_start(self.home, TOKEN, "A", now=T0 + 1)
+        vg.record_stopped(self.home, TOKEN, now=T0 + 2)
+        vg.record_typed(self.home, TOKEN, now=T0 + 3)
+        vg.record_subagent_start(self.home, TOKEN, "E", now=T0 + 10_000)
+        state = vg.load_state(self.home, TOKEN)
+        self.assertTrue(state["agents"]["E"]["voice"])
+        self.assertIsNotNone(vg.decide(state, "Write", {}, T0 + 10_001, "E"))
+
+    def test_live_taint_applies_shortly_after(self):
+        vg.record_voice(self.home, TOKEN, "spawn", now=T0)
+        vg.record_subagent_start(self.home, TOKEN, "A", now=T0 + 1)
+        vg.record_stopped(self.home, TOKEN, now=T0 + 2)
+        vg.record_typed(self.home, TOKEN, now=T0 + 3)
+        vg.record_subagent_start(self.home, TOKEN, "B", now=T0 + 100)
+        self.assertTrue(vg.load_state(self.home, TOKEN)["agents"]["B"]["voice"])
+
+    def test_eviction_prefers_typed_entries(self):
+        vg.record_typed(self.home, TOKEN, now=T0)
+        for i in range(vg.MAX_AGENTS - 1):
+            vg.record_subagent_start(self.home, TOKEN, f"t{i}", now=T0 + 1)
+        vg.record_voice(self.home, TOKEN, "speak", now=T0 + 2)
+        vg.record_subagent_start(self.home, TOKEN, "v", now=T0 + 3)
+        vg.record_subagent_start(self.home, TOKEN, "extra", now=T0 + 4)
+        agents = vg.load_state(self.home, TOKEN)["agents"]
+        self.assertEqual(len(agents), vg.MAX_AGENTS)
+        self.assertIn("v", agents)
+        self.assertNotIn("t0", agents)
+
+    def test_inherited_grant_revoked_by_typing(self):
+        vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 1)
+        vg.record_subagent_start(self.home, TOKEN, "F", now=T0 + 2)
+        vg.record_stopped(self.home, TOKEN, now=T0 + 3)
+        state = vg.load_state(self.home, TOKEN)
+        self.assertIsNone(vg.decide(state, "Write", {}, T0 + 4, "F"))
+        self.assertIsNotNone(vg.decide(state, "Write", {}, T0 + 2 + 301, "F"))
+        vg.record_typed(self.home, TOKEN, now=T0 + 5)
+        state = vg.load_state(self.home, TOKEN)
+        self.assertIsNotNone(vg.decide(state, "Write", {}, T0 + 6, "F"))
+
+    def test_agent_hooks_always_exit_0_silently(self):
+        for event in ("subagentstart", "subagentstop"):
+            for payload, tok in (("garbage", TOKEN), ("{}", TOKEN), ({"agent_id": 5}, TOKEN),
+                                 ({"agent_id": ""}, TOKEN), ({"agent_id": "x" * 200}, TOKEN),
+                                 ({"agent_id": "a1"}, "badtoken")):
+                with self.subTest(event=event, payload=payload, tok=tok):
+                    self.assertEqual(self.hook(event, payload, token=tok)[:2], (0, ""))
+            self.assertEqual(run_main([event], "{}")[:2], (0, ""))
+        vg.record_armed(self.home, TOKEN)
+        self.state_path().write_text("{not json")
+        self.assertEqual(self.agent("subagentstart", "a1")[:2], (0, ""))
+
+    def test_agents_capped(self):
+        for i in range(vg.MAX_AGENTS + 5):
+            vg.record_subagent_start(self.home, TOKEN, f"agent-{i}")
+        agents = vg.load_state(self.home, TOKEN)["agents"]
+        self.assertEqual(len(agents), vg.MAX_AGENTS)
+        self.assertNotIn("agent-0", agents)
+        self.assertIn(f"agent-{vg.MAX_AGENTS + 4}", agents)
+
+    def test_malformed_agents_exit_2(self):
+        vg.record_armed(self.home, TOKEN)
+        for bad in ([], {"": {"voice": True, "granted_at": None, "started_at": 1}}, {"a": 1}, {"a": {"voice": "yes"}},
+                    {"a": {"voice": True, "granted_at": "x", "started_at": 1}},
+                    {"a": {"voice": True, "granted_at": None}},
+                    {"a": {"voice": True, "granted_at": None, "started_at": float("nan")}}, 
+                    {"x" * 129: {"voice": True, "granted_at": None, "started_at": 1}}):
+            with self.subTest(bad=bad):
+                self.state_path().write_text(json.dumps({"agents": bad}))
+                self.assertEqual(self.pre("Read")[0], 2)
+
+    def test_log_tags_agent_safely(self):
+        vg.record_voice(self.home, TOKEN, "hi")
+        self.pre_as("abc\ndef-ghijkl", "Write")
+        log = (Path(self.home) / "logs" / "guard.log").read_text()
+        self.assertIn(" a:abcdef-g", log)
+        self.assertEqual(len([ln for ln in log.splitlines() if "pretooluse" in ln]), 1)
+
+
 class FailClosedTests(GuardTestCase):
     def test_corrupt_state_exits_2(self):
         vg.record_armed(self.home, TOKEN)

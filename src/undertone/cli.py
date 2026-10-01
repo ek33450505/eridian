@@ -224,7 +224,13 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
             "UserPromptSubmit": [
                 {"hooks": [{"type": "command", "command": _hook_cmd("userpromptsubmit"), "timeout": 30}]}
             ],
-            # No `|| exit 2`: a Stop hook exiting 2 forces Claude to keep going.
+            # No `|| exit 2` on Stop/SubagentStop: exit 2 keeps Claude / the subagent running.
+            "SubagentStart": [
+                {"hooks": [{"type": "command", "command": _hook_cmd("subagentstart"), "timeout": 30}]}
+            ],
+            "SubagentStop": [
+                {"hooks": [{"type": "command", "command": _hook_cmd("subagentstop"), "timeout": 30}]}
+            ],
             "Stop": [
                 {"hooks": [{"type": "command", "command": _hook_cmd("stop"), "timeout": 30}]}
             ],
