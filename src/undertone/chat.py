@@ -79,7 +79,7 @@ class _Turn:
     t_submit: float
     t_speech_end: float
     t_first_token: float | None = None
-    latency_printed: bool = False
+    t_first_say: float | None = None
 
 
 class ChatSession:
@@ -236,22 +236,30 @@ class ChatSession:
             return True
 
     def _on_speech_start(self, text: str) -> None:
-        """Player thread: first spoken chunk of the current turn -> latency."""
+        """Player thread: record when the turn's first chunk starts speaking.
+
+        Records only -- printing here would land mid-way through the streamed
+        reply; the worker prints the latency line once the reply is finished.
+        """
         del text
         now = self._clock()
         with self._lock:
             turn = self._turn
-            if turn is None or turn.latency_printed or turn.gen != self._gen:
+            if turn is not None and turn.t_first_say is None and turn.gen == self._gen:
+                turn.t_first_say = now
+
+    def _print_latency(self, turn: _Turn) -> None:
+        with self._lock:
+            if turn.t_first_say is None:
                 return
-            turn.latency_printed = True
-            to_say = now - turn.t_speech_end
+            to_say = turn.t_first_say - turn.t_speech_end
             first = (
                 f"{turn.t_first_token - turn.t_submit:.2f} s"
                 if turn.t_first_token is not None
                 else "n/a"
             )
         self._print(
-            f"[latency] speech end → first say: {to_say:.2f} s (first token {first})\n"
+            f"[latency] speech end \u2192 first say: {to_say:.2f} s (first token {first})\n"
         )
 
     # ---- worker thread -----------------------------------------------
@@ -345,4 +353,5 @@ class ChatSession:
             return
         self._player.wait_idle()
         if self._is_current(gen):
+            self._print_latency(turn)
             self._control.put(("reply_done", gen))

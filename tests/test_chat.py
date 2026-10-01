@@ -106,16 +106,23 @@ class _FakePlayer:
         self.stops = 0
         self.busy = False
         self.closed = False
+        self.fire_on_start = False
 
     def enqueue(self, text: str) -> None:
         # Deliberately does NOT call on_start inline: the real player calls it
-        # from its own thread, and ChatSession enqueues under its lock.
+        # from its own thread, and ChatSession enqueues under its lock (so
+        # firing it inline here would self-deadlock); see wait_idle.
         self.enqueued.append(text)
 
     def stop(self) -> None:
         self.stops += 1
 
     def wait_idle(self, timeout: float | None = None) -> bool:
+        # With `fire_on_start`, report speech starting (the session records
+        # only the first) as the real player would while playing.
+        if self.fire_on_start:
+            for text in self.enqueued:
+                self.on_start(text)
         return True
 
     def close(self) -> None:
@@ -248,19 +255,28 @@ class ConversationFlowTest(ChatSessionTestCase):
         self.assertEqual(self.player.enqueued, ["Let me check.", "Looking now", "done."])
         self.assertIn("[tool: Read]", self.out.getvalue())
 
-    def test_latency_line_printed_once_on_first_speech(self) -> None:
-        self.world.script["hello"] = [TextDelta("Hi. Again. "), TurnEnd("s", False, False)]
+    def test_latency_line_printed_once_after_the_full_reply(self) -> None:
+        # The player reports speech starting while the turn is being served.
+        self.player.fire_on_start = True
+        self.world.script["hello"] = [
+            TextDelta("Hi. Again "),
+            TextDelta("and again. "),
+            TurnEnd("s", False, False),
+        ]
         self.wake()
         self.speak("hello")
         self.settle()
-        self.player.on_start("Hi.")
-        self.player.on_start("Again.")
-        lines = [ln for ln in self.out.getvalue().splitlines() if "[latency]" in ln]
-        self.assertEqual(len(lines), 1)
+        out = self.out.getvalue()
+        lines = out.splitlines()
+        idx = [i for i, ln in enumerate(lines) if "[latency]" in ln]
+        self.assertEqual(len(idx), 1)
+        line = lines[idx[0]]
         self.assertRegex(
-            lines[0],
-            r"^\[latency\] speech end → first say: \d+\.\d\d s \(first token \d+\.\d\d s\)$",
+            line,
+            r"^\[latency\] speech end \u2192 first say: \d+\.\d\d s \(first token \d+\.\d\d s\)$",
         )
+        self.assertEqual(lines[idx[0] - 1], "Hi. Again and again. ")
+        self.assertGreater(out.index("[latency]"), out.index("and again."))
 
     def test_close_closes_brain_and_player(self) -> None:
         self.wake()
@@ -319,6 +335,19 @@ class NoFollowUpTest(ChatSessionTestCase):
         self.settle()
         self.assertEqual(self.world.factory_calls, [None, "sid-1"])
         self.assertEqual(self.player.enqueued[-1], "Back.")
+
+
+class InterruptedLatencyTest(ChatSessionTestCase):
+    def test_interrupted_turn_prints_no_latency_line(self) -> None:
+        self.player.fire_on_start = True
+        self.world.script["story"] = "BLOCK"
+        self.wake()
+        self.speak("story")
+        self.assertTrue(self.world.blocked.wait(timeout=2.0))
+        self.wake()  # barge-in
+        self.assertTrue(self.world.finished_blocked.wait(timeout=2.0))
+        self.settle()
+        self.assertNotIn("[latency]", self.out.getvalue())
 
 
 class ResumeFailureTest(ChatSessionTestCase):
