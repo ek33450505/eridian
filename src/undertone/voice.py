@@ -35,8 +35,8 @@ reason as above -- ambient audio must not be able to answer a confirm prompt.
 That rule is enforced downstream too: every utterance carries `via`, and only a
 wake-word turn can grant a confirmation (a talk-over turn could be our own
 speech leaking through imperfect echo cancellation). A talk-over transcript
-that mostly repeats the reply being spoken (`spoken.looks_like_echo`) is
-dropped instead of sent.
+has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
+if nothing is left it is dropped instead of sent.
 
 Unknown types and malformed lines are ignored; a failure in one connection never
 takes the process down.
@@ -63,6 +63,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import select
 import socket
 import stat
@@ -75,7 +76,7 @@ from . import paths
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
-from .spoken import looks_like_echo, sanitize_terminal
+from .spoken import sanitize_terminal, strip_echo
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
@@ -330,13 +331,14 @@ class VoiceBridge:
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
-            if (
-                self._turn_via == "talk_over"
-                and self._echo_ref
-                and looks_like_echo(text, self._echo_ref)
-            ):
-                self._print("[ignored: that sounded like my own reply]\n")
-                return
+            if self._turn_via == "talk_over" and self._echo_ref:
+                kept = strip_echo(text, self._echo_ref)
+                if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
+                    self._print(f'[ignored as my own reply: "{text}"]\n')
+                    return
+                if kept != text:
+                    self._print(f'[removed my own words: "{text}" -> "{kept}"]\n')
+                    text = kept
             self._print(f"you: {text}\n")
             with _bounded(self._lock):
                 self._gen += 1

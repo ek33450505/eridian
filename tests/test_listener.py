@@ -103,6 +103,15 @@ class StripWakePhraseTest(unittest.TestCase):
     def test_leaves_unrelated_text_alone(self) -> None:
         self.assertEqual(strip_wake_phrase("turn on the lights"), "turn on the lights")
 
+    def test_a_jarvis_is_stripped(self) -> None:
+        self.assertEqual(strip_wake_phrase("A Jarvis."), "")
+        self.assertEqual(strip_wake_phrase("A Jarvis, run the tests"), "run the tests")
+
+    def test_a_is_not_stripped_as_a_prefix_of_other_words(self) -> None:
+        self.assertEqual(strip_wake_phrase("a jar of jam"), "a jar of jam")
+        self.assertEqual(strip_wake_phrase("Alpha Jarvis"), "Alpha Jarvis")
+        self.assertEqual(strip_wake_phrase("ajarvis"), "ajarvis")
+
     def test_case_insensitive_and_variants(self) -> None:
         self.assertEqual(strip_wake_phrase("OK JARVIS turn it off"), "turn it off")
         self.assertEqual(strip_wake_phrase("hi jarvis: stop"), "stop")

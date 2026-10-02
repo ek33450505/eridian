@@ -542,25 +542,41 @@ class TalkOverTest(VoiceTestCase):
             {"type": "utterance", "text": "one more thing", "via": "follow_up"},
         )
 
-    def test_echo_like_talk_over_is_dropped(self) -> None:
-        self._bridge()
-        self.start()
-        channel = self.attach()
-        self._reply(
-            channel,
-            "I finished the refactor and all the tests pass. Want me to open a pull request?",
-            kind="answer",
-        )
-        self.transcript = "I finished the refactor and all the test pass"
+    ECHO_REPLY = "I finished the refactor and all the tests pass. Want me to open a pull request?"
+
+    def _talk_over_reply(self, transcript: str, channel: _Channel) -> None:
+        self._reply(channel, self.ECHO_REPLY, kind="answer")
+        self.transcript = transcript
         self._talk()
         self.player.busy = False
         self.vad_value = 0.0
         self.clock.now += 1.0
         self.bridge.process_frame(FRAME)
-        self.assertIn("[ignored: that sounded like my own reply]", self.out.getvalue())
+
+    def test_pure_echo_talk_over_is_dropped(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        heard = "I finished the refactor and all the tests pass"
+        self._talk_over_reply(heard, channel)
+        self.assertIn(f'[ignored as my own reply: "{heard}"]', self.out.getvalue())
         self.assertNotIn("you:", self.out.getvalue())
         channel.sock.settimeout(0.3)
         self.assertIsNone(channel.read_line())
+
+    def test_mixed_echo_and_user_speech_sends_only_the_user_part(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        heard = "I finished the refactor and all the tests pass wait what's the time"
+        self._talk_over_reply(heard, channel)
+        self.assertEqual(
+            channel.read_line(),
+            {"type": "utterance", "text": "wait what's the time", "via": "talk_over"},
+        )
+        out = self.out.getvalue()
+        self.assertIn(f'[removed my own words: "{heard}" -> "wait what\'s the time"]', out)
+        self.assertIn("you: wait what's the time", out)
 
     def test_wake_turn_is_never_echo_filtered(self) -> None:
         self._bridge()
@@ -569,7 +585,14 @@ class TalkOverTest(VoiceTestCase):
         self._reply(channel, "I finished the refactor and all the tests pass.", kind="answer")
         self.wake()  # barge-in by wake word
         self.speak("I finished the refactor and all the tests pass")
-        self.assertEqual(channel.read_line()["via"], "wake")
+        self.assertEqual(
+            channel.read_line(),
+            {
+                "type": "utterance",
+                "text": "I finished the refactor and all the tests pass",
+                "via": "wake",
+            },
+        )
 
     def test_disabled_never_arms(self) -> None:
         calls = self._bridge(talk_over=False)

@@ -13,7 +13,8 @@ then), which is what makes barge-in work: saying it again stops the speech,
 interrupts the turn, and opens a fresh listening turn. With `talk_over=True`
 (echo cancellation on) sustained speech during playback does the same without
 the wake word, and what the user says becomes the next prompt (a transcript
-that mostly repeats the reply being spoken is dropped as our own echo).
+has the words that repeat the reply being spoken removed, and is dropped if
+nothing is left).
 
 Threading model: the `Listener` and `process_frame` are MAIN-thread only. One
 worker thread runs brain turns sequentially, so an interrupted turn is always
@@ -32,6 +33,7 @@ tests/test_chat.py uses fakes only -- no mic, speaker, or real `claude`.
 from __future__ import annotations
 
 import queue
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -42,7 +44,7 @@ from .brain import BrainError, TextDelta, ToolUse, TurnEnd
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
-from .spoken import looks_like_echo, sanitize_terminal
+from .spoken import sanitize_terminal, strip_echo
 
 APOLOGY = "Sorry, I lost my connection to Claude."
 
@@ -203,13 +205,14 @@ class ChatSession:
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
-            if (
-                self._talk_over_turn
-                and self._echo_ref
-                and looks_like_echo(text, self._echo_ref)
-            ):
-                self._print("[ignored: that sounded like my own reply]\n")
-                return
+            if self._talk_over_turn and self._echo_ref:
+                kept = strip_echo(text, self._echo_ref)
+                if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
+                    self._print(f'[ignored as my own reply: "{text}"]\n')
+                    return
+                if kept != text:
+                    self._print(f'[removed my own words: "{text}" -> "{kept}"]\n')
+                    text = kept
             self._print(f"you: {text}\n")
             now = self._clock()
             t_speech_end = now - (event.speech_end_to_text_ms or 0.0) / 1000.0

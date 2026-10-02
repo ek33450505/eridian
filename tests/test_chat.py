@@ -480,7 +480,18 @@ class TalkOverTest(ChatSessionTestCase):
     def test_echo_like_talk_over_is_not_submitted(self) -> None:
         self._barge_in_on_story("first part second part")
         self.assertEqual(self.world.asks, ["story"])
-        self.assertIn("[ignored: that sounded like my own reply]", self.out.getvalue())
+        self.assertIn(
+            '[ignored as my own reply: "first part second part"]', self.out.getvalue()
+        )
+
+    def test_mixed_echo_and_user_speech_submits_only_the_user_part(self) -> None:
+        self._barge_in_on_story("first part second part what time is it")
+        self.assertEqual(self.world.asks, ["story", "what time is it"])
+        self.assertIn(
+            '[removed my own words: "first part second part what time is it" -> '
+            '"what time is it"]',
+            self.out.getvalue(),
+        )
 
     def test_unrelated_talk_over_is_submitted(self) -> None:
         self._barge_in_on_story("never mind that, what time is it")

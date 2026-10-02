@@ -2,7 +2,13 @@
 
 import unittest
 
-from undertone.spoken import looks_like_echo, sanitize_for_tts, sanitize_terminal, scrub_wake_word, strip_markdown
+from undertone.spoken import (
+    sanitize_for_tts,
+    sanitize_terminal,
+    scrub_wake_word,
+    strip_echo,
+    strip_markdown,
+)
 
 
 class StripMarkdownTest(unittest.TestCase):
@@ -106,22 +112,31 @@ class SanitizeForTtsTest(unittest.TestCase):
                 self.assertNotIn("]", out)
 
 
-class LooksLikeEchoTest(unittest.TestCase):
-    SPOKEN = "I finished the refactor and all the tests pass. Want me to open a pull request?"
+class StripEchoTest(unittest.TestCase):
+    SPOKEN = "The adaptive filter learns how that sound travels through the room."
 
-    def test_echo_with_stt_word_errors_is_detected(self) -> None:
-        heard = "I finished the refactor and all the test pass want me to open a pull quest"
-        self.assertTrue(looks_like_echo(heard, self.SPOKEN))
+    def test_user_words_after_echo_are_kept(self) -> None:
+        heard = "the adaptive filter learns how that sound travels wait what's the time"
+        self.assertEqual(strip_echo(heard, self.SPOKEN), "wait what's the time")
 
-    def test_user_interruption_sharing_a_few_words_is_not_echo(self) -> None:
-        spoken = "The subagent finished and reported two failing checks in the build."
-        self.assertFalse(looks_like_echo("wait, what about the subagent", spoken))
+    def test_echo_with_a_word_error_is_mostly_removed(self) -> None:
+        out = strip_echo("an adaptive filter lurns how that sound wait what time", self.SPOKEN)
+        self.assertEqual(out, "an lurns wait what time")
 
-    def test_short_heard_is_not_echo(self) -> None:
-        self.assertFalse(looks_like_echo("open a", self.SPOKEN))
+    def test_single_shared_words_stay(self) -> None:
+        heard = "wait the sound is how I like it"
+        self.assertEqual(strip_echo(heard, self.SPOKEN), heard)
 
-    def test_empty_spoken_is_not_echo(self) -> None:
-        self.assertFalse(looks_like_echo("one two three four", ""))
+    def test_pure_echo_is_empty(self) -> None:
+        self.assertEqual(strip_echo("The adaptive filter, learns how that sound.", self.SPOKEN), "")
+
+    def test_empty_spoken_leaves_heard_unchanged(self) -> None:
+        self.assertEqual(strip_echo("wait what's the time", ""), "wait what's the time")
+
+    def test_min_run_is_respected(self) -> None:
+        heard = "adaptive filter then something else"
+        self.assertEqual(strip_echo(heard, self.SPOKEN), "then something else")
+        self.assertEqual(strip_echo(heard, self.SPOKEN, min_run=3), heard)
 
 
 if __name__ == "__main__":

@@ -26,8 +26,10 @@ FRAME_BYTES = 320  # 160 int16 samples = 10 ms at 16 kHz
 VAD_CHUNK_BYTES = 1024  # 512 int16 samples = 32 ms at 16 kHz
 SAMPLE_RATE = 16000
 
+# STT sometimes hears "hey" as "a"; that one needs a separator so "ajarvis"
+# and "Alpha Jarvis" are left alone.
 _WAKE_PHRASE_RE = re.compile(
-    r"^\s*(hey|hi|okay|ok)?[\s,]*jarvis[\s,.!?:]*", re.IGNORECASE
+    r"^\s*(hey|hi|okay|ok|a(?=[\s,]))?[\s,]*jarvis[\s,.!?:]*", re.IGNORECASE
 )
 
 

@@ -141,8 +141,8 @@ Every utterance now carries `"via": "wake"|"follow_up"|"talk_over"` on the voice
 - **Verified end-to-end** (2026-10-01): via `talk_over`, `follow_up`, or missing → no grant, Write denied; via `wake` → granted.
 
 ### Echo Filter (Defence in Depth)
-- `spoken.looks_like_echo(heard, spoken, threshold=0.6, min_words=3)` uses difflib, matching in-order word blocks.
-- A talk-over transcript that mostly repeats the reply being spoken is dropped with `[ignored: that sounded like my own reply]`.
+- `spoken.strip_echo(heard, spoken, min_run=2)` uses difflib to find runs of 2+ heard words that match the reply in order, and removes them; single shared words ("the") stay.
+- The rest of a talk-over transcript is sent with `[removed my own words: "…" -> "…"]`; if nothing is left it is dropped with `[ignored as my own reply: "…"]`. The pre-roll and the detection delay overlap the reply, so a talk-over transcript often starts with residual echo.
 - Not applied to wake or follow-up turns.
 
 ### Residual Risks
