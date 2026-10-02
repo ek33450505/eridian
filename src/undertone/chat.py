@@ -10,7 +10,11 @@ one hands-free loop:
 
 The wake word stays live while Claude thinks and speaks (the listener is IDLE
 then), which is what makes barge-in work: saying it again stops the speech,
-interrupts the turn, and opens a fresh listening turn.
+interrupts the turn, and opens a fresh listening turn. With `talk_over=True`
+(echo cancellation on) sustained speech during playback does the same without
+the wake word, and what the user says becomes the next prompt (a transcript
+has the words that repeat the reply being spoken removed, and is dropped if
+nothing is left).
 
 Threading model: the `Listener` and `process_frame` are MAIN-thread only. One
 worker thread runs brain turns sequentially, so an interrupted turn is always
@@ -29,6 +33,7 @@ tests/test_chat.py uses fakes only -- no mic, speaker, or real `claude`.
 from __future__ import annotations
 
 import queue
+import re
 import sys
 import threading
 from dataclasses import dataclass
@@ -39,7 +44,7 @@ from .brain import BrainError, TextDelta, ToolUse, TurnEnd
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
-from .spoken import sanitize_terminal
+from .spoken import sanitize_terminal, strip_echo
 
 APOLOGY = "Sorry, I lost my connection to Claude."
 
@@ -89,8 +94,10 @@ class ChatSession:
         follow_up_s: float = 6.0,
         cue: Callable[[str], None] | None = None,
         out: TextIO = sys.stdout,
+        talk_over: bool = False,
     ) -> None:
         self._clock = clock
+        self._talk_over = talk_over
         self._brain_factory = brain_factory
         self._save_session = save_session
         self._last_session_id = resume_session_id
@@ -101,6 +108,10 @@ class ChatSession:
         self._lock = threading.Lock()
         self._print_lock = threading.Lock()
         self._gen = 0
+        self._spoken_gen = -1  # gen that _spoken_text belongs to (under _lock)
+        self._spoken_text = ""  # sentences enqueued in that gen, for the echo filter
+        self._talk_over_turn = False  # main thread: the open turn began as talk-over
+        self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._in_flight = 0  # utterances submitted but not yet fully served
         self._turn: _Turn | None = None
         self._brain: BrainLike | None = None
@@ -130,6 +141,9 @@ class ChatSession:
 
     def process_frame(self, frame: bytes) -> None:
         self._drain_control()
+        self._listener.talk_over = (
+            "turn" if self._talk_over and self._player.busy else "off"
+        )
         self._listener.process_frame(frame)
 
     def run(self, frames: Iterable[bytes]) -> None:
@@ -174,12 +188,31 @@ class ChatSession:
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
+            self._talk_over_turn = False
             self._cue("wake")
             self._maybe_barge_in()
+        elif event.kind in ("talk_over", "talk_over_stop"):
+            if event.kind == "talk_over":
+                self._talk_over_turn = True
+                # Snapshot before the barge-in bumps the generation.
+                with self._lock:
+                    self._echo_ref = (
+                        self._spoken_text if self._spoken_gen == self._gen else ""
+                    )
+            self._maybe_barge_in()  # no cue: the user is already talking
         elif event.kind == "follow_up":
+            self._talk_over_turn = False
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
+            if self._talk_over_turn and self._echo_ref:
+                kept = strip_echo(text, self._echo_ref)
+                if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
+                    self._print(f'[ignored as my own reply: "{text}"]\n')
+                    return
+                if kept != text:
+                    self._print(f'[removed my own words: "{text}" -> "{kept}"]\n')
+                    text = kept
             self._print(f"you: {text}\n")
             now = self._clock()
             t_speech_end = now - (event.speech_end_to_text_ms or 0.0) / 1000.0
@@ -221,6 +254,10 @@ class ChatSession:
         with self._lock:
             if gen != self._gen:
                 return False
+            if sentences:
+                if self._spoken_gen != gen:
+                    self._spoken_gen, self._spoken_text = gen, ""
+                self._spoken_text += " ".join(sentences) + " "
             for sentence in sentences:
                 self._player.enqueue(sentence)
             return True

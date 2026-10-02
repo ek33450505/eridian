@@ -296,5 +296,86 @@ class SessionHelpersTest(CliTestCase):
         self.assertEqual(parser.parse_args(["attach"]).follow_up, 6.0)
 
 
+class FakeEngine:
+    def __init__(self) -> None:
+        self.started = False
+        self.closed = False
+
+    def play(self, pcm: bytes) -> None:
+        pass
+
+    def clear(self) -> None:
+        pass
+
+    @property
+    def playing(self) -> bool:
+        return False
+
+    def wait_drained(self, timeout: float | None = None) -> bool:
+        return True
+
+    def start(self) -> None:
+        self.started = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def frames(self):
+        return iter([b"frame"])
+
+
+class MakeAudioIoTest(unittest.TestCase):
+    def test_aec_on_builds_rendered_queue_on_the_engine(self) -> None:
+        from undertone.player import RenderedSpeechQueue
+
+        engine = FakeEngine()
+        io_ = cli.make_audio_io(False, engine_factory=lambda: engine)
+        queues = [io_.player_factory(), io_.player_factory(lambda text: None)]
+        try:
+            for q in queues:
+                self.assertIsInstance(q, RenderedSpeechQueue)
+                self.assertIs(q._sink, engine)
+        finally:
+            for q in queues:
+                q.close()
+
+    def test_aec_on_talk_over_and_engine_delegation(self) -> None:
+        engine = FakeEngine()
+        io_ = cli.make_audio_io(False, engine_factory=lambda: engine)
+        self.assertTrue(io_.talk_over)
+        self.assertIs(io_.engine, engine)
+        io_.start()
+        self.assertTrue(engine.started)
+        self.assertEqual(list(io_.frames()), [b"frame"])
+        io_.close()
+        self.assertTrue(engine.closed)
+        self.assertIn("on", cli.banner_line(io_))
+
+    def test_no_aec_uses_say_queue_without_engine(self) -> None:
+        from undertone.player import SpeechQueue
+
+        def factory():
+            raise AssertionError("engine must not be built with --no-aec")
+
+        io_ = cli.make_audio_io(True, engine_factory=factory)
+        self.assertFalse(io_.talk_over)
+        self.assertIsNone(io_.engine)
+        q = io_.player_factory()
+        try:
+            self.assertIsInstance(q, SpeechQueue)
+        finally:
+            q.close()
+        io_.start()
+        io_.close()  # no engine: no-ops
+        self.assertIn("off", cli.banner_line(io_))
+
+    def test_parser_accepts_no_aec(self) -> None:
+        parser = cli.build_parser()
+        self.assertTrue(parser.parse_args(["chat", "--no-aec"]).no_aec)
+        self.assertTrue(parser.parse_args(["attach", "--no-aec"]).no_aec)
+        self.assertFalse(parser.parse_args(["chat"]).no_aec)
+        self.assertFalse(parser.parse_args(["attach"]).no_aec)
+
+
 if __name__ == "__main__":
     unittest.main()

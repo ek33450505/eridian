@@ -13,7 +13,9 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
     channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"}   (first line)
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"}
                                                                     (any number)
-    voice -> channel   {"type":"utterance","text":"..."}
+    voice -> channel   {"type":"utterance","text":"...","via":"wake"|"follow_up"|"talk_over"}
+                       (`via` = what opened the turn; the channel lets only "wake"
+                        satisfy a confirm phrase)
                        {"type":"detached"}   (sent to the OLD connection when a
                                               newer channel says hello; "latest
                                               session wins", then it is closed)
@@ -24,6 +26,18 @@ early "running the tests now") never does, and neither does `confirm` -- a
 spoken confirmation prompt must not be answerable by ambient audio (a video
 saying "yes") inside an open mic window, so it needs a fresh wake word. An
 unknown `kind` fails closed: it is spoken but opens no window.
+
+Talk-over (`talk_over=True`, only when echo cancellation is on): while a reply
+plays, sustained user speech stops it without the wake word and becomes the
+next utterance. During confirm (and unknown-kind) speech talk-over is OFF: a
+confirm prompt is short and must always be heard in full, so it plays to the
+end. "hey jarvis" still interrupts it, and answering still needs the wake word
+-- ambient audio must not be able to answer a confirm prompt. That rule is
+enforced downstream too: every utterance carries `via`, and only a
+wake-word turn can grant a confirmation (a talk-over turn could be our own
+speech leaking through imperfect echo cancellation). A talk-over transcript
+has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
+if nothing is left it is dropped instead of sent.
 
 Unknown types and malformed lines are ignored; a failure in one connection never
 takes the process down.
@@ -50,6 +64,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import select
 import socket
 import stat
@@ -62,7 +77,7 @@ from . import paths
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
-from .spoken import sanitize_terminal
+from .spoken import sanitize_terminal, strip_echo
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
@@ -135,9 +150,11 @@ class VoiceBridge:
         follow_up_s: float = 6.0,
         cue: Callable[[str], None] | None = None,
         out: TextIO = sys.stdout,
+        talk_over: bool = False,
     ) -> None:
         self._socket_path = Path(socket_path)
         self._follow_up_s = follow_up_s
+        self._talk_over = talk_over
         self._cue = cue or (lambda kind: None)
         self._out = out
 
@@ -145,6 +162,11 @@ class VoiceBridge:
         self._print_lock = threading.Lock()
         self._chunk_lock = threading.Lock()
         self._gen = 0
+        self._no_talk_over_gen = -1  # gen whose speech (confirm) talk-over must not cut
+        self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
+        self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
+        self._turn_via = ""  # main thread: what opened the current turn
+        self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._conn: _Conn | None = None  # the attached (latest-hello) channel
         self._conns: set[_Conn] = set()
         self._closed = False
@@ -257,7 +279,17 @@ class VoiceBridge:
 
     def process_frame(self, frame: bytes) -> None:
         self._drain_control()
+        self._listener.talk_over = self._talk_over_mode()
         self._listener.process_frame(frame)
+
+    def _talk_over_mode(self) -> str:
+        if not self._talk_over:
+            return "off"
+        # Session lock, then the player's (documented order).
+        with _bounded(self._lock):
+            if not self._player.busy:
+                return "off"
+            return "off" if self._no_talk_over_gen == self._gen else "turn"
 
     def run(self, frames: Iterable[bytes]) -> None:
         for frame in frames:
@@ -281,17 +313,37 @@ class VoiceBridge:
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
+            self._turn_via, self._echo_ref = "wake", ""
             self._cue("wake")
             self._maybe_barge_in()
+        elif event.kind == "talk_over":
+            self._turn_via = "talk_over"
+            # Snapshot before the barge-in bumps the generation.
+            with _bounded(self._lock):
+                self._echo_ref = (
+                    self._spoken_text if self._spoken_gen == self._gen else ""
+                )
+            self._maybe_barge_in()  # no cue: the user is already talking
         elif event.kind == "follow_up":
+            self._turn_via, self._echo_ref = "follow_up", ""
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
+            if self._turn_via == "talk_over" and self._echo_ref:
+                kept = strip_echo(text, self._echo_ref)
+                if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
+                    self._print(f'[ignored as my own reply: "{text}"]\n')
+                    return
+                if kept != text:
+                    self._print(f'[removed my own words: "{text}" -> "{kept}"]\n')
+                    text = kept
             self._print(f"you: {text}\n")
             with _bounded(self._lock):
                 self._gen += 1
                 conn = self._conn
-            if conn is not None and conn.send({"type": "utterance", "text": text}):
+            if conn is not None and conn.send(
+                {"type": "utterance", "text": text, "via": self._turn_via}
+            ):
                 return
             self._print("[no Claude session attached]\n")
             self._player.enqueue(NO_SESSION_SPEECH)
@@ -305,6 +357,9 @@ class VoiceBridge:
         with _bounded(self._lock):
             if not self._player.busy:
                 return
+            if self._no_talk_over_gen == self._gen:
+                # `busy` can lag the stop; keep talk-over off for the next gen
+                self._no_talk_over_gen = self._gen + 1
             self._gen += 1
         self._player.stop()
         self._print("[interrupted]\n")
@@ -440,6 +495,11 @@ class VoiceBridge:
             sentences = self._chunker.feed(text) + self._chunker.flush()
         with _bounded(self._lock):
             gen = self._gen
+            if kind not in ("answer", "ack"):
+                self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
+            if self._spoken_gen != gen:
+                self._spoken_gen, self._spoken_text = gen, ""
+            self._spoken_text += " ".join(sentences) + " "
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":
@@ -474,14 +534,14 @@ def _server_answers(path: Path) -> bool:
         probe.close()
 
 
-def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
+def run_attach(*, no_beep: bool, follow_up_s: float, no_aec: bool = False) -> int:
     """The real wiring behind `undertone attach` (real mic; not unit-tested)."""
     # Lazy imports for the same reason as cli._cmd_chat: keep `--help` fast and
     # the heavy audio/model deps out of import time. cli is imported lazily too
     # (it imports this module).
     import time
 
-    from . import audio, cli
+    from . import cli
     from .stt import ModelNotCachedError, ParakeetSTT
 
     try:
@@ -495,6 +555,7 @@ def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
     vad = SileroVoiceActivityDetector()
     cues = {"wake": cli._WAKE_CUE, "follow_up": cli._FOLLOW_UP_CUE}
 
+    io = cli.make_audio_io(no_aec)
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -504,10 +565,14 @@ def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
         vad_reset=vad.reset,
         follow_up_s=follow_up_s,
         cue=None if no_beep else (lambda kind: cli._play_cue(cues[kind])),
+        player_factory=io.player_factory,
+        talk_over=io.talk_over,
     )
     if bridge.start() != 0:
         bridge.close()
+        io.close()
         return 1
+    print(cli.banner_line(io))
 
     print(
         "undertone attach: listening for 'hey jarvis'. Start a Claude session with "
@@ -515,9 +580,16 @@ def run_attach(*, no_beep: bool, follow_up_s: float) -> int:
         flush=True,
     )
     try:
-        bridge.run(audio.frame_source())
+        try:
+            io.start()
+        except Exception as exc:  # noqa: BLE001 - any device/engine failure
+            print(cli.AUDIO_START_ERROR.format(exc=exc), file=sys.stderr)
+            return 1
+        bridge.run(io.frames())
     except KeyboardInterrupt:
         pass
     finally:
+        # Bridge first: that stops the player, which clears the sink.
         bridge.close()
+        io.close()
     return 0

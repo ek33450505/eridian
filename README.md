@@ -1,6 +1,6 @@
 # undertone
 
-Hands-free, local-first voice loop for Claude Code on macOS (Apple Silicon). Say "hey jarvis" and ask: either into your running interactive Claude Code session (`undertone attach` + `undertone session`), or in a standalone voice conversation (`undertone chat`). You hear Claude's answer, and saying "hey jarvis" again mid-reply cuts it off. For 6 seconds after an answer you can ask a follow-up without the wake word.
+Hands-free, local-first voice loop for Claude Code on macOS (Apple Silicon). Say "hey jarvis" and ask: either into your running interactive Claude Code session (`undertone attach` + `undertone session`), or in a standalone voice conversation (`undertone chat`). You hear Claude's answer, and saying "hey jarvis" again mid-reply cuts it off — or talk over it without the wake word. For 6 seconds after an answer you can ask a follow-up without the wake word.
 
 ## Local-first by design (the point of this repo)
 
@@ -75,11 +75,13 @@ Run `chat` from a project directory, because Claude's file tools are confined to
 
 **Terminal 1:** Run the voice input listener.
 ```bash
-uv run undertone attach [--no-beep] [--follow-up SECONDS]
+uv run undertone attach [--no-beep] [--no-aec] [--follow-up SECONDS]
 ```
 - `--follow-up SECONDS`: seconds to keep listening after a reply without the wake word (default 6; 0 disables)
 - `--no-beep`: skip the audible wake/follow-up cues
+- `--no-aec`: play speech with `say` directly (no echo cancellation, no talk-over, wake-word barge-in only); use if AEC misbehaves
 - Say "hey jarvis", then your question. It lands in the session, and Claude's `reply` is spoken aloud. The follow-up window opens only after an answer, never after an acknowledgement or a confirmation request.
+- **Echo cancellation on:** talk over a reply to stop it without the wake word. **Echo cancellation off:** say "hey jarvis" to stop a reply.
 
 **Terminal 2:** from **your project directory**, start an interactive Claude Code session wired to receive voice turns. Use the venv's executable, because `uv run` only works inside the undertone checkout:
 ```bash
@@ -90,11 +92,13 @@ This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --
 
 ### Standalone voice conversation (Path B)
 
-`undertone chat [--no-beep] [--resume] [--follow-up SECONDS]`
+`undertone chat [--no-beep] [--no-aec] [--resume] [--follow-up SECONDS]`
 - `--follow-up SECONDS`: how long after a reply you can ask a follow-up without the wake word (default 6; 0 disables)
 - `--resume`: continue the last chat session (uses the saved session ID)
 - `--no-beep`: no cue sounds (normally Tink on wake, and Pop when the follow-up window opens)
+- `--no-aec`: play speech with `say` directly (no echo cancellation, no talk-over, wake-word barge-in only); use if AEC misbehaves
 - Ctrl-C to quit
+- **Echo cancellation on:** talk over a reply to stop it without the wake word. **Echo cancellation off:** say "hey jarvis" to stop a reply.
 
 ### Utilities
 
@@ -105,26 +109,29 @@ This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --
 
 ```
 Path A (undertone attach + undertone session)
-  mic → wake word → VAD → STT → voice.sock → channel (mcp_channel.py) → Claude Code session
-                                                                              │ reply tool
-  speaker ← say ← sentence chunker ← voice.sock ← channel ◄───────────────────┘
+  mic ──► DuplexAudio (AEC) ──► wake word → VAD → STT → voice.sock → channel (mcp_channel.py) → Claude Code session
+   ▲                            │ (also active during playback = barge-in, talk-over)            │ reply tool
+   │                            ▼                                                                ▼
+  speaker ◄── rendered TTS ◄── sentence chunker ◄── voice.sock ◄── channel ◄────────────────────┘
 
 Path B (undertone chat)
-  mic → wake word → VAD → STT → brain (persistent claude -p)
-                                    │ streamed text
-  speaker ← say ← sentence chunker ◄┘
+  mic ──► DuplexAudio (AEC) ──► wake word → VAD → STT ──► brain (persistent claude -p)
+   ▲                            │ (also active during playback = barge-in, talk-over)            │ streamed text
+   │                            ▼                                                                ▼
+  speaker ◄── rendered TTS ◄── sentence chunker ◄────────────────────────────────────────────────┘
 ```
 
-The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" again stops the speech (barge-in). In `chat` it also interrupts Claude's turn. A channel can't interrupt a running turn, so in Path A your new question queues until Claude finishes.
+The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" again stops the speech (barge-in). You can also talk over a reply to stop it without the wake word (echo cancellation provides the speaker reference signal). In `chat`, both also interrupt Claude's turn. A channel can't interrupt a running turn, so in Path A your new question queues until Claude finishes.
 
 ### Pipeline details
 
+- **Echo cancellation:** WebRTC AEC3 via livekit's `AudioProcessingModule(echo_cancellation=True, noise_suppression=True, high_pass_filter=True)`. Full-duplex 16 kHz mono int16 stream paired with rendered speech. Offline measurement (2026-10-01): ERLE ≈ 35 dB, Silero VAD fired on 0/217 residual chunks (189/217 without AEC). Live-tested 2026-10-02 on the MacBook Pro speakers and mic in one room; other rooms, devices and volumes are untested.
 - **Wake word:** pymicro-wakeword with built-in "Hey Jarvis" model (0.97 cutoff, 10 ms frames at 16 kHz)
-- **VAD:** Silero VAD end-of-turn detection after 0.7 s of silence
+- **VAD:** Silero VAD end-of-turn detection after 0.7 s of silence; talk-over at 0.3 s of sustained speech (≥0.6 confidence)
 - **STT:** parakeet-mlx `mlx-community/parakeet-tdt-0.6b-v3` (in-memory float32 processing)
 - **Brain:** persistent `claude -p` stream-json subprocess with file tools confined to working directory
 - **Chunker:** splits Claude's reply into sentences
-- **TTS:** macOS `say` (default voice **Evan (Enhanced)**); override with `UNDERTONE_VOICE` env var
+- **TTS:** each sentence rendered to 16 kHz mono int16 WAV by `say -o` (rendering time ~0.62 s per 4.7 s sentence), then played through the echo canceller for a reference signal. macOS `say` voice is **Evan (Enhanced)** (default); override with `UNDERTONE_VOICE` env var
 
 ### Measured latencies (M4 Max)
 
@@ -136,13 +143,17 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 
 ### Modules
 
-`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `voice_guard.py`, `paths.py`, `cli.py`.
+`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `duplex.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `voice_guard.py`, `paths.py`, `cli.py`.
 
 ## Safety model for voice
 
 ### Path A: voice into a Claude Code session
 
 Voice turns keep full session power but are unverified input. A hard control (`voice_guard.py`) gates tool calls during spoken turns: before anything destructive, irreversible or outward-facing, Claude must send a `reply` tool with `kind="confirm"` asking the user to speak the wake word, then "confirm <word1> <word2>" with two uncommon nouns. The listener strips the wake word from every transcript, so Claude receives "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. Both words must be at least 3 letters, uncommon, and fresh (not used before in the session); one attempt, valid 300 s. Any other message cancels the challenge. On a successful confirm, gated calls are allowed for the rest of the turn. The confirm flow is enforced by hooks injected into the session; see [`SECURITY.md`](SECURITY.md) §7a for the gating rules and residual risks.
+
+- **Confirm by wake word only:** every utterance carries a `via` field (`wake`, `follow_up`, or `talk_over`). Only a wake-word turn (`via: "wake"`) can satisfy a confirm challenge, preventing a mishearing of ambient audio or undertone's own speech (via echo cancellation imperfection) from bypassing the guard. Talk-over and follow-up turns cannot grant gated calls.
+
+- **Talk-over barge-in:** while Claude is speaking, 0.3 s of sustained speech stops the reply without saying the wake word. Your speech becomes your next turn, with 0.5 s of your first words preserved. Exception: a confirm prompt (or a reply of unknown kind) can't be talked over, so you always hear the whole phrase; "hey jarvis" still interrupts it, and you answer with "hey jarvis" plus the phrase. In `chat`, talk-over also interrupts Claude's in-flight turn.
 
 - **Wake word never spoken:** `speaker.build_say_argv()` runs `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any utterance of "hey jarvis" or obfuscated forms with "the wake word". Undertone's instructions also tell Claude never to say it.
 
@@ -171,6 +182,7 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | parakeet-tdt-0.6b-v3 | STT model by NVIDIA; **CC-BY-4.0** — attribution: NVIDIA |
 | mlx | ML framework; MIT |
 | sounddevice 0.5.6 | Audio I/O; MIT |
+| livekit 1.1.20 | echo cancellation; Apache-2.0 |
 | numpy | Linear algebra; BSD-3-Clause and others |
 | macOS `say` | text-to-speech; part of macOS |
 | Claude Code | Anthropic's terms |
@@ -187,16 +199,17 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | **2b** | `undertone chat [--no-beep] [--resume] [--follow-up SECONDS]` (standalone voice REPL) | ✓ done |
 | **D** | documentation: this README, local-first, architecture, training, SECURITY, CHANGELOG, offline check | ✓ done (refreshed at each phase end) |
 | **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
-| **4** | Kokoro voice + talking over replies without wake word (echo cancellation via livekit AEC) | planned |
+| **4a** | echo cancellation via livekit AEC + talking over replies without wake word | ✓ done (live-tested 2026-10-02 (MacBook Pro speakers and mic, one room)) |
+| **4b** | Kokoro voice | planned |
 | **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
 
 For the full research and component justification: see [`docs/plan.md`](docs/plan.md).
 
 ## Testing
 
-281 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
+359 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
 
-Plus `bash scripts/verify-offline.sh` for the offline pipeline check (see "Verify it yourself" above).
+Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word → VAD → STT → TTS inside a `sandbox-exec` profile that denies all network access. Now also covers echo cancellation (ERLE ≥ 20 dB, and no speech-like run on the residual long enough to trigger talk-over). See "Verify it yourself" above.
 
 ## Environment variables
 

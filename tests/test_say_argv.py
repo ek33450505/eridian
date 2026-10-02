@@ -68,6 +68,38 @@ class VoiceSelectionTest(unittest.TestCase):
     def test_empty_voice_omits_v_flag(self) -> None:
         self.assertEqual(self._argv(""), ["say-stub", "--", "hello"])
 
+class OutPathTest(unittest.TestCase):
+    """Pure argv tests for the render variant -- `say` is never run."""
+
+    def _argv(self, text: str, voice: str, out_path: str | None) -> list[str] | None:
+        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say-stub", "UNDERTONE_VOICE": voice}):
+            return speaker.build_say_argv(text, out_path=out_path)
+
+    def test_out_path_argv_without_voice(self) -> None:
+        self.assertEqual(
+            self._argv("hello", "", "/tmp/x/1.wav"),
+            ["say-stub", "-o", "/tmp/x/1.wav", "--file-format=WAVE", "--data-format=LEI16@16000", "--", "hello"],
+        )
+
+    def test_out_path_argv_with_voice(self) -> None:
+        self.assertEqual(
+            self._argv("hello", "Zoe (Premium)", "/tmp/x/1.wav"),
+            [
+                "say-stub", "-v", "Zoe (Premium)", "-o", "/tmp/x/1.wav",
+                "--file-format=WAVE", "--data-format=LEI16@16000", "--", "hello",
+            ],
+        )
+
+    def test_flag_shaped_text_still_after_double_dash(self) -> None:
+        argv = self._argv("-o/tmp/pwned", "", "/tmp/x/1.wav")
+        self.assertEqual(argv[-2:], ["--", "-o/tmp/pwned"])
+        self.assertEqual(argv.index("--"), len(argv) - 2)
+
+    def test_out_path_none_is_unchanged(self) -> None:
+        self.assertEqual(self._argv("hello", "", None), ["say-stub", "--", "hello"])
+
+    def test_empty_text_still_none_with_out_path(self) -> None:
+        self.assertIsNone(self._argv("\x00", "", "/tmp/x/1.wav"))
 
 
 if __name__ == "__main__":

@@ -132,6 +132,7 @@ class _FakePlayer:
 class ChatSessionTestCase(unittest.TestCase):
     follow_up_s = 6.0
     resume_id: str | None = None
+    talk_over = False
 
     def setUp(self) -> None:
         self.clock = _FakeClock()
@@ -168,6 +169,7 @@ class ChatSessionTestCase(unittest.TestCase):
             follow_up_s=self.follow_up_s,
             cue=self.cues.append,
             out=self.out,
+            talk_over=self.talk_over,
         )
         self.player = self.players[0]
         self.addCleanup(self.session.close)
@@ -423,6 +425,93 @@ class BargeInTest(ChatSessionTestCase):
         self.assertEqual(self.saved, ["sid-blocked", "sid-new"])
         self.assertTrue(self.pump_until(lambda: self.listener_state == "LISTENING"))
         self.assertEqual(self.cues[-1], "follow_up")
+
+
+class TalkOverTest(ChatSessionTestCase):
+    talk_over = True
+
+    def _talk(self, n: int = 10) -> None:
+        self.vad_value = 1.0
+        for _ in range(n):
+            self.session.process_frame(FRAME)
+
+    def test_talk_over_interrupts_and_becomes_next_prompt(self) -> None:
+        self.world.script["story"] = "BLOCK"
+        self.world.script["new question"] = [
+            TextDelta("New answer. "),
+            TurnEnd("sid-new", False, False),
+        ]
+        self.wake()
+        self.speak("story")
+        self.assertTrue(self.world.blocked.wait(timeout=2.0))
+        self.player.busy = True
+
+        self.transcript = "new question"
+        self._talk()
+        self.assertEqual(self.player.stops, 1)
+        self.assertEqual(self.world.interrupts, 1)
+        self.assertIn("[interrupted]", self.out.getvalue())
+        self.assertEqual(self.cues, ["wake"])  # no cue for the talk-over turn
+        self.assertEqual(self.listener_state, "LISTENING")
+
+        self.assertTrue(self.world.finished_blocked.wait(timeout=2.0))
+        self.player.busy = False
+        self.vad_value = 0.0
+        self.clock.now += 1.0
+        self.session.process_frame(FRAME)
+        self.settle()
+        self.assertEqual(self.world.asks, ["story", "new question"])
+
+    def _barge_in_on_story(self, heard: str) -> None:
+        self.world.script["story"] = "BLOCK"
+        self.wake()
+        self.speak("story")
+        self.assertTrue(self.world.blocked.wait(timeout=2.0))
+        self.player.busy = True
+        self.transcript = heard
+        self._talk()
+        self.assertTrue(self.world.finished_blocked.wait(timeout=2.0))
+        self.player.busy = False
+        self.vad_value = 0.0
+        self.clock.now += 1.0
+        self.session.process_frame(FRAME)
+        self.settle()
+
+    def test_echo_like_talk_over_is_not_submitted(self) -> None:
+        self._barge_in_on_story("first part second part")
+        self.assertEqual(self.world.asks, ["story"])
+        self.assertIn(
+            '[ignored as my own reply: "first part second part"]', self.out.getvalue()
+        )
+
+    def test_mixed_echo_and_user_speech_submits_only_the_user_part(self) -> None:
+        self._barge_in_on_story("first part second part what time is it")
+        self.assertEqual(self.world.asks, ["story", "what time is it"])
+        self.assertIn(
+            '[removed my own words: "first part second part what time is it" -> '
+            '"what time is it"]',
+            self.out.getvalue(),
+        )
+
+    def test_unrelated_talk_over_is_submitted(self) -> None:
+        self._barge_in_on_story("never mind that, what time is it")
+        self.assertEqual(self.world.asks, ["story", "never mind that, what time is it"])
+
+    def test_idle_player_does_not_arm(self) -> None:
+        self._talk(30)
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self.player.stops, 0)
+
+
+class TalkOverDisabledTest(ChatSessionTestCase):
+    def test_busy_player_does_not_arm_without_the_flag(self) -> None:
+        self.player.busy = True
+        self.vad_value = 1.0
+        for _ in range(30):
+            self.session.process_frame(FRAME)
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self.player.stops, 0)
+        self.assertEqual(self.world.interrupts, 0)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prove the audio pipeline (wake word, VAD, STT, TTS) runs with the network denied.
+# Prove the audio pipeline (wake word, VAD, STT, TTS, echo cancellation) runs with the network denied.
 # Uses macOS sandbox-exec; a Docker --network none container can't run MLX or `say`.
 # Run `uv run undertone models fetch` first (outside the sandbox).
 #
@@ -59,7 +59,7 @@ rc=0
 sandbox-exec -p "$profile" "$PY" "$ROOT/scripts/offline_check.py" "$clip" "$out" || rc=$?
 
 if [[ "$rc" -eq 0 ]]; then
-  echo "OFFLINE CHECK: PASS (wake, VAD, STT, TTS ran with network denied)"
+  echo "OFFLINE CHECK: PASS (wake, VAD, STT, TTS, echo cancellation ran with network denied)"
 else
   echo "OFFLINE CHECK: FAIL (exit $rc)"
 fi

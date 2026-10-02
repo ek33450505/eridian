@@ -5,6 +5,7 @@ Pure, stdlib-only, no I/O — easy to test in isolation (see tests/test_spoken.p
 
 from __future__ import annotations
 
+import difflib
 import re
 
 _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
@@ -73,3 +74,45 @@ def strip_markdown(text: str) -> str:
     text = _URL_RE.sub(" ", text)
     text = _FILE_PATH_RE.sub(" ", text)
     return text
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def strip_echo(heard: str, spoken: str, *, min_run: int = 2) -> str:
+    """Remove the words of `heard` that repeat our own `spoken` reply.
+
+    A talk-over transcript can start with residual echo of the reply (the
+    pre-roll and detection delay overlap the speech), followed by what the user
+    actually said. Heard words inside a run of at least `min_run` consecutive
+    words that also appear, in order, in `spoken` are dropped; isolated common
+    words ("the") stay. Returns the remaining words joined by single spaces,
+    minus leading/trailing punctuation-only tokens.
+    """
+    words = heard.split()
+    if not _WORD_RE.search(spoken.lower()):
+        return heard
+    flat: list[str] = []
+    owner: list[int] = []
+    for i, word in enumerate(words):
+        for token in _WORD_RE.findall(word.lower()):
+            flat.append(token)
+            owner.append(i)
+    spoken_tokens = _WORD_RE.findall(spoken.lower())
+    matched = [False] * len(flat)
+    blocks = difflib.SequenceMatcher(None, flat, spoken_tokens, autojunk=False)
+    for block in blocks.get_matching_blocks():
+        if block.size >= min_run:
+            for k in range(block.a, block.a + block.size):
+                matched[k] = True
+    removed = {
+        i
+        for i in set(owner)
+        if all(m for m, o in zip(matched, owner) if o == i)
+    }
+    kept = [w for i, w in enumerate(words) if i not in removed]
+    while kept and not _WORD_RE.search(kept[0].lower()):
+        kept.pop(0)
+    while kept and not _WORD_RE.search(kept[-1].lower()):
+        kept.pop()
+    return " ".join(kept)

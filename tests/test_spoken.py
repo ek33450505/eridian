@@ -2,7 +2,13 @@
 
 import unittest
 
-from undertone.spoken import sanitize_for_tts, sanitize_terminal, scrub_wake_word, strip_markdown
+from undertone.spoken import (
+    sanitize_for_tts,
+    sanitize_terminal,
+    scrub_wake_word,
+    strip_echo,
+    strip_markdown,
+)
 
 
 class StripMarkdownTest(unittest.TestCase):
@@ -104,6 +110,33 @@ class SanitizeForTtsTest(unittest.TestCase):
                 out = sanitize_for_tts(text)
                 self.assertNotIn("[", out)
                 self.assertNotIn("]", out)
+
+
+class StripEchoTest(unittest.TestCase):
+    SPOKEN = "The adaptive filter learns how that sound travels through the room."
+
+    def test_user_words_after_echo_are_kept(self) -> None:
+        heard = "the adaptive filter learns how that sound travels wait what's the time"
+        self.assertEqual(strip_echo(heard, self.SPOKEN), "wait what's the time")
+
+    def test_echo_with_a_word_error_is_mostly_removed(self) -> None:
+        out = strip_echo("an adaptive filter lurns how that sound wait what time", self.SPOKEN)
+        self.assertEqual(out, "an lurns wait what time")
+
+    def test_single_shared_words_stay(self) -> None:
+        heard = "wait the sound is how I like it"
+        self.assertEqual(strip_echo(heard, self.SPOKEN), heard)
+
+    def test_pure_echo_is_empty(self) -> None:
+        self.assertEqual(strip_echo("The adaptive filter, learns how that sound.", self.SPOKEN), "")
+
+    def test_empty_spoken_leaves_heard_unchanged(self) -> None:
+        self.assertEqual(strip_echo("wait what's the time", ""), "wait what's the time")
+
+    def test_min_run_is_respected(self) -> None:
+        heard = "adaptive filter then something else"
+        self.assertEqual(strip_echo(heard, self.SPOKEN), "then something else")
+        self.assertEqual(strip_echo(heard, self.SPOKEN, min_run=3), heard)
 
 
 if __name__ == "__main__":

@@ -312,7 +312,7 @@ class StateMachineTests(GuardTestCase):
 
     def test_grant_survives_its_own_prompt_event(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern")
-        self.assertTrue(vg.record_voice(self.home, TOKEN, "Confirm walnut lantern."))
+        self.assertTrue(vg.record_voice(self.home, TOKEN, "Confirm walnut lantern.", can_grant=True))
         self.hook("userpromptsubmit", {"prompt": voice_prompt("Confirm walnut lantern.")})
         self.assertAllowed("Write")
         log = (Path(self.home) / "logs" / "guard.log").read_text()
@@ -351,17 +351,17 @@ class StateMachineTests(GuardTestCase):
 
     def test_stop_ends_grant_but_keeps_challenge(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
-        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 1)
+        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 1)
         self.assertIsNone(vg.decide(vg.load_state(self.home, TOKEN), "Write", {}, T0 + 2))
         vg.record_stopped(self.home, TOKEN, now=T0 + 3)
         self.assertIsNotNone(vg.decide(vg.load_state(self.home, TOKEN), "Write", {}, T0 + 4))
         vg.record_confirm_request(self.home, TOKEN, "confirm apple banana", now=T0 + 5)
         vg.record_stopped(self.home, TOKEN, now=T0 + 6)
-        self.assertTrue(vg.record_voice(self.home, TOKEN, "confirm apple banana", now=T0 + 7))
+        self.assertTrue(vg.record_voice(self.home, TOKEN, "confirm apple banana", can_grant=True, now=T0 + 7))
 
     def test_queued_nonmatching_voice_clears_grant(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern")
-        vg.record_voice(self.home, TOKEN, "confirm walnut lantern")
+        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True)
         vg.record_voice(self.home, TOKEN, "queued request")
         self.assertDenied("Write")
 
@@ -375,7 +375,7 @@ class StateMachineTests(GuardTestCase):
     def test_confirm_flow_grants_rest_of_turn(self):
         phrase = vg.record_confirm_request(self.home, TOKEN, "Say the wake word, then 'confirm walnut lantern'.", now=T0)
         self.assertEqual(phrase, "walnut lantern")
-        self.assertTrue(vg.record_voice(self.home, TOKEN, "Confirm Walnut Lantern.", now=T0 + 5))
+        self.assertTrue(vg.record_voice(self.home, TOKEN, "Confirm Walnut Lantern.", can_grant=True, now=T0 + 5))
         state = vg.load_state(self.home, TOKEN)
         self.assertIsNone(vg.decide(state, "Write", {}, T0 + 6))
         self.assertIsNone(vg.decide(state, "Bash", {"command": "rm x"}, T0 + 6))
@@ -386,29 +386,44 @@ class StateMachineTests(GuardTestCase):
 
     def test_confirm_via_hook_path_allows(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern")
-        self.assertTrue(vg.record_voice(self.home, TOKEN, "confirm walnut lantern"))
+        self.assertTrue(vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True))
         self.assertAllowed("Write")
+
+    def test_non_wake_turn_cannot_grant_and_consumes_challenge(self):
+        vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+        self.assertFalse(
+            vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=False, now=T0 + 1)
+        )
+        self.assertIsNone(vg.load_state(self.home, TOKEN)["challenge"])
+        self.assertFalse(
+            vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 2)
+        )
+        self.assertIsNotNone(vg.decide(vg.load_state(self.home, TOKEN), "Write", {}, T0 + 3))
+
+    def test_can_grant_defaults_to_false(self):
+        vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 1))
 
     def test_wrong_phrase_then_right_phrase_no_grant(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
-        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm apple banana", now=T0 + 1))
-        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 2))
+        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm apple banana", can_grant=True, now=T0 + 1))
+        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 2))
         self.assertIsNotNone(vg.decide(vg.load_state(self.home, TOKEN), "Write", {}, T0 + 3))
 
     def test_expired_challenge_no_grant(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
-        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 301))
+        self.assertFalse(vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 301))
 
     def test_expired_grant_denied(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
-        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 1)
+        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 1)
         state = vg.load_state(self.home, TOKEN)
         self.assertIsNone(vg.decide(state, "Write", {}, T0 + 2))
         self.assertIsNotNone(vg.decide(state, "Write", {}, T0 + 1 + 301))
 
     def test_typed_clears_grant(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
-        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 1)
+        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 1)
         vg.record_stopped(self.home, TOKEN, now=T0 + 1.5)
         vg.record_typed(self.home, TOKEN, now=T0 + 2)
         state = vg.load_state(self.home, TOKEN)
@@ -555,7 +570,7 @@ class SubagentTaintTests(GuardTestCase):
 
     def test_inherited_grant_revoked_by_typing(self):
         vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
-        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", now=T0 + 1)
+        vg.record_voice(self.home, TOKEN, "confirm walnut lantern", can_grant=True, now=T0 + 1)
         vg.record_subagent_start(self.home, TOKEN, "F", now=T0 + 2)
         vg.record_stopped(self.home, TOKEN, now=T0 + 3)
         state = vg.load_state(self.home, TOKEN)
