@@ -29,10 +29,11 @@ unknown `kind` fails closed: it is spoken but opens no window.
 
 Talk-over (`talk_over=True`, only when echo cancellation is on): while a reply
 plays, sustained user speech stops it without the wake word and becomes the
-next utterance. Confirm (and unknown-kind) speech is stop-only: the speech
-stops but the user must still say the wake word to answer, for the same
-reason as above -- ambient audio must not be able to answer a confirm prompt.
-That rule is enforced downstream too: every utterance carries `via`, and only a
+next utterance. During confirm (and unknown-kind) speech talk-over is OFF: a
+confirm prompt is short and must always be heard in full, so it plays to the
+end. "hey jarvis" still interrupts it, and answering still needs the wake word
+-- ambient audio must not be able to answer a confirm prompt. That rule is
+enforced downstream too: every utterance carries `via`, and only a
 wake-word turn can grant a confirmation (a talk-over turn could be our own
 speech leaking through imperfect echo cancellation). A talk-over transcript
 has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
@@ -161,7 +162,7 @@ class VoiceBridge:
         self._print_lock = threading.Lock()
         self._chunk_lock = threading.Lock()
         self._gen = 0
-        self._stop_only_gen = -1  # gen whose speech talk-over may only stop
+        self._no_talk_over_gen = -1  # gen whose speech (confirm) talk-over must not cut
         self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
         self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
         self._turn_via = ""  # main thread: what opened the current turn
@@ -288,7 +289,7 @@ class VoiceBridge:
         with _bounded(self._lock):
             if not self._player.busy:
                 return "off"
-            return "stop" if self._stop_only_gen == self._gen else "turn"
+            return "off" if self._no_talk_over_gen == self._gen else "turn"
 
     def run(self, frames: Iterable[bytes]) -> None:
         for frame in frames:
@@ -315,17 +316,14 @@ class VoiceBridge:
             self._turn_via, self._echo_ref = "wake", ""
             self._cue("wake")
             self._maybe_barge_in()
-        elif event.kind in ("talk_over", "talk_over_stop"):
-            if event.kind == "talk_over":
-                self._turn_via = "talk_over"
-                # Snapshot before the barge-in bumps the generation.
-                with _bounded(self._lock):
-                    self._echo_ref = (
-                        self._spoken_text if self._spoken_gen == self._gen else ""
-                    )
+        elif event.kind == "talk_over":
+            self._turn_via = "talk_over"
+            # Snapshot before the barge-in bumps the generation.
+            with _bounded(self._lock):
+                self._echo_ref = (
+                    self._spoken_text if self._spoken_gen == self._gen else ""
+                )
             self._maybe_barge_in()  # no cue: the user is already talking
-            if event.kind == "talk_over_stop":
-                self._print('[confirmation needed: say "hey jarvis" and the phrase]\n')
         elif event.kind == "follow_up":
             self._turn_via, self._echo_ref = "follow_up", ""
             self._cue("follow_up")
@@ -359,9 +357,9 @@ class VoiceBridge:
         with _bounded(self._lock):
             if not self._player.busy:
                 return
-            if self._stop_only_gen == self._gen:
-                # `busy` can lag the stop; keep the confirm speech stop-only
-                self._stop_only_gen = self._gen + 1
+            if self._no_talk_over_gen == self._gen:
+                # `busy` can lag the stop; keep talk-over off for the next gen
+                self._no_talk_over_gen = self._gen + 1
             self._gen += 1
         self._player.stop()
         self._print("[interrupted]\n")
@@ -498,7 +496,7 @@ class VoiceBridge:
         with _bounded(self._lock):
             gen = self._gen
             if kind not in ("answer", "ack"):
-                self._stop_only_gen = gen  # set before enqueuing: never "turn"
+                self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
             if self._spoken_gen != gen:
                 self._spoken_gen, self._spoken_text = gen, ""
             self._spoken_text += " ".join(sentences) + " "

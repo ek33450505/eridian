@@ -122,7 +122,7 @@ Every utterance on the voice socket now carries `"via": "wake"|"follow_up"|"talk
 
 **Residual risks (talk-over, stated plainly):**
 - **Before the fix (2026-10-01):** a talk-over turn could capture undertone's own spoken "confirm <w1> <w2>" through imperfect AEC and grant it. A talk-over stream already listening when a confirm reply was spoken could capture the reply. A follow-up window could open after a confirm reply. All three are now blocked by the hard control.
-- **Imperfect AEC:** ambient speech during playback can still open a talk-over turn, but it is gated (cannot confirm or run Write-class tools). Imperfect AEC in a real room (speaker nonlinearity, loud volume) is **not yet live-tested**. `--no-aec` turns talk-over off.
+- **Imperfect AEC:** ambient speech during playback can still open a talk-over turn, but it is gated (cannot confirm or run Write-class tools). AEC was live-tested once (2026-10-02, MacBook Pro speakers and mic, one room); other rooms, external speakers and high volumes are untested. `--no-aec` turns talk-over off.
 
 **Fail-closed:**
 - `pretooluse` errors exit 2, and the hook command ends in `|| exit 2`, so a missing or crashing interpreter blocks the call instead of allowing it.
@@ -151,6 +151,14 @@ Every utterance on the voice socket now carries `"via": "wake"|"follow_up"|"talk
 - A subagent's `Write`, and its `touch` workaround, were both denied.
 - A typed turn after the voice turn ended was ungated.
 - The test found that a background subagent could outlive its voice turn. Subagent tracking (above) was added for it.
+
+**Live test, Phase 4a (2026-10-02, real speech, speakers on):**
+- A full spoken reply played without opening a talk-over turn on undertone's own voice.
+- Talking over a reply stopped it. The first build then dropped the whole turn as echo, losing the user's words; `strip_echo` now removes only the repeated words.
+- Talking over a confirm prompt stopped it and the phrase was never heard; talk-over is now off during confirm prompts.
+- A wake-word turn "Confirm Lemon Canyon." granted the gated delete (`pretooluse granted Bash`) and the file was removed. An earlier unanswered challenge was used up by the next voice turn, as designed.
+- STT turned "hey jarvis" into "A Jarvis.", which reached Claude; the wake strip now handles it.
+- Re-test after the fixes: reported working by Ed (per-step output not captured).
 
 ### 8. Local Files
 

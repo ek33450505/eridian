@@ -492,35 +492,54 @@ class TalkOverTest(VoiceTestCase):
         )
         self.assertIn("you: actually never mind", self.out.getvalue())
 
-    def test_confirm_talk_over_only_stops(self) -> None:
-        self._bridge()
+    def _assert_talk_over_off(self, **extra) -> None:
+        calls = self._bridge()
         self.start()
         channel = self.attach()
-        self._reply(channel, kind="confirm")
+        self._reply(channel, **extra)
         self.transcript = "yes"
-        self._talk(25)
-        self.assertGreaterEqual(self.player.stops, 1)
+        self._talk(30)
+        self.assertEqual(calls, [])  # VAD never runs: talk-over is off
+        self.assertEqual(self.player.stops, 0)
         self.assertEqual(self.state, "IDLE")
         self.assertNotIn("you:", self.out.getvalue())
-        self.assertEqual(self.out.getvalue().count("[confirmation needed:"), 3)
+        channel.sock.settimeout(0.3)
+        self.assertIsNone(channel.read_line())
 
-    def test_unknown_kind_is_stop_only(self) -> None:
+    def test_confirm_speech_is_not_cut_by_talk_over(self) -> None:
+        self._assert_talk_over_off(kind="confirm")
+
+    def test_unknown_kind_speech_is_not_cut_by_talk_over(self) -> None:
+        self._assert_talk_over_off(kind="shout")
+
+    def test_answer_reply_still_arms_turn_mode(self) -> None:
         self._bridge()
         self.start()
         channel = self.attach()
-        self._reply(channel, kind="shout")
-        self._talk()
-        self.assertEqual(self.player.stops, 1)
-        self.assertEqual(self.state, "IDLE")
+        self._reply(channel, kind="answer")
+        self.assertEqual(self.bridge._talk_over_mode(), "turn")
+        self._reply(channel, kind="confirm")
+        self.assertEqual(self.bridge._talk_over_mode(), "off")
 
-    def test_stop_only_does_not_outlive_the_generation(self) -> None:
+    def test_wake_word_still_barges_in_on_confirm_and_next_gen_stays_off(self) -> None:
         self._bridge()
         self.start()
         channel = self.attach()
         self._reply(channel, kind="confirm")
-        self._talk()
+        self.wake()
+        self.assertEqual(self.player.stops, 1)
+        self.assertEqual(self.cues, ["wake"])
+        # `busy` lags the stop: the bumped generation must stay "off"
+        self.assertTrue(self.player.busy)
+        self.assertEqual(self.bridge._talk_over_mode(), "off")
+
+    def test_no_talk_over_does_not_outlive_the_generation(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, kind="confirm")
         self.player.busy = False
-        self.wake()  # a fresh wake + utterance bumps the generation
+        self.wake()
         self.speak("yes")
         self.assertEqual(
             channel.read_line(), {"type": "utterance", "text": "yes", "via": "wake"}

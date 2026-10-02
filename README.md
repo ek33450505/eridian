@@ -125,7 +125,7 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 
 ### Pipeline details
 
-- **Echo cancellation:** WebRTC AEC3 via livekit's `AudioProcessingModule(echo_cancellation=True, noise_suppression=True, high_pass_filter=True)`. Full-duplex 16 kHz mono int16 stream paired with rendered speech. Offline measurement (2026-10-01): ERLE ≈ 35 dB, Silero VAD fired on 0/217 residual chunks (189/217 without AEC). **NOT yet live-tested with real speakers and mic.**
+- **Echo cancellation:** WebRTC AEC3 via livekit's `AudioProcessingModule(echo_cancellation=True, noise_suppression=True, high_pass_filter=True)`. Full-duplex 16 kHz mono int16 stream paired with rendered speech. Offline measurement (2026-10-01): ERLE ≈ 35 dB, Silero VAD fired on 0/217 residual chunks (189/217 without AEC). Live-tested 2026-10-02 on the MacBook Pro speakers and mic in one room; other rooms, devices and volumes are untested.
 - **Wake word:** pymicro-wakeword with built-in "Hey Jarvis" model (0.97 cutoff, 10 ms frames at 16 kHz)
 - **VAD:** Silero VAD end-of-turn detection after 0.7 s of silence; talk-over at 0.3 s of sustained speech (≥0.6 confidence)
 - **STT:** parakeet-mlx `mlx-community/parakeet-tdt-0.6b-v3` (in-memory float32 processing)
@@ -153,7 +153,7 @@ Voice turns keep full session power but are unverified input. A hard control (`v
 
 - **Confirm by wake word only:** every utterance carries a `via` field (`wake`, `follow_up`, or `talk_over`). Only a wake-word turn (`via: "wake"`) can satisfy a confirm challenge, preventing a mishearing of ambient audio or undertone's own speech (via echo cancellation imperfection) from bypassing the guard. Talk-over and follow-up turns cannot grant gated calls.
 
-- **Talk-over barge-in:** while Claude is speaking, 0.3 s of sustained speech stops the reply without saying the wake word. Your speech becomes your next turn, with 0.5 s of your first words preserved. Exception: while a confirm prompt (or reply of unknown kind) is playing, talk-over stops the speech but you must still say "hey jarvis" plus the answer. In `chat`, talk-over also interrupts Claude's in-flight turn.
+- **Talk-over barge-in:** while Claude is speaking, 0.3 s of sustained speech stops the reply without saying the wake word. Your speech becomes your next turn, with 0.5 s of your first words preserved. Exception: a confirm prompt (or a reply of unknown kind) can't be talked over, so you always hear the whole phrase; "hey jarvis" still interrupts it, and you answer with "hey jarvis" plus the phrase. In `chat`, talk-over also interrupts Claude's in-flight turn.
 
 - **Wake word never spoken:** `speaker.build_say_argv()` runs `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any utterance of "hey jarvis" or obfuscated forms with "the wake word". Undertone's instructions also tell Claude never to say it.
 
@@ -199,7 +199,7 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | **2b** | `undertone chat [--no-beep] [--resume] [--follow-up SECONDS]` (standalone voice REPL) | ✓ done |
 | **D** | documentation: this README, local-first, architecture, training, SECURITY, CHANGELOG, offline check | ✓ done (refreshed at each phase end) |
 | **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
-| **4a** | echo cancellation via livekit AEC + talking over replies without wake word | built, live test pending |
+| **4a** | echo cancellation via livekit AEC + talking over replies without wake word | ✓ done (live-tested 2026-10-02 (MacBook Pro speakers and mic, one room)) |
 | **4b** | Kokoro voice | planned |
 | **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
 

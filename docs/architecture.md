@@ -46,7 +46,7 @@ There are two brains:
 | `spoken.py` | Reply sanitization for TTS: strips invisible characters, removes `[`/`]`, replaces wake word forms with "the wake word" | Used by speaker.build_say_argv. |
 | `voice_guard.py` | SessionStart, UserPromptSubmit, Stop, SubagentStart, SubagentStop and PreToolUse hooks that gate tool calls during voice turns. Covers arming, voice/typed provenance, voice-started subagents, the Bash allowlist and the confirm-phrase grant. | Stdlib only. Injected via `--settings` and runs as `python -P -m undertone.voice_guard <event> --home <UNDERTONE_HOME> --session <token>`. Events: `sessionstart`, `userpromptsubmit`, `stop`, `subagentstart`, `subagentstop`, `pretooluse`. Session state at `~/.undertone/sessions/<token>.json` (0600, atomic). Log at `~/.undertone/logs/guard.log` (0600, decisions only). Fails closed: `pretooluse` errors exit 2 (plus `|| exit 2` on the command), and the channel refuses voice turns unless SessionStart armed this launch's state. |
 | `mcp_channel.py` | Stdlib MCP stdio **channel** server. Claude Code spawns it from the inline `--mcp-config` that `undertone session` passes (`python -P -m undertone.cli channel`). | Requires an armed session token (UNDERTONE_SESSION); refuses voice turns if SessionStart hook hasn't armed state. Connects as a client to `~/.undertone/voice.sock` and says `hello`. Each `utterance` becomes a `notifications/claude/channel` event. Exposes the `reply` tool (`kind` = ack/answer/confirm, ≤4000 chars) and forwards replies to `attach`. Registers confirm phrases (one-shot, 300 s challenge on each request). Rejects the 2026-07-28 `server/discover` probe so Claude Code falls back to `initialize` 2025-11-25. |
-| `voice.py` | `VoiceBridge`, the `undertone attach` process. It runs the mic loop (Listener on the main thread) and the unix-socket server at `~/.undertone/voice.sock` (0600). | Sends each utterance to the attached channel and speaks replies sentence by sentence through `SpeechQueue`. Wake during speech = barge-in (stop speech). The follow-up window opens only after an `answer`. Socket rules: 64 KB lines, 16 connections, latest session wins. |
+| `voice.py` | `VoiceBridge`, the `undertone attach` process. It runs the mic loop (Listener on the main thread) and the unix-socket server at `~/.undertone/voice.sock` (0600). | Sends each utterance to the attached channel and speaks replies sentence by sentence through `RenderedSpeechQueue` (or `SpeechQueue` with `--no-aec`). Wake during speech = barge-in (stop speech); talk-over does the same during ack/answer speech, never during a confirm prompt. Tags each utterance with `via`. The follow-up window opens only after an `answer`. Socket rules: 64 KB lines, 16 connections, latest session wins. |
 | `paths.py` | UNDERTONE_HOME layout (0700) | Default `~/.undertone`. Includes the voice.sock path and logs directory. (`voice_guard` keeps its state under `sessions/`.) |
 | `cli.py` | Commands: `listen`, `chat`, `session`, `attach`, `channel` (internal), `models fetch`. `chat_workdir()` picks the working directory. | `session` generates a token (`secrets.token_hex(16)`) and injects hooks via `--settings` inline JSON; refuses `--settings`, `--bare`, `--safe-mode`. Resolves the cwd (symlinks followed). If it is home or an ancestor of home, any dot-directory under home, `~/Library`, or exactly `~/Documents`/`~/Desktop`/`~/Downloads`, it switches to `~/.undertone/workspace` and refuses a symlinked workspace. |
 
@@ -62,7 +62,7 @@ LISTENING
 THINKING (brain turn) → SPEAKING (sentences queued and played)
   ├─ wake word during speech                         → barge-in: stop speech, interrupt turn → LISTENING
   ├─ talk-over, mode "turn" (ack/answer; all chat)  → barge-in → LISTENING (talk_over turn, 0.5 s pre-roll)
-  ├─ talk-over, mode "stop" (confirm/unknown kind)   → stop speech only (talk_over_stop); answering needs the wake word
+  ├─ (confirm/unknown kind: talk-over is off, so the prompt plays to the end; answering needs the wake word)
   └─ reply finished playing                          → FOLLOW-UP: LISTENING without the wake word, 6 s
                                                         (no speech → IDLE)
 ```
@@ -129,7 +129,7 @@ Tests run with `uv run python -m unittest discover -s tests`. No microphone, no 
 ### Talk-Over Detection and Control
 - Sustained speech: 10 consecutive 32 ms VAD chunks at ≥ 0.6 (`ListenerConfig.talk_over_threshold=0.6`, `talk_over_min_s=0.3`).
 - In `"turn"` mode, opens a `talk_over` turn pre-seeded with `talk_over_preroll_s=0.5` s of audio.
-- In `"stop"` mode, emits `talk_over_stop` and stays IDLE, keeping the wake detector running.
+- In `"stop"` mode, emits `talk_over_stop` and stays IDLE, keeping the wake detector running. `VoiceBridge` no longer uses it: during confirm or unknown-kind speech it sets `"off"`, so a confirm prompt is always heard in full.
 - The wake word is always checked first.
 - With mode `"off"` (default, and whenever the player is idle), no VAD runs while IDLE.
 
@@ -149,7 +149,7 @@ Every utterance now carries `"via": "wake"|"follow_up"|"talk_over"` on the voice
 - Talk-over widens no-wake-word input: it was the 6 s follow-up window after an answer; now it is also the whole playback of every ack or answer.
 - Ambient speech during playback can open a turn. That turn is gated by voice_guard and cannot confirm.
 - If the wake detector ever fired on undertone's own speech, that turn would carry `via: "wake"`. The TTS scrub prevents the wake phrase from being spoken; that pre-existing control covers this.
-- **Imperfect AEC in a real room** (speaker nonlinearity, loud volume) is **not yet live-tested**. `--no-aec` turns talk-over off.
+- **Imperfect AEC in a real room:** live-tested once (2026-10-02, MacBook Pro speakers and mic); residual echo did reach STT during talk-over, which `strip_echo` handles. Other rooms, external speakers and high volumes are untested. `--no-aec` turns talk-over off.
 
 ### Measurement (offline simulation, M4 Max, 2026-10-01)
 - **ERLE (Echo Return Loss Enhancement):** ≈ 35 dB
