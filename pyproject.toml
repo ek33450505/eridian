@@ -11,6 +11,7 @@ dependencies = [
     "pysilero-vad",
     "parakeet-mlx",
     "livekit>=1.1.20,<2",
+    "onnxruntime>=1.30,<2",
 ]
 
 [project.scripts]
