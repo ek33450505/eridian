@@ -33,7 +33,7 @@ offline check
   [PASS] TTS exit - say rc=0
   [PASS] TTS output - 102246 bytes
   [PASS] Kokoro telemetry off - ORT_DISABLE_TELEMETRY=1
-  [PASS] Kokoro render - 2 pieces, 3.87 s audio, first audio in 0.288 s
+  [PASS] Kokoro render - 2 pieces, 3.87 s audio, first audio in 0.286 s
   [PASS] Kokoro self-screen - homophone blocked; ordinary sentence played
   [PASS] echo cancellation - ERLE 43.9 dB (need >= 20); longest speech-like run 3 chunks (talk-over needs 10); VAD>=0.5 on 3/177 chunks
 RESULT: PASS
@@ -139,7 +139,7 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 - **STT:** parakeet-mlx `mlx-community/parakeet-tdt-0.6b-v3` (in-memory float32 processing)
 - **Brain:** persistent `claude -p` stream-json subprocess with file tools confined to working directory
 - **Chunker:** splits Claude's reply into sentences
-- **TTS:** Kokoro-82M (default; phoneme-based, ~0.085 s per second of audio) or macOS `say` (fallback). Kokoro uses espeak-ng for grapheme-to-phoneme, onnxruntime 1.30 for inference. `say` voice is **Evan (Enhanced)**; override with `UNDERTONE_VOICE` env var. Kokoro voice is **am_michael**; override with `UNDERTONE_KOKORO_VOICE`. All TTS output is run through a single scrub (`speaker.prepare_speech`), then played through the echo canceller for a reference signal
+- **TTS:** Kokoro-82M (default; phoneme-based, ~0.085 s per second of audio) or macOS `say` (fallback). Kokoro uses espeak-ng for grapheme-to-phoneme, onnxruntime 1.30 for inference. `say` voice is **Evan (Enhanced)**; override with `UNDERTONE_VOICE` env var. Kokoro voice is **am_adam**; override with `UNDERTONE_KOKORO_VOICE`. All TTS output is run through a single scrub (`speaker.prepare_speech`), then played through the echo canceller for a reference signal
 
 ### Measured latencies (M4 Max)
 
@@ -235,7 +235,7 @@ Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word 
 - `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
 - `UNDERTONE_SESSION` (set by `undertone session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Samantha"`); empty string uses system voice
-- `UNDERTONE_KOKORO_VOICE` — voice name for Kokoro (e.g., `am_adam`, `bm_george`; default `am_michael`)
+- `UNDERTONE_KOKORO_VOICE` — voice name for Kokoro (e.g., `am_michael`, `bm_george`; default `am_adam`)
 - `UNDERTONE_SELF_WAKE_GUARD_S` — window (seconds) after undertone stops speaking during which a wake word is treated as barge-in, not exact wake (default 1.0 s, floor 1.0, cap 10.0; for AirPlay latency, try 3)
 - `UNDERTONE_ESPEAK_CMD` (tests only) — path to espeak-ng or stub
 - `UNDERTONE_TEST_REAL_KOKORO` (tests only) — set to `1` to run real Kokoro smoke tests

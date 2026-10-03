@@ -178,7 +178,7 @@ class VoiceNameTests(KokoroTestBase):
                 self.make(voice=bad)
 
     def test_empty_name_falls_back_to_default(self):
-        self.assertEqual(self.make(voice="").voice, kokoro.DEFAULT_VOICE)
+        self.assertEqual(self.make(voice="").voice, "am_adam")
 
     def test_env_invalid_rejected(self):
         os.environ[kokoro.VOICE_ENV] = "../x"
@@ -200,6 +200,10 @@ class VoiceNameTests(KokoroTestBase):
 
 
 class ModelConstantsTests(unittest.TestCase):
+    def test_default_voice(self):
+        self.assertEqual(kokoro.DEFAULT_VOICE, "am_adam")
+        self.assertIn(kokoro.DEFAULT_VOICE, kokoro.VOICE_SHA256)
+
     def test_first_piece_budget(self):
         # 32 tokens ~ 0.27 s first audio on an idle M4 Max; 47 took 0.35 s (2026-10-02).
         self.assertEqual(kokoro.FIRST_PIECE_TOKENS, 32)
