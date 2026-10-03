@@ -13,7 +13,7 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
     channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"}   (first line)
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"}
                                                                     (any number)
-    voice -> channel   {"type":"utterance","text":"...","via":"wake"|"follow_up"|"talk_over"}
+    voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                        (`via` = what opened the turn; the channel lets only "wake"
                         satisfy a confirm phrase)
                        {"type":"detached"}   (sent to the OLD connection when a
@@ -39,6 +39,12 @@ speech leaking through imperfect echo cancellation). A talk-over transcript
 has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
 if nothing is left it is dropped instead of sent.
 
+`wake_barge_in`: a wake word heard while we are speaking, or within
+SELF_WAKE_GUARD_S after we stopped, may be our own voice tripping the detector
+(a reply containing "hey jarvice"). It still interrupts and opens a turn, but
+that turn is tagged `wake_barge_in` and can never grant a confirmation; only a
+wake word heard after a full second of silence can.
+
 Unknown types and malformed lines are ignored; a failure in one connection never
 takes the process down.
 
@@ -62,6 +68,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import queue
 import re
@@ -84,6 +91,13 @@ NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone ses
 
 _BACKLOG = 32  # above MAX_CONNECTIONS so the cap, not the kernel queue, is the limit
 MAX_CONNECTIONS = 16
+# A wake word heard while we speak, or this long after we stop, is treated as
+# possibly our own voice. The detector fires 50-250 ms after the phrase ends
+# (measured) plus output latency, so a self-wake on a reply's last words can
+# land after the player is already idle. Such a turn is `wake_barge_in`, which
+# never grants a confirmation.
+SELF_WAKE_GUARD_S = 1.0
+_SELF_WAKE_GUARD_MAX_S = 10.0
 _POLL_S = 0.2  # accept/recv poll, so shutdown never waits on a blocked call
 _IO_TIMEOUT_S = 2.0  # bound on any single socket send
 _LOCK_TIMEOUT_S = 5.0
@@ -151,6 +165,7 @@ class VoiceBridge:
         cue: Callable[[str], None] | None = None,
         out: TextIO = sys.stdout,
         talk_over: bool = False,
+        self_wake_guard_s: float = SELF_WAKE_GUARD_S,
     ) -> None:
         self._socket_path = Path(socket_path)
         self._follow_up_s = follow_up_s
@@ -171,6 +186,9 @@ class VoiceBridge:
         self._conns: set[_Conn] = set()
         self._closed = False
         self._followed_gen = -1  # main thread only: dedupes reply_done per generation
+        self._clock = clock
+        self._self_wake_guard_s = self_wake_guard_s
+        self._last_busy = float("-inf")  # main thread only: last frame the player was busy
 
         self._server: socket.socket | None = None
         self._bound = False
@@ -280,6 +298,8 @@ class VoiceBridge:
     def process_frame(self, frame: bytes) -> None:
         self._drain_control()
         self._listener.talk_over = self._talk_over_mode()
+        if self._player.busy:
+            self._last_busy = self._clock()
         self._listener.process_frame(frame)
 
     def _talk_over_mode(self) -> str:
@@ -313,7 +333,12 @@ class VoiceBridge:
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
-            self._turn_via, self._echo_ref = "wake", ""
+            own_voice = (
+                self._player.busy
+                or (self._clock() - self._last_busy) <= self._self_wake_guard_s
+            )
+            self._turn_via = "wake_barge_in" if own_voice else "wake"
+            self._echo_ref = ""
             self._cue("wake")
             self._maybe_barge_in()
         elif event.kind == "talk_over":
@@ -503,7 +528,7 @@ class VoiceBridge:
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":
-            self._print('[confirmation needed: say "hey jarvis" and the phrase]\n')
+            self._print('[confirmation needed: when I finish, say "hey jarvis" and the phrase]\n')
         self._speech_q.put((gen, kind))
 
     # ---- speech watcher thread -----------------------------------------
@@ -520,6 +545,30 @@ class VoiceBridge:
                     if kind == "answer":
                         self._control.put(("reply_done", gen))
                     break
+
+
+def self_wake_guard_from_env(environ=os.environ, err: TextIO = sys.stderr) -> float:
+    """Guard window from UNDERTONE_SELF_WAKE_GUARD_S (seconds).
+
+    For AirPlay or other high-latency outputs, set 3. Values below the default
+    would weaken the guard, so 1.0 is a hard floor; the cap is 10.0.
+    """
+    name = "UNDERTONE_SELF_WAKE_GUARD_S"
+    raw = environ.get(name, "")
+    if raw == "":
+        return SELF_WAKE_GUARD_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < SELF_WAKE_GUARD_S:
+        print(
+            f"undertone: ignoring {name}={raw!r}; "
+            f"using {SELF_WAKE_GUARD_S} (minimum {SELF_WAKE_GUARD_S})",
+            file=err,
+        )
+        return SELF_WAKE_GUARD_S
+    return min(value, _SELF_WAKE_GUARD_MAX_S)
 
 
 def _server_answers(path: Path) -> bool:
@@ -567,6 +616,7 @@ def run_attach(*, no_beep: bool, follow_up_s: float, no_aec: bool = False) -> in
         cue=None if no_beep else (lambda kind: cli._play_cue(cues[kind])),
         player_factory=io.player_factory,
         talk_over=io.talk_over,
+        self_wake_guard_s=self_wake_guard_from_env(),
     )
     if bridge.start() != 0:
         bridge.close()

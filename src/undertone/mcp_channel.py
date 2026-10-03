@@ -12,9 +12,11 @@ so all diagnostics go to <UNDERTONE_HOME>/logs/channel.log.
 
 Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
   channel -> voice  {"type":"hello","pid":N,"cwd":"..."}  (first line)
-  voice -> channel  {"type":"utterance","text":"...","via":"wake"|"follow_up"|"talk_over"}
+  voice -> channel  {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                     (only a "wake" turn can satisfy a confirm challenge; a missing
-                    or unknown `via` cannot -- fail closed)
+                    or unknown `via` cannot -- fail closed. "wake_barge_in" is a
+                    wake heard while/just after the voice spoke, possibly its own
+                    echo: it opens a turn but never grants)
   channel -> voice  {"type":"reply","text":"...","kind":"ack|answer|confirm"}
   voice -> channel  {"type":"detached"}  (a newer session won; stop retrying)
 
