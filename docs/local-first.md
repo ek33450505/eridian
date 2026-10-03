@@ -6,19 +6,24 @@ This is the deep version of the README's lead section. undertone's promise is: *
 
 | Stays on your Mac | Goes to Anthropic | Never exists |
 |---|---|---|
-| Mic audio; wake word (pymicro-wakeword); VAD (Silero, 32 ms chunks); STT (parakeet-mlx, float32 in memory); TTS (macOS `say`, rendered to 16 kHz PCM in temp files, then deleted); AEC (livekit WebRTC AudioProcessingModule, local-only); all models | The transcribed text of each turn, plus normal Claude Code traffic: the contents of files Claude reads (working directory only) and its WebSearch queries, which run server-side | API keys of undertone's own (it uses however your `claude` is logged in); audio uploads; cloud STT/TTS fallbacks |
+| Mic audio; wake word (pymicro-wakeword); VAD (Silero, 32 ms chunks); STT (parakeet-mlx, float32 in memory); TTS (Kokoro-82M via onnxruntime, rendered in memory; or macOS `say`, rendered to a private temp file that is deleted after reading); G2P for Kokoro (espeak-ng CLI, GPL-3.0, subprocess only); AEC (livekit WebRTC AudioProcessingModule, local-only); all models | The transcribed text of each turn, plus normal Claude Code traffic: the contents of files Claude reads (working directory only) and its WebSearch queries, which run server-side | API keys of undertone's own (it uses however your `claude` is logged in); audio uploads; cloud STT/TTS fallbacks |
 
 ## Every Network Touchpoint, Listed Honestly
 
 ### 1. **`undertone models fetch`**
-A one-time ~2.5 GB Hugging Face download: `mlx-community/parakeet-tdt-0.6b-v3`. The model file is 2,508,288,736 bytes (`model.safetensors`).
+A one-time Hugging Face download includes:
+- `mlx-community/parakeet-tdt-0.6b-v3` (STT, ~2.5 GB): model file 2,508,288,736 bytes (`model.safetensors`)
+- `onnx-community/Kokoro-82M-v1.0-ONNX` (TTS, pinned revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, Phase 4b): fp32 `onnx/model.onnx`, tokenizer, and voice files. Each is checked against a SHA-256 pinned in `src/undertone/kokoro.py` whenever it loads from the cache
 
-In normal operation, `stt.py` does `os.environ.setdefault("HF_HUB_OFFLINE", "1")` at import time, before parakeet is imported. That keeps the Hub offline on every start, unless you set `HF_HUB_OFFLINE` yourself. Without that flag, `from_pretrained` contacts the Hub on every startup even with a warm local cache (discovered in Phase 0).
+In normal operation, `stt.py` does `os.environ.setdefault("HF_HUB_OFFLINE", "1")` at import time, before parakeet is imported. `kokoro.py` does the same before importing onnxruntime. That keeps the Hub offline on every start, unless you set `HF_HUB_OFFLINE` yourself. Without that flag, `from_pretrained` contacts the Hub on every startup even with a warm local cache (discovered in Phase 0).
 
-The `fetch_model()` function temporarily lifts the offline flag ONLY for the one-time download; loading never contacts the Hub again.
+The `fetch_model()` function temporarily lifts the offline flag ONLY for the one-time download; loading never contacts the Hub again. At runtime, the model is loaded with `local_files_only=True`.
 
 ### 2. **The `claude` Child** (Path B) and **Claude Code Session** (Path A)
 In Path B, the persistent `claude -p` process in `undertone chat` connects to api.anthropic.com. In Path A, a running Claude Code session receives voice transcripts via the MCP channel. Both authenticate however your `claude` already does; undertone adds no key of its own. Transcribed text and anything Claude reads from your files leave here.
+
+### 2b. **onnxruntime Telemetry (Phase 4b)**
+onnxruntime 1.30's macOS wheel embeds Microsoft's 1DS telemetry client (`mobile.events.data.microsoft.com`). `src/undertone/kokoro.py` FORCES `ORT_DISABLE_TELEMETRY=1` before onnxruntime is imported and calls `onnxruntime.disable_telemetry_events()`. With the variable set, ORT no longer even initializes its telemetry device ID. The force-disable is verified in the offline check.
 
 ### 3. **Optional: `training/` Docker Image**
 The Docker image `training/Dockerfile` (optional — the default "hey jarvis" is pretrained):
@@ -41,22 +46,24 @@ Run `bash scripts/verify-offline.sh`.
 2. Runs `.venv/bin/python scripts/offline_check.py <clip> <out.aiff>` inside a macOS `sandbox-exec` profile that **denies all network access** with the policy `(version 1)(allow default)(deny network*)`
 3. Inside that sandbox, feeds the real wake word detector, VAD, and STT through `Listener` with a simulated clock
 4. Calls `say -o` to render a reply to an AIFF file
-5. **Echo cancellation check (Phase 4):** Simulates room echo on the rendered reply and runs it through the real `AudioProcessingModule` (WebRTC AEC3). Asserts:
-   - ERLE (Echo Return Loss Enhancement) ≥ 20 dB
-   - No speech-like run on the residual (echo-cancelled) audio long enough to trigger talk-over: the longest run of chunks with Silero VAD ≥ `talk_over_threshold` must be shorter than the 10 chunks talk-over needs. On 2026-10-01: ERLE 43.9 dB, longest run 3 chunks. With echo cancellation switched off, the check fails (ERLE 0.7 dB, longest run 92 chunks).
-6. Asserts:
+5. **Echo cancellation check (Phase 4):** Simulates room echo on the rendered reply and runs it through the real `AudioProcessingModule` (WebRTC AEC3). Asserts ERLE ≥ 20 dB and that residual speech is too short to trigger talk-over.
+6. **Kokoro check (Phase 4b):** Asserts that importing `undertone.kokoro` forced `ORT_DISABLE_TELEMETRY=1`, then renders a fixed sentence from the local model cache (espeak-ng → onnxruntime), reports the time to first audio, and writes it to `<out>-kokoro.wav` (16 kHz mono 16-bit).
+7. **Kokoro self-screen check (Phase 4b):** Renders "hey jarvice" (a homophone that passes the text scrub) and an ordinary sentence with Kokoro. A fresh `ScreenedSink` with the real wake detector must block the first and play the second.
+8. Asserts:
    - Network canary fails (TCP to 1.1.1.1 and DNS lookup both blocked)
    - Wake word fired exactly once
    - Transcript contains "capital of france" (case-insensitive, punctuation-ignored)
-   - `say` exit code is 0 and wrote bytes to the output file
+   - All renders exit code 0 and wrote bytes to output files
 
-**Verified 2026-10-01:**
+**Verified 2026-10-02 (M4 Max):**
 - Wake fired: ✓
 - Transcript matched: ✓
-- `say` rc 0: ✓
-- Inside the sandbox, a TCP connect to 1.1.1.1:443 failed: ✓
-- Inside the sandbox, a DNS lookup of example.com failed: ✓
-- Echo cancellation inside the sandbox: ERLE 43.9 dB, longest speech-like run 3 chunks (talk-over needs 10): ✓
+- `say` render rc 0; Kokoro rendered 2 pieces: ✓
+- Inside the sandbox, TCP/DNS blocked: ✓
+- Echo cancellation: ERLE 43.9 dB, talk-over check passed: ✓
+- Kokoro telemetry off: ✓
+- Kokoro self-screen: homophone blocked, ordinary sentence played: ✓
+- **Final:** `OFFLINE CHECK: PASS (wake, VAD, STT, TTS, Kokoro, self-screen, echo cancellation ran with network denied)`
 
 **Why not Docker `--network none`?**
 MLX (the ML framework) and macOS `say` are macOS-only; Docker can't run them.

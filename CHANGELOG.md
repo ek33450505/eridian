@@ -4,6 +4,37 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-02 — Phase 4b: Kokoro voice
+
+**Added**
+- Kokoro-82M ONNX resident TTS engine (phoneme-based; 0.05 s + 0.085 s/second of audio on idle M4 Max). Default voice: `am_michael`; override with `UNDERTONE_KOKORO_VOICE` env var (e.g., `am_adam`, `bm_george`). Download via `undertone models fetch` (57 files, model + tokenizer + voice bins). Model pinned to `onnx-community/Kokoro-82M-v1.0-ONNX` revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, fp32 `onnx/model.onnx` (~325 MB). Model weights: Apache-2.0. Runtime: onnxruntime 1.30 (CPU-only; CoreML was no faster and used 2× memory). MIT license.
+- G2P (grapheme-to-phoneme) via espeak-ng, run as a separate subprocess (text on stdin), never linked. GPL-3.0-or-later; installed via Homebrew.
+- Telemetry defense: `ORT_DISABLE_TELEMETRY=1` forced before onnxruntime import (Microsoft's 1DS telemetry client in the wheel is blocked).
+- `UNDERTONE_ESPEAK_CMD` env var for tests; `UNDERTONE_TEST_REAL_KOKORO` (tests only; opt-in real-model smoke test).
+- **Speech sanitizer unification:** `speaker.prepare_speech` is the single scrub point for all text before any TTS engine. One place: NUL strip, lone-surrogate strip, NFKC normalize, `spoken.sanitize_for_tts` (wake-word replace, bracket strip, zero-width chars), then `MAX_SPEECH_CHARS` cap (1000 chars). Both `say` and Kokoro exit via this scrub.
+- **Acoustic self-screen:** `screen.ScreenedSink` wraps the echo-cancellation playback path (never `--no-aec` mode). Before each chunk plays, a fresh wake detector (cutoff 0.8, live detector fires at 0.97) runs on the last 2 s of played audio plus lookahead silence. Blocks homophones ("hey jarviss", "djarvis", etc.) that pass text scrub but fire the detector on Kokoro: 0/200 ordinary sentences blocked; 67/80 homophone attack clips blocked with the phrase at the very end of a chunk, and every clip that played peaked below 0.8.
+- **Wake-word barge-in (no confirm):** when undertone is speaking, or within `UNDERTONE_SELF_WAKE_GUARD_S` (default 1.0 s, floor 1.0, cap 10.0; override for AirPlay latency), a wake word still interrupts but lands as `via: "wake_barge_in"`. This `via` never grants a confirmation, fail-closed. A barge-in turn is subject to the same gating rules as `follow_up` (unverified input). The confirm hint is now `[confirmation needed: when I finish, say "hey jarvis" and the phrase]`.
+- `--tts {kokoro,say}` flag on `undertone chat` and `undertone attach` (default `kokoro`). Fallback: if espeak-ng is missing or the model isn't fetched, undertone prints a reason and uses `say`. Startup banner appends ` Voice: Kokoro (am_michael).` or ` Voice: say (Evan (Enhanced)).`.
+- Measured latencies (warm, idle M4 Max): `say` first audio 0.54–0.56 s (process startup dominates); Kokoro first audio 0.12–0.30 s for first 50-token chunk (~7–8 words). Offline check: 0.29 s first audio, after trimming Kokoro's ~0.4 s of leading silence.
+- `scripts/verify-offline.sh` now proves Kokoro telemetry off, render, and self-screen work locally. Final line: `OFFLINE CHECK: PASS (wake, VAD, STT, TTS, Kokoro, self-screen, echo cancellation ran with network denied)`. Sample output block updated in README.
+
+**Changed**
+- `undertone models fetch` now also downloads Kokoro (model, tokenizer, voices; 57 files) and prints a reminder if espeak-ng is missing.
+- `undertone chat` and `undertone attach` default to `--tts kokoro`; pass `--no-aec` to use `say` with no acoustic screen.
+- `speaker.build_say_argv` unchanged; `speaker.espeak_phonemes` new (text → IPA phonemes via espeak-ng subprocess).
+
+**Security**
+- One scrub: `speaker.prepare_speech` is the single text-cleaning step for every TTS engine, before any phoneme or voice model sees the text: NUL and lone-surrogate strip, NFKC, wake-word replacement, every `[`/`]` removed (espeak-ng honors `[[...]]` phoneme input like `say` does), zero-width characters, and a 1000-character cap.
+- Acoustic self-screen: a wake detector (cutoff 0.8) runs on our own audio before each chunk plays, to catch homophones that pass the text scrub but trigger the live wake detector when Kokoro speaks them. It blocked 0/200 ordinary sentences and 67/80 homophone attack clips. If the detector itself fails, speech stays muted and undertone prints `undertone: the wake-word screen failed (…); speech stays muted until restart` once.
+- `wake_barge_in`: a wake word heard while undertone is speaking, or within 1 s after (`UNDERTONE_SELF_WAKE_GUARD_S` raises this to at most 10 s), still interrupts but can't grant a gated call. Only a `via: "wake"` turn, heard after that window of silence, satisfies a confirm challenge.
+- Model integrity: the Kokoro model, tokenizer and all 55 voice files are checked against SHA-256 values pinned in `kokoro.py` (taken from the Hugging Face LFS ids of the pinned revision) every time they load from the cache. A mismatch, a corrupt model, a bad tokenizer or a failed warm-up falls back to `say` with `undertone: Kokoro voice unavailable (<reason>); using say`.
+- Restart both `undertone attach` and `undertone session` after upgrading: an old `attach` tags barge-in wakes as `wake`, which can still grant.
+
+**Dependency**
+- onnxruntime 1.30.0 (MIT; Python package)
+- flatbuffers (transitive, via onnxruntime; Apache-2.0)
+- espeak-ng (GPL-3.0-or-later; installed via Homebrew, run as subprocess, never bundled or linked)
+
 ### 2026-10-01 — Phase 4a: echo cancellation and talk-over
 
 **Added**
