@@ -583,7 +583,9 @@ def _server_answers(path: Path) -> bool:
         probe.close()
 
 
-def run_attach(*, no_beep: bool, follow_up_s: float, no_aec: bool = False) -> int:
+def run_attach(
+    *, no_beep: bool, follow_up_s: float, no_aec: bool = False, tts: str = "kokoro"
+) -> int:
     """The real wiring behind `undertone attach` (real mic; not unit-tested)."""
     # Lazy imports for the same reason as cli._cmd_chat: keep `--help` fast and
     # the heavy audio/model deps out of import time. cli is imported lazily too
@@ -604,7 +606,7 @@ def run_attach(*, no_beep: bool, follow_up_s: float, no_aec: bool = False) -> in
     vad = SileroVoiceActivityDetector()
     cues = {"wake": cli._WAKE_CUE, "follow_up": cli._FOLLOW_UP_CUE}
 
-    io = cli.make_audio_io(no_aec)
+    io = cli.make_audio_io(no_aec, tts=tts)
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
         vad=lambda chunk: vad(chunk),

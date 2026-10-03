@@ -14,7 +14,8 @@ import wave
 from unittest import mock
 
 from undertone import player
-from undertone.player import RenderedSpeechQueue, SpeechQueue
+from undertone import speaker
+from undertone.player import KokoroRenderer, RenderedSpeechQueue, SayRenderer, SpeechQueue
 
 _RECORDING_STUB = """#!/bin/sh
 echo "$@" >> "$STUB_LOG_FILE"
@@ -393,6 +394,21 @@ class RenderedSpeechQueueTest(unittest.TestCase):
         self.assertTrue(q.wait_idle(5.0))
         self.assertEqual(self.sink.played, [self.frames])
 
+    def test_stop_between_dequeue_and_spawn_prevents_the_spawn(self) -> None:
+        q = self._queue()
+        real = speaker.build_say_argv
+
+        def build_then_stop(*args, **kwargs):
+            argv = real(*args, **kwargs)
+            q.stop()  # lands after dequeue, before the renderer's pre-spawn check
+            return argv
+
+        with mock.patch.object(speaker, "build_say_argv", build_then_stop):
+            q.enqueue("racy")
+            self.assertTrue(q.wait_idle(5.0))
+        self.assertFalse(self._log.exists())  # the stub never ran
+        self.assertEqual(self.sink.played, [])
+
     def test_busy_reflects_sink_playing(self) -> None:
         self.sink.auto_drain = False
         q = self._queue()
@@ -437,6 +453,167 @@ class RenderedSpeechQueueTest(unittest.TestCase):
         q.close()
         q.enqueue("late")
         self.assertEqual(self.sink.played, [])
+
+
+
+class FakeVoice:
+    def __init__(self, pieces: list[str], pcms: dict[str, bytes | None]) -> None:
+        self._pieces = pieces
+        self._pcms = pcms
+        self.rendered: list[str] = []
+
+    def pieces(self, phonemes: str) -> list[str]:
+        return list(self._pieces)
+
+    def render(self, piece: str) -> bytes | None:
+        self.rendered.append(piece)
+        return self._pcms[piece]
+
+
+class KokoroRendererTest(unittest.TestCase):
+    def _render(self, voice, wanted=lambda: True, phonemes="ph") -> list[bytes]:
+        with mock.patch.object(speaker, "espeak_phonemes", return_value=phonemes):
+            return list(KokoroRenderer(voice).render("hello", wanted))
+
+    def test_yields_per_piece_in_order(self) -> None:
+        voice = FakeVoice(["a", "b", "c"], {"a": b"\x01\x00", "b": b"\x02\x00", "c": b"\x03\x00"})
+        self.assertEqual(self._render(voice), [b"\x01\x00", b"\x02\x00", b"\x03\x00"])
+        self.assertEqual(voice.rendered, ["a", "b", "c"])
+
+    def test_none_phonemes_yields_nothing(self) -> None:
+        voice = FakeVoice(["a"], {"a": b"\x01\x00"})
+        self.assertEqual(self._render(voice, phonemes=None), [])
+        self.assertEqual(voice.rendered, [])
+
+    def test_not_wanted_before_second_piece_skips_it(self) -> None:
+        voice = FakeVoice(["a", "b"], {"a": b"\x01\x00", "b": b"\x02\x00"})
+        self.assertEqual(self._render(voice, wanted=lambda: not voice.rendered), [b"\x01\x00"])
+        self.assertEqual(voice.rendered, ["a"])
+
+    def test_none_render_is_skipped(self) -> None:
+        voice = FakeVoice(["a", "b", "c"], {"a": b"\x01\x00", "b": None, "c": b"\x03\x00"})
+        self.assertEqual(self._render(voice), [b"\x01\x00", b"\x03\x00"])
+        self.assertEqual(voice.rendered, ["a", "b", "c"])
+
+
+class StubRenderer:
+    """Yields the given pieces; optionally runs a hook before each yield."""
+
+    def __init__(self, pieces: list[bytes], before_each=None) -> None:
+        self.pieces = pieces
+        self.before_each = before_each
+        self.cancels = 0
+        self.closed = 0
+
+    def render(self, text, wanted):
+        for i, pcm in enumerate(self.pieces):
+            if self.before_each is not None:
+                self.before_each(i)
+            yield pcm
+
+    def cancel(self) -> None:
+        self.cancels += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class PickySink(FakeSink):
+    """A sink whose play() returns False for the 0-based call indices in `reject`."""
+
+    def __init__(self, reject: set[int]) -> None:
+        super().__init__()
+        self.auto_drain = True
+        self.reject = reject
+        self.calls = 0
+
+    def play(self, pcm: bytes) -> bool:
+        idx = self.calls
+        self.calls += 1
+        if idx in self.reject:
+            return False
+        super().play(pcm)
+        return True
+
+
+class RenderedSpeechQueueRendererTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.queues: list[RenderedSpeechQueue] = []
+
+    def tearDown(self) -> None:
+        for q in self.queues:
+            q.close()
+
+    def _queue(self, sink, renderer, on_start=None) -> RenderedSpeechQueue:
+        q = RenderedSpeechQueue(on_start, sink=sink, renderer=renderer)
+        self.queues.append(q)
+        return q
+
+    def test_rejected_piece_is_skipped_and_on_start_fires_once(self) -> None:
+        sink = PickySink({1})
+        started: list[str] = []
+        q = self._queue(sink, StubRenderer([b"\x01\x00", b"\x02\x00", b"\x03\x00"]), started.append)
+        q.enqueue("hi")
+        self.assertTrue(q.wait_idle(3.0))
+        self.assertEqual(sink.played, [b"\x01\x00", b"\x03\x00"])
+        self.assertEqual(started, ["hi"])
+
+    def test_on_start_follows_first_accepted_piece(self) -> None:
+        sink = PickySink({0})
+        started: list[str] = []
+        q = self._queue(sink, StubRenderer([b"\x01\x00", b"\x02\x00"]), started.append)
+        q.enqueue("hi")
+        self.assertTrue(q.wait_idle(3.0))
+        self.assertEqual(sink.played, [b"\x02\x00"])
+        self.assertEqual(started, ["hi"])
+
+    def test_all_pieces_rejected_never_calls_on_start(self) -> None:
+        sink = PickySink({0, 1, 2})
+        started: list[str] = []
+        q = self._queue(sink, StubRenderer([b"\x01\x00"] * 3), started.append)
+        q.enqueue("hi")
+        self.assertTrue(q.wait_idle(3.0))
+        self.assertEqual(sink.played, [])
+        self.assertEqual(started, [])
+
+    def test_none_from_sink_counts_as_played(self) -> None:
+        sink = FakeSink()
+        sink.auto_drain = True
+        started: list[str] = []
+        q = self._queue(sink, StubRenderer([b"\x01\x00"]), started.append)
+        q.enqueue("hi")
+        self.assertTrue(q.wait_idle(3.0))
+        self.assertEqual(started, ["hi"])
+
+    def test_stop_mid_item_sends_no_further_pieces(self) -> None:
+        sink = FakeSink()
+        sink.auto_drain = True
+        holder: dict = {}
+
+        def before_each(i: int) -> None:
+            if i == 1:
+                holder["q"].stop()  # lands between piece 1 and piece 2
+
+        q = self._queue(sink, StubRenderer([b"\x01\x00", b"\x02\x00", b"\x03\x00"], before_each))
+        holder["q"] = q
+        q.enqueue("hi")
+        self.assertTrue(q.wait_idle(3.0))
+        self.assertEqual(sink.played, [b"\x01\x00"])
+
+    def test_stop_cancels_renderer_and_close_closes_it(self) -> None:
+        sink = FakeSink()
+        renderer = StubRenderer([])
+        q = self._queue(sink, renderer)
+        q.stop()
+        self.assertEqual(renderer.cancels, 1)
+        self.assertGreaterEqual(sink.clears, 1)
+        q.close()
+        self.assertEqual(renderer.closed, 1)
+
+    def test_default_renderer_is_say(self) -> None:
+        q = RenderedSpeechQueue(sink=FakeSink())
+        self.queues.append(q)
+        self.assertIsInstance(q._renderer, SayRenderer)
 
 
 if __name__ == "__main__":

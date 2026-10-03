@@ -250,14 +250,20 @@ class ScreenedSinkTest(unittest.TestCase):
         self.assertTrue(s.play(CLEAN))
         self.assertFalse(s.play(MARK))
 
+    def _errors_sink(self, factory):
+        self.errors: list[BaseException] = []
+        return self._make(factory, on_error=self.errors.append)
+
     def test_factory_exception_fails_closed(self) -> None:
         def factory():
             raise RuntimeError("model load failed")
 
-        s = self._make(factory)
+        s = self._errors_sink(factory)
         self.assertFalse(s.play(CLEAN))
         self.assertEqual(self.inner.played, [])
-        self.assertEqual(self.blocked, 1)
+        self.assertEqual(self.blocked, 0)  # the screen broke; it did not fire
+        self.assertEqual(len(self.errors), 1)
+        self.assertEqual(str(self.errors[0]), "model load failed")
 
     def test_detector_exception_fails_closed(self) -> None:
         def factory():
@@ -266,11 +272,42 @@ class ScreenedSinkTest(unittest.TestCase):
 
             return detect
 
-        s = self._make(factory)
+        s = self._errors_sink(factory)
         self.assertFalse(s.play(CLEAN))
         self.assertEqual(self.inner.played, [])
-        self.assertEqual(self.blocked, 1)
+        self.assertEqual(self.blocked, 0)
+        self.assertEqual(len(self.errors), 1)
         self.assertEqual(s._history, b"")
+
+    def test_on_error_fires_once_but_later_failures_stay_blocked(self) -> None:
+        def factory():
+            raise RuntimeError("down")
+
+        s = self._errors_sink(factory)
+        self.assertFalse(s.play(CLEAN))
+        self.assertFalse(s.play(CLEAN))
+        self.assertFalse(s.play(CLEAN))
+        self.assertEqual(len(self.errors), 1)
+        self.assertEqual(self.blocked, 0)
+        self.assertEqual(self.inner.played, [])
+
+    def test_on_error_raising_is_swallowed(self) -> None:
+        def boom(exc) -> None:
+            raise RuntimeError("x")
+
+        def factory():
+            raise RuntimeError("down")
+
+        s = self._make(factory, on_error=boom)
+        self.assertFalse(s.play(CLEAN))
+
+    def test_failure_without_on_error_is_still_blocked(self) -> None:
+        def factory():
+            raise RuntimeError("down")
+
+        s = self._make(factory)
+        self.assertFalse(s.play(CLEAN))
+        self.assertEqual(self.blocked, 0)
 
     def test_on_blocked_raising_is_swallowed(self) -> None:
         def boom() -> None:

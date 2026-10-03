@@ -62,11 +62,14 @@ class ScreenedSink:
         detector_factory: Callable[[], Callable[[bytes], bool]],
         clock: Callable[[], float] = time.monotonic,
         on_blocked: Callable[[], None] | None = None,
+        on_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self._inner = inner
         self._factory = detector_factory
         self._clock = clock
         self._on_blocked = on_blocked
+        self._on_error = on_error
+        self._error_reported = False
         self._lock = threading.Lock()
         self._history = b""
         self._est_end = 0.0
@@ -79,6 +82,8 @@ class ScreenedSink:
         if not pcm:
             return True
         padded = pcm + bytes(-len(pcm) % _FRAME_BYTES)
+        failure: Exception | None = None
+        report_error = False
         with self._lock:
             try:
                 now = self._clock()
@@ -90,15 +95,22 @@ class ScreenedSink:
                 blocked = _fires(
                     self._factory(), context + padded + bytes(_LOOKAHEAD_BYTES)
                 )
-            except Exception:
+            except Exception as exc:
                 blocked = True  # fail closed: never play audio we could not screen
+                failure = exc
             if not blocked:
                 self._history = (context + padded)[-_HISTORY_BYTES:]
                 self._est_end = max(now, self._est_end) + len(pcm) / _BYTES_PER_S
+            if failure is not None and not self._error_reported:
+                self._error_reported = report_error = True
         if blocked:
-            if self._on_blocked is not None:
+            # A broken screen is not "sounded like the wake word": report it
+            # separately, once, and stay silent (but closed) afterwards.
+            callback = self._on_blocked if failure is None else self._on_error
+            arg = () if failure is None else (failure,)
+            if callback is not None and (failure is None or report_error):
                 try:
-                    self._on_blocked()
+                    callback(*arg)
                 except Exception:
                     pass
             return False
