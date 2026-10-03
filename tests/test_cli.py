@@ -327,21 +327,39 @@ class FakeEngine:
 class MakeAudioIoTest(unittest.TestCase):
     def test_aec_on_builds_rendered_queue_on_the_engine(self) -> None:
         from undertone.player import RenderedSpeechQueue
+        from undertone.screen import ScreenedSink
 
         engine = FakeEngine()
-        io_ = cli.make_audio_io(False, engine_factory=lambda: engine)
+        io_ = cli.make_audio_io(
+            False, engine_factory=lambda: engine, screen_factory=lambda: (lambda frame: False)
+        )
         queues = [io_.player_factory(), io_.player_factory(lambda text: None)]
         try:
             for q in queues:
                 self.assertIsInstance(q, RenderedSpeechQueue)
-                self.assertIs(q._sink, engine)
+                self.assertIsInstance(q._sink, ScreenedSink)
+                self.assertIs(q._sink._inner, engine)
         finally:
             for q in queues:
                 q.close()
 
+    def test_wake_factory_applies_probability_cutoff(self) -> None:
+        mww = mock.MagicMock()
+        fake_mod = mock.MagicMock()
+        fake_mod.MicroWakeWord.from_builtin.return_value = mww
+        with mock.patch.dict(sys.modules, {"pymicro_wakeword": fake_mod}):
+            cli._make_wake_factory(probability_cutoff=0.8)()
+            self.assertEqual(mww.probability_cutoff, 0.8)
+            mww2 = mock.MagicMock(probability_cutoff=0.97)
+            fake_mod.MicroWakeWord.from_builtin.return_value = mww2
+            cli._make_wake_factory()()
+            self.assertEqual(mww2.probability_cutoff, 0.97)
+
     def test_aec_on_talk_over_and_engine_delegation(self) -> None:
         engine = FakeEngine()
-        io_ = cli.make_audio_io(False, engine_factory=lambda: engine)
+        io_ = cli.make_audio_io(
+            False, engine_factory=lambda: engine, screen_factory=lambda: (lambda frame: False)
+        )
         self.assertTrue(io_.talk_over)
         self.assertIs(io_.engine, engine)
         io_.start()

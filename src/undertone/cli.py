@@ -21,12 +21,16 @@ _WAKE_CUE = "/System/Library/Sounds/Tink.aiff"
 _FOLLOW_UP_CUE = "/System/Library/Sounds/Pop.aiff"
 
 
-def _make_wake_factory() -> Callable[[], Callable[[bytes], bool]]:
+def _make_wake_factory(
+    *, probability_cutoff: float | None = None
+) -> Callable[[], Callable[[bytes], bool]]:
     # Lazy import: pymicro-wakeword is heavy and only the voice commands need it.
     from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures, Model
 
     def wake_factory():
         mww = MicroWakeWord.from_builtin(Model.HEY_JARVIS)
+        if probability_cutoff is not None:
+            mww.probability_cutoff = probability_cutoff
         feats = MicroWakeWordFeatures()
 
         def detect(frame: bytes) -> bool:
@@ -119,9 +123,15 @@ class AudioIO:
             self.engine.close()
 
 
-def make_audio_io(no_aec: bool, *, engine_factory: Callable[[], object] | None = None) -> AudioIO:
+def make_audio_io(
+    no_aec: bool,
+    *,
+    engine_factory: Callable[[], object] | None = None,
+    screen_factory: Callable[[], Callable[[bytes], bool]] | None = None,
+) -> AudioIO:
     """Echo-cancelled full-duplex audio by default; plain mic + `say` with no_aec."""
     from .player import RenderedSpeechQueue, SpeechQueue
+    from .screen import SCREEN_CUTOFF, ScreenedSink
 
     if no_aec:
         return AudioIO(
@@ -130,8 +140,17 @@ def make_audio_io(no_aec: bool, *, engine_factory: Callable[[], object] | None =
     if engine_factory is None:
         from .duplex import DuplexAudio as engine_factory
     engine = engine_factory()
+
+    def on_blocked() -> None:
+        print("[skipped speech that sounded like the wake word]", file=sys.stderr, flush=True)
+
+    sink = ScreenedSink(
+        engine,
+        detector_factory=screen_factory or _make_wake_factory(probability_cutoff=SCREEN_CUTOFF),
+        on_blocked=on_blocked,
+    )
     return AudioIO(
-        player_factory=lambda on_start=None: RenderedSpeechQueue(on_start, sink=engine),
+        player_factory=lambda on_start=None: RenderedSpeechQueue(on_start, sink=sink),
         talk_over=True,
         engine=engine,
     )
