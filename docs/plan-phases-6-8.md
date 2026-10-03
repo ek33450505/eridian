@@ -34,6 +34,8 @@ Sessions can spill; the order matters more than the boundaries.
 
 ## S0 — finish Phase 4b
 
+**✓ Done 2026-10-02:** contention test run (default session kept; first piece cut to 32 tokens, 0.286 s first audio in the offline check), full suite 499 OK, offline check 10/10 PASS, live test passed with `am_adam` (Ed). Kept below as a record.
+
 At the time of writing (2026-10-02 evening), on `feature/phase4b-kokoro`:
 - Committed: Kokoro engine (`f0a4c36`), single scrub + espeak-ng (`c1be949`), acoustic self-screen (`978476c`), `wake_barge_in` (`f8c3bc8`), offline check (`b521b47`).
 - In review / to commit: Unit 4 (Kokoro in the speech queue, `--tts`, `models fetch`), Kokoro hardening (SHA-256 pins, load-error fallback, vocab check), docs, this plan.

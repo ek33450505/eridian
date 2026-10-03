@@ -87,7 +87,7 @@ THINKING (brain turn) → SPEAKING (sentences queued and played)
 | Claude first token (warm) | 1.0–2.0 s | Persistent child; one-shot `claude -p` is 5.5–13 s |
 | `say` first audio | 0.54–0.56 s | `say -o` with Evan (Enhanced), 2026-10-02 (Phase 0: 0.73 s with Zoe Premium) |
 | Kokoro first audio | 0.12–0.27 s | onnxruntime + espeak-ng, idle machine, 2026-10-02 |
-| Live end-to-end with Kokoro (speech end → first audio) | not yet measured | Live test pending |
+| Live end-to-end with Kokoro (speech end → first audio) | not yet measured | Live test passed 2026-10-02; no timing was captured |
 
 Target: ≤ 4 s from speech end to reply start.
 

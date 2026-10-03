@@ -219,7 +219,7 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | **D** | documentation: this README, local-first, architecture, training, SECURITY, CHANGELOG, offline check | ✓ done (refreshed at each phase end) |
 | **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
 | **4a** | echo cancellation via livekit AEC + talking over replies without wake word | ✓ done (live-tested 2026-10-02 (MacBook Pro speakers and mic, one room)) |
-| **4b** | Kokoro voice | ✓ built; live test pending |
+| **4b** | Kokoro voice | ✓ done (live-tested 2026-10-02) |
 | **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
 
 For the full research and component justification: see [`docs/plan.md`](docs/plan.md).

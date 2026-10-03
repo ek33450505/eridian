@@ -6,6 +6,8 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ### 2026-10-02 — Phase 4b: Kokoro voice
 
+**Live test (2026-10-02, Ed):** with both `undertone session` and `undertone attach` restarted, Ed ran the checklist: banner `Voice: Kokoro (am_adam).`, Kokoro replies, talk-over, a confirm answered after the prompt finished, no self-trigger, and `--tts say` / `--no-aec` — "nothing odd, works great" (reported by Ed; per-step output not captured). The full suite ran 499 tests OK and `scripts/verify-offline.sh` passed 10/10 with the network denied.
+
 **Added**
 - Kokoro-82M ONNX resident TTS engine (phoneme-based; 0.05 s + 0.085 s/second of audio on idle M4 Max). Default voice: `am_adam`, Ed's pick from the samples; through the full playback path the self-screen blocked 0/200 ordinary sentences with it, against 2/200 with `am_michael`. Override with `UNDERTONE_KOKORO_VOICE` (e.g., `am_michael`, `bm_george`). Download via `undertone models fetch` (57 files, model + tokenizer + voice bins). Model pinned to `onnx-community/Kokoro-82M-v1.0-ONNX` revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, fp32 `onnx/model.onnx` (~325 MB). Model weights: Apache-2.0. Runtime: onnxruntime 1.30 (CPU-only; CoreML was no faster and used 2× memory). MIT license.
 - G2P (grapheme-to-phoneme) via espeak-ng, run as a separate subprocess (text on stdin), never linked. GPL-3.0-or-later; installed via Homebrew.
