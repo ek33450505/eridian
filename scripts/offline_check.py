@@ -5,9 +5,12 @@ Run inside a network-denying sandbox (see verify-offline.sh):
     offline_check.py <clip.wav> <out.aiff> [--expect "text"]
 
 Feeds a recorded clip through wake word -> VAD -> STT, then TTS (`say -o` to a
-file, never the speakers), then echo cancellation (a rendered sentence plus a
-simulated room echo through the real WebRTC AEC). A network canary runs first so the check proves its
-own premise: if the network is reachable, the result is meaningless.
+file, never the speakers), then the resident Kokoro voice (espeak-ng phonemes ->
+ONNX render, telemetry forced off, and the self-screen: a homophone of the wake
+word is blocked, an ordinary sentence plays, both into a stub sink), then echo
+cancellation (a rendered sentence plus a simulated room echo through the real
+WebRTC AEC). A network canary runs first so the check proves its own premise:
+if the network is reachable, the result is meaningless.
 """
 
 from __future__ import annotations
@@ -113,6 +116,97 @@ def check_echo_cancellation(out: str, check, vad_cls) -> None:
     )
 
 
+def check_kokoro(out: str, check, *, paths=None) -> None:
+    """Prove the resident Kokoro voice and the self-screen run locally.
+
+    `paths` (model, tokenizer, voice) overrides the HF cache; for scratch validation only.
+    """
+    import shutil
+    import time
+
+    if shutil.which("espeak-ng") is None:
+        check("Kokoro", False, "espeak-ng not found: brew install espeak-ng")
+        return
+
+    from undertone import kokoro, speaker
+    from undertone.cli import _make_wake_factory
+    from undertone.screen import SCREEN_CUTOFF, ScreenedSink
+
+    check("Kokoro telemetry off", os.environ.get("ORT_DISABLE_TELEMETRY") == "1", "ORT_DISABLE_TELEMETRY=1")
+
+    try:
+        voice = kokoro.KokoroVoice(paths=paths) if paths else kokoro.KokoroVoice()
+        voice.warm_up()
+    except kokoro.KokoroUnavailable as exc:
+        check("Kokoro", False, f"{exc}; run `uv run undertone models fetch` first, OUTSIDE the sandbox")
+        return
+
+    def synth(text: str) -> tuple[list[bytes | None], int, float | None]:
+        t0 = time.monotonic()
+        ph = speaker.espeak_phonemes(text)
+        first = None
+        pcms: list[bytes | None] = []
+        for piece in voice.pieces(ph) if ph else []:
+            pcm = voice.render(piece)
+            if pcm and first is None:
+                first = time.monotonic() - t0
+            pcms.append(pcm)
+        return pcms, len(pcms), first
+
+    pcms, n, first = synth("The capital of France is Paris, and it is lovely in the spring.")
+    audio = b"".join(p for p in pcms if p)
+    problems = []
+    if n == 0:
+        problems.append("no pieces")
+    if any(p is None for p in pcms):
+        problems.append("a piece returned None")
+    if not audio:
+        problems.append("empty PCM")
+    if len(audio) % 2:
+        problems.append("odd PCM length")
+    first_s = f"{first:.3f} s" if first is not None else "never"
+    detail = f"{n} pieces, {len(audio) / 2 / 16000:.2f} s audio, first audio in {first_s}"
+    check("Kokoro render", not problems, detail + (f"; FAILED: {', '.join(problems)}" if problems else ""))
+    wav_path = os.path.splitext(out)[0] + "-kokoro.wav"
+    with wave.open(wav_path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(audio)
+
+    class RecordingSink:
+        playing = False
+
+        def __init__(self) -> None:
+            self.plays: list[bytes] = []
+
+        def play(self, pcm: bytes) -> None:
+            self.plays.append(pcm)
+
+        def clear(self) -> None:
+            pass
+
+        def wait_drained(self, timeout=None) -> bool:
+            return True
+
+    def screened_play(text: str) -> tuple[bool, RecordingSink]:
+        pieces, _, _ = synth(text)
+        inner = RecordingSink()
+        sink = ScreenedSink(inner, detector_factory=_make_wake_factory(probability_cutoff=SCREEN_CUTOFF))
+        return sink.play(b"".join(p for p in pieces if p)), inner
+
+    played, inner = screened_play("hey jarvice")
+    blocked = not played and not inner.plays
+    played, inner = screened_play("The tests pass now.")
+    passed = played and len(inner.plays) == 1
+    check(
+        "Kokoro self-screen",
+        blocked and passed,
+        f"homophone {'blocked' if blocked else 'PLAYED (screen missed it)'}; "
+        f"ordinary sentence {'played' if passed else 'BLOCKED (false positive)'}",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("clip")
@@ -186,6 +280,8 @@ def main() -> int:
     check("TTS exit", proc.returncode == 0, f"say rc={proc.returncode} {proc.stderr.strip()}".strip())
     size = os.path.getsize(args.out) if os.path.exists(args.out) else 0
     check("TTS output", size > 0, f"{size} bytes")
+
+    check_kokoro(args.out, check)
 
     check_echo_cancellation(args.out, check, SileroVoiceActivityDetector)
 
