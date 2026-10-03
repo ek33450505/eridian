@@ -295,6 +295,20 @@ class SessionHelpersTest(CliTestCase):
         self.assertEqual(args.follow_up, 0.0)
         self.assertEqual(parser.parse_args(["attach"]).follow_up, 6.0)
 
+    def test_attach_announce_option(self) -> None:
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args(["attach"]).announce, "all")
+        for level in ("all", "permission", "off"):
+            self.assertEqual(parser.parse_args(["attach", "--announce", level]).announce, level)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["attach", "--announce", "loud"])
+
+    def test_cmd_attach_passes_announce(self) -> None:
+        args = cli.build_parser().parse_args(["attach", "--announce", "permission"])
+        with mock.patch("undertone.voice.run_attach", return_value=0) as run:
+            self.assertEqual(cli._cmd_attach(args), 0)
+        self.assertEqual(run.call_args.kwargs["announce"], "permission")
+
 
 class FakeEngine:
     def __init__(self) -> None:

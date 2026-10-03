@@ -473,7 +473,11 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     from . import voice
 
     return voice.run_attach(
-        no_beep=args.no_beep, follow_up_s=args.follow_up, no_aec=args.no_aec, tts=args.tts
+        no_beep=args.no_beep,
+        follow_up_s=args.follow_up,
+        no_aec=args.no_aec,
+        tts=args.tts,
+        announce=args.announce,
     )
 
 
@@ -574,6 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="kokoro",
         help="voice engine: kokoro (default; needs `undertone models fetch` and "
         "espeak-ng) or the macOS say voice",
+    )
+    attach_parser.add_argument(
+        "--announce",
+        choices=["all", "permission", "off"],
+        default="all",
+        help="speak when Claude finishes or needs you (default all; "
+        "'permission' skips 'finished')",
     )
     attach_parser.set_defaults(func=_cmd_attach)
 

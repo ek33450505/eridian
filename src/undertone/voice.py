@@ -10,7 +10,8 @@ calling the channel's `reply` tool, and the channel sends the text back as a
 Socket protocol (newline-delimited UTF-8 JSON, each line <= 64 KB; an oversized
 line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
 
-    channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"}   (first line)
+    channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"[,"session":"<32 hex>"]}
+                                                                    (first line)
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"}
                                                                     (any number)
     voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
@@ -19,6 +20,26 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
                        {"type":"detached"}   (sent to the OLD connection when a
                                               newer channel says hello; "latest
                                               session wins", then it is closed)
+
+    hook -> voice      {"type":"announce","session":"<32 hex>","event":"<event>"}
+                       (typically a one-shot connection with NO hello: it never
+                        attaches or detaches anything)
+
+Announce: a hook can make the bridge speak a short FIXED sentence
+(ANNOUNCE_TEMPLATES, e.g. "Claude finished.") without a reply. The line is
+honoured only if `session` equals (hmac.compare_digest) the `session` the
+currently attached channel sent in its hello, and `event` is enabled by the
+`--announce` level; anything else is silently ignored. Nothing from the message
+is ever spoken or printed except the validated event key. The reader thread only
+posts `("announce", event)` to the control queue; the main thread decides:
+"finished" is skipped if a non-ack reply was already spoken since the last
+"finished", and while a confirm (or unknown-kind) reply is pending -- i.e. until
+an utterance is next sent to the channel -- because a no-wake-word follow-up
+window must never be able to burn a pending confirm challenge. Any announce is
+skipped while the listener is not IDLE or if the same event was spoken within
+ANNOUNCE_REPEAT_S. An announcement queues behind current speech (never stops
+it), bumps the generation, and plays with talk-over off. Only "finished" opens
+the follow-up window (as an `answer` does).
 
 Reply `kind` gates the no-wake-word follow-up window: only an `answer` (the
 default when `kind` is missing) opens it, once its speech goes idle. `ack` (an
@@ -67,6 +88,7 @@ or real `claude`.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
 import math
 import os
@@ -85,9 +107,24 @@ from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
 from .spoken import sanitize_terminal, strip_echo
+from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
+
+ANNOUNCE_TEMPLATES = {
+    "finished": "Claude finished.",
+    "permission": "Claude needs your permission.",
+    "question": "Claude has a question for you.",
+    "plan": "Claude's plan is ready.",
+    "error": "Claude stopped with an error.",
+}
+ANNOUNCE_LEVELS = {
+    "all": frozenset(ANNOUNCE_TEMPLATES),
+    "permission": frozenset(ANNOUNCE_TEMPLATES) - {"finished"},
+    "off": frozenset(),
+}
+ANNOUNCE_REPEAT_S = 3.0  # the same event is not spoken twice within this
 
 _BACKLOG = 32  # above MAX_CONNECTIONS so the cap, not the kernel queue, is the limit
 MAX_CONNECTIONS = 16
@@ -132,6 +169,7 @@ class _Conn:
         self.pid: int | None = None
         self.cwd = ""
         self.hello = False
+        self.session = ""  # 32-hex token from hello; "" can never match an announce
 
     def send(self, obj: dict) -> bool:
         data = (json.dumps(obj) + "\n").encode("utf-8")
@@ -166,10 +204,12 @@ class VoiceBridge:
         out: TextIO = sys.stdout,
         talk_over: bool = False,
         self_wake_guard_s: float = SELF_WAKE_GUARD_S,
+        announce: frozenset[str] = frozenset(),
     ) -> None:
         self._socket_path = Path(socket_path)
         self._follow_up_s = follow_up_s
         self._talk_over = talk_over
+        self._announce = announce
         self._cue = cue or (lambda kind: None)
         self._out = out
 
@@ -186,6 +226,9 @@ class VoiceBridge:
         self._conns: set[_Conn] = set()
         self._closed = False
         self._followed_gen = -1  # main thread only: dedupes reply_done per generation
+        self._answered = False  # session lock: a non-ack reply was spoken since the last "finished"
+        self._confirm_pending = False  # session lock: confirm/unknown reply, no utterance sent since
+        self._announce_last: dict[str, float] = {}  # main thread only: event -> last spoken
         self._clock = clock
         self._self_wake_guard_s = self_wake_guard_s
         self._last_busy = float("-inf")  # main thread only: last frame the player was busy
@@ -318,9 +361,13 @@ class VoiceBridge:
     def _drain_control(self) -> None:
         while True:
             try:
-                kind, gen = self._control.get_nowait()
+                kind, arg = self._control.get_nowait()
             except queue.Empty:
                 return
+            if kind == "announce":
+                self._on_announce(arg)
+                continue
+            gen = arg
             if (
                 kind == "reply_done"
                 and self._follow_up_s > 0
@@ -330,6 +377,36 @@ class VoiceBridge:
             ):
                 self._followed_gen = gen
                 self._listener.listen_now(self._follow_up_s)
+
+    def _on_announce(self, event: str) -> None:
+        """Main thread. `event` is already validated against the enabled templates."""
+        if event == "finished":
+            with _bounded(self._lock):
+                answered, self._answered = self._answered, False
+                confirm_pending = self._confirm_pending
+            if confirm_pending:
+                self._print("[announce skipped: finished (confirm pending)]\n")
+                return
+            if answered:
+                self._print("[announce skipped: finished (already answered)]\n")
+                return
+        if self._listener.state != "IDLE":
+            self._print(f"[announce skipped: {event} (listening)]\n")
+            return
+        now = self._clock()
+        last = self._announce_last.get(event)
+        if last is not None and now - last < ANNOUNCE_REPEAT_S:
+            self._print(f"[announce skipped: {event} (repeat)]\n")
+            return
+        self._announce_last[event] = now
+        template = ANNOUNCE_TEMPLATES[event]
+        with _bounded(self._lock):
+            self._gen += 1
+            gen = self._gen
+            self._no_talk_over_gen = gen  # short: heard in full; the wake word still barges in
+            self._player.enqueue(template)  # queues behind current speech; never stop()
+        self._print(f"[announce: {event}]\n")
+        self._speech_q.put((gen, "answer" if event == "finished" else "announce"))
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
@@ -369,6 +446,8 @@ class VoiceBridge:
             if conn is not None and conn.send(
                 {"type": "utterance", "text": text, "via": self._turn_via}
             ):
+                with _bounded(self._lock):
+                    self._confirm_pending = False
                 return
             self._print("[no Claude session attached]\n")
             self._player.enqueue(NO_SESSION_SPEECH)
@@ -475,7 +554,7 @@ class VoiceBridge:
     def _handle_line(self, conn: _Conn, line: bytes) -> None:
         try:
             msg = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             return
         if not isinstance(msg, dict):
             return
@@ -483,17 +562,36 @@ class VoiceBridge:
         if kind == "hello":
             pid, cwd = msg.get("pid"), msg.get("cwd")
             if isinstance(pid, int) and not isinstance(pid, bool) and isinstance(cwd, str):
-                self._attach(conn, pid, cwd)
+                session = msg.get("session")
+                valid = isinstance(session, str) and TOKEN_RE.fullmatch(session)
+                self._attach(conn, pid, cwd, session if valid else "")
+        elif kind == "announce":
+            self._on_announce_line(msg.get("event"), msg.get("session"))
         elif kind == "reply":
             text = msg.get("text")
             if isinstance(text, str):
                 reply_kind = msg.get("kind", "answer")
                 self._on_reply(conn, text, reply_kind if isinstance(reply_kind, str) else "?")
 
-    def _attach(self, conn: _Conn, pid: int, cwd: str) -> None:
-        conn.pid, conn.cwd, conn.hello = pid, cwd, True
+    def _on_announce_line(self, event: object, session: object) -> None:
+        """Reader thread: validate and hand off; never speaks or touches the player."""
+        if not isinstance(event, str) or event not in self._announce:
+            return
+        if not isinstance(session, str) or not TOKEN_RE.fullmatch(session):
+            return
+        with _bounded(self._lock):
+            conn = self._conn
+            expected = conn.session if conn is not None else ""
+        if not expected or not hmac.compare_digest(session, expected):
+            return
+        self._control.put(("announce", event))
+
+    def _attach(self, conn: _Conn, pid: int, cwd: str, session: str = "") -> None:
+        conn.pid, conn.cwd, conn.hello, conn.session = pid, cwd, True, session
         with _bounded(self._lock):
             old, self._conn = self._conn, conn
+            if old is not conn:  # the flags belong to the previous session
+                self._answered = self._confirm_pending = False
         if old is not None and old is not conn:
             old.send({"type": "detached"})
             old.close()
@@ -520,7 +618,10 @@ class VoiceBridge:
             sentences = self._chunker.feed(text) + self._chunker.flush()
         with _bounded(self._lock):
             gen = self._gen
+            if kind != "ack":
+                self._answered = True
             if kind not in ("answer", "ack"):
+                self._confirm_pending = True
                 self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
             if self._spoken_gen != gen:
                 self._spoken_gen, self._spoken_text = gen, ""
@@ -584,7 +685,12 @@ def _server_answers(path: Path) -> bool:
 
 
 def run_attach(
-    *, no_beep: bool, follow_up_s: float, no_aec: bool = False, tts: str = "kokoro"
+    *,
+    no_beep: bool,
+    follow_up_s: float,
+    no_aec: bool = False,
+    tts: str = "kokoro",
+    announce: str = "all",
 ) -> int:
     """The real wiring behind `undertone attach` (real mic; not unit-tested)."""
     # Lazy imports for the same reason as cli._cmd_chat: keep `--help` fast and
@@ -619,6 +725,7 @@ def run_attach(
         player_factory=io.player_factory,
         talk_over=io.talk_over,
         self_wake_guard_s=self_wake_guard_from_env(),
+        announce=ANNOUNCE_LEVELS[announce],
     )
     if bridge.start() != 0:
         bridge.close()
