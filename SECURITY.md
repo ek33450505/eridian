@@ -77,6 +77,15 @@ The start-up header prints the effective working directory and, when it substitu
 - Messages are newline-delimited JSON. A line over 64 KB drops that connection, and malformed or unknown lines are ignored. At most 16 connections are kept, and extras are closed.
 - Each connection has its own reader thread, so a failure in one never stops the mic loop or other connections.
 - "Latest session wins": a newer channel's `hello` sends `{"type":"detached"}` to the older one and closes it.
+- **Announcements (Phase 6).** A hook opens a one-shot connection with no `hello`, sends `{"type":"announce","session":"<32-hex token>","event":"<event>"}` and closes. `attach` speaks it only if the token equals (`hmac.compare_digest`) the one the attached channel sent in its `hello`, and only if `--announce` enables the event; anything else is ignored. The token is a routing check, not a secret against the same user: it is on the hook command lines, visible via `ps`, and a same-user process could already send `hello` and `reply` lines. Announcements speak fixed templates only, never Claude's text, and each event is spoken at most once per 3.0 s. "Claude finished." opens the follow-up window, whose turn can never grant a confirmation, and it is suppressed while a confirm is pending, so it can't use up the confirm challenge.
+
+#### Announce hook (`announce.py`)
+
+`undertone session` runs `python -P -m undertone.announce <hook> --home <UNDERTONE_HOME> --session <token>` as async hooks: a second handler on the `Stop` entry (after the voice guard's), plus `StopFailure` and `PermissionRequest`. Async hooks can't block Claude or decide a permission.
+- It always exits 0 and writes nothing to stdout or stderr, because `PermissionRequest` stdout is a decision channel. Every path runs inside `try/except BaseException`, the argument parser never prints, and the `voice_guard` import is lazy, so a broken install stays silent too.
+- It drains stdin first, and it forwards nothing from the payload: the line it sends holds only the token and a fixed event key.
+- It sends nothing unless `--home` is absolute, the token is 32 hex characters, and `<home>/voice.sock` is a socket (`lstat`, so not a symlink) owned by the same uid. It connects with a 0.5 s timeout and never reads from the socket.
+- It logs at most one line per run to `<home>/logs/guard.log`: `announce <sent|skipped|error> <hook> <event or reason>`, where the reason is `bg-agents`, `no-socket`, `bad-token` or `send-failed`. It never logs the token or the payload.
 
 ### 7. Claude Code Channel MCP Server (`mcp_channel.py`)
 

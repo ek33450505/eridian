@@ -81,8 +81,9 @@ Run `chat` from a project directory, because Claude's file tools are confined to
 
 **Terminal 1:** Run the voice input listener.
 ```bash
-uv run undertone attach [--no-beep] [--no-aec] [--follow-up SECONDS] [--tts {kokoro,say}]
+uv run undertone attach [--no-beep] [--no-aec] [--announce {all,permission,off}] [--follow-up SECONDS] [--tts {kokoro,say}]
 ```
+- `--announce {all,permission,off}`: announcements when Claude finishes or needs you (default `all`; `permission` skips "finished"; `off` disables)
 - `--follow-up SECONDS`: seconds to keep listening after a reply without the wake word (default 6; 0 disables)
 - `--no-beep`: skip the audible wake/follow-up cues
 - `--no-aec`: play speech with `say` directly (no echo cancellation, no talk-over, wake-word barge-in only); use if AEC misbehaves
@@ -95,7 +96,7 @@ uv run undertone attach [--no-beep] [--no-aec] [--follow-up SECONDS] [--tts {kok
 ~/Projects/personal/undertone/.venv/bin/undertone session [claude args ...]
 ```
 
-This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`, with the voice-turn hard control (`voice_guard`) injected via `--settings`. Your voice input from Terminal 1 arrives as `← undertone: <text>`, and Claude can call the `reply` tool to speak answers. The command generates a session token and refuses `--settings`, `--settings=…`, `--bare` and `--safe-mode`, since each would override the guard.
+This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`, with the voice-turn hard control (`voice_guard`) injected via `--settings`. Your voice input from Terminal 1 arrives as `← undertone: <text>`, and Claude can call the `reply` tool to speak answers. undertone announces when Claude finishes or needs your permission, opening a no-wake-word follow-up window after "Claude finished." The command generates a session token and refuses `--settings`, `--settings=…`, `--bare` and `--safe-mode`, since each would override the guard.
 
 ### Standalone voice conversation (Path B)
 
@@ -151,7 +152,7 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 
 ### Modules
 
-`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `duplex.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `voice_guard.py`, `paths.py`, `cli.py`.
+`audio.py`, `listener.py`, `stt.py`, `brain.py`, `chunker.py`, `duplex.py`, `player.py`, `chat.py`, `speaker.py`, `spoken.py`, `mcp_channel.py`, `voice.py`, `voice_guard.py`, `announce.py`, `paths.py`, `cli.py`.
 
 ## Safety model for voice
 
@@ -172,6 +173,8 @@ Voice turns keep full session power but are unverified input. A hard control (`v
 - **Talk-over barge-in:** while Claude is speaking, 0.3 s of sustained speech stops the reply without saying the wake word. Your speech becomes your next turn, with 0.5 s of your first words preserved. Exception: a confirm prompt (or a reply of unknown kind) can't be talked over, so you always hear the whole phrase; "hey jarvis" still interrupts it, and you answer with "hey jarvis" plus the phrase. In `chat`, talk-over also interrupts Claude's in-flight turn.
 
 - **Confirmation hint:** the new phrase is `[confirmation needed: when I finish, say "hey jarvis" and the phrase]`, clarifying that a silent period before the wake word is required.
+
+- **Announcements:** `undertone attach` speaks fixed templates ("Claude finished.", "Claude needs your permission.", etc.) when Claude ends a turn or asks for permission, and only for the session it is attached to. They use the same speech path as replies (one text scrub, plus the acoustic self-screen with Kokoro), and never include Claude's text. The `--announce` flag controls them. "Claude finished." opens the follow-up window; the other announcements don't. A follow-up turn can't grant a confirmation, and "Claude finished." is suppressed while a confirm is pending, so its window can't use up the confirm challenge.
 
 ### Path B: standalone `undertone chat`
 
@@ -220,6 +223,7 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
 | **4a** | echo cancellation via livekit AEC + talking over replies without wake word | ✓ done (live-tested 2026-10-02 (MacBook Pro speakers and mic, one room)) |
 | **4b** | Kokoro voice | ✓ done (live-tested 2026-10-02) |
+| **6** | Jarvis speaks first: spoken "Claude finished" / "needs your permission" via Stop and PermissionRequest hooks | ✓ built (live test pending) |
 | **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
 
 For the full research and component justification: see [`docs/plan.md`](docs/plan.md).

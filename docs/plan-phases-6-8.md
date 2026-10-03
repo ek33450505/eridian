@@ -65,6 +65,19 @@ At the time of writing (2026-10-02 evening), on `feature/phase4b-kokoro`:
 
 **Security review focus.** Who can write to `voice.sock` (same user, 0600) and what an announce message can make undertone say (templates only); that announce turns and follow-ups never grant.
 
+**Spike result (2026-10-02): GO.** Captured live by Ed, Claude Code 2.1.288 (see `docs/architecture.md` → Phase 6):
+- `Stop` fires 43–100 ms after the final message (7 samples); an Esc-interrupted turn fires none. Its payload also carries `background_tasks` and `session_crons`, which the hooks docs don't list.
+- `Notification` never fired: not for a forced permission prompt (inside cmux, and with cmux's hook injection off), and not after 250 s idle inside cmux. `PermissionRequest` fired on every prompt.
+- Projected `Stop` to first audio ≈ 0.4 s on an idle machine (≤ 0.1 s lag + 0.03 s hook start + ~0.29 s Kokoro first audio); the live test measures it for real.
+
+Design changes from the spike and review: `PermissionRequest` (→ permission / question / plan) and `StopFailure` (→ error) replace `Notification`, so there's no idle announcement; the hooks are async and output-free; `Stop` stays silent while a background subagent is running; the transport is the one-shot announce line on `voice.sock`, with the session token added to `hello`; announcements are dropped while the listener isn't idle; "finished" is skipped after a spoken non-ack reply and while a confirm is pending.
+
+**Units:**
+- ✓ 6.1 (`5f0ff15`): announce handling in `voice.py`, `session` in the channel's `hello`, `attach --announce`, tests.
+- ✓ 6.2 (`3a7a6eb`): the `undertone.announce` hook and its wiring in `voice_guard_settings`, tests.
+- 6.3: docs (README, CHANGELOG, SECURITY, architecture, this plan).
+- Live test by Ed: pending.
+
 ## Phase 7 — menu-bar helper (S2–S3)
 
 **Why.** Today the terminal app holds the microphone permission, nothing restarts `attach` after a crash or re-login, and there's no visual state, mute or push-to-talk.
@@ -111,6 +124,7 @@ Note: Automation and Full Disk Access grants land on the process hosting Claude 
 | Multi-session routing by voice | "Jarvis, switch to the undertone session." The research found no tool that ships it. |
 | Transcript history | Local, 0600, opt-in. |
 | Headphones / AirPods mode | Bluetooth latency vs `SELF_WAKE_GUARD_S`; HFP mic quality. Needs hardware testing. |
+| Follow-up window after a confirm | An `answer` reply sent while a confirm is pending still opens the follow-up window (pre-Phase 6 behaviour); anything heard there uses up the challenge. It can't grant. Fix: gate that window on the confirm-pending flag. Found in the Phase 6 security review. |
 | cast-desktop voice status panel | Read-only, over the Phase 7 control socket. |
 
 ## Open decisions for Ed
@@ -119,7 +133,7 @@ Note: Automation and Full Disk Access grants land on the process hosting Claude 
 2. Speaker-verification weights: WeSpeaker/TitaNet are CC-BY-4.0 (attribution, commercial OK, not MIT/Apache); SpeechBrain ECAPA is Apache-2.0 but needs a one-off PyTorch export to ONNX.
 3. Push-to-talk turns: non-granting (default) or allowed to confirm?
 4. Music control by voice: ungated or confirm?
-5. Announcement defaults for Phase 6.
+5. ✓ Decided (Ed, 2026-10-02): Announcement defaults — `--announce all` (default), follow-up window after "finished" on, silent while `background_tasks` lists a `subagent` with status `running`.
 
 ## Kickoff blocks
 
