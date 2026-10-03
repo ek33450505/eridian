@@ -344,7 +344,7 @@ def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
 
 
 def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
-    """Inline `--settings` JSON that installs the voice guard's hooks for one session."""
+    """Inline `--settings` JSON that installs the voice guard's hooks and the announce hooks for one session."""
 
     def _hook_cmd(event: str) -> str:
         parts = [
@@ -352,6 +352,19 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
             "--home", str(home), "--session", token,
         ]
         return " ".join(shlex.quote(x) for x in parts)
+
+    def _announce(event: str) -> dict:
+        parts = [
+            executable, "-P", "-m", "undertone.announce", event,
+            "--home", str(home), "--session", token,
+        ]
+        # Async and output-free: an announce hook can never block Claude or decide a permission.
+        return {
+            "type": "command",
+            "command": " ".join(shlex.quote(x) for x in parts),
+            "async": True,
+            "timeout": 10,
+        }
 
     return {
         # --settings outranks project/local/user settings, so this forces hooks on.
@@ -371,8 +384,15 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
                 {"hooks": [{"type": "command", "command": _hook_cmd("subagentstop"), "timeout": 30}]}
             ],
             "Stop": [
-                {"hooks": [{"type": "command", "command": _hook_cmd("stop"), "timeout": 30}]}
+                {
+                    "hooks": [
+                        {"type": "command", "command": _hook_cmd("stop"), "timeout": 30},
+                        _announce("stop"),
+                    ]
+                }
             ],
+            "StopFailure": [{"hooks": [_announce("stopfailure")]}],
+            "PermissionRequest": [{"matcher": "*", "hooks": [_announce("permissionrequest")]}],
             "PreToolUse": [
                 {
                     "matcher": "*",

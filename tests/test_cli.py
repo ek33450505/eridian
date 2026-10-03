@@ -197,9 +197,12 @@ class SessionHelpersTest(CliTestCase):
         st = cli.voice_guard_settings("/py", Path("/h o/me"), self.TOK)
         self.assertIs(st["disableAllHooks"], False)
         hooks = st["hooks"]
-        self.assertEqual(set(hooks), {"SessionStart", "UserPromptSubmit", "PreToolUse", "Stop", "SubagentStart", "SubagentStop"})
+        self.assertEqual(set(hooks), {
+            "SessionStart", "UserPromptSubmit", "PreToolUse", "Stop", "StopFailure",
+            "PermissionRequest", "SubagentStart", "SubagentStop",
+        })
         for event, entries in hooks.items():
-            self.assertEqual(entries[0]["hooks"][0]["timeout"], 10 if event == "PreToolUse" else 30)
+            self.assertEqual(entries[0]["hooks"][0]["timeout"], 10 if event in ("PreToolUse", "StopFailure", "PermissionRequest") else 30)
             self.assertEqual(entries[0]["hooks"][0]["type"], "command")
         stop = hooks["Stop"][0]["hooks"][0]["command"]
         self.assertIn(self.TOK, shlex.split(stop))
@@ -211,6 +214,20 @@ class SessionHelpersTest(CliTestCase):
             self.assertIn(event.lower(), argv)
             self.assertIn(self.TOK, argv)
             self.assertNotIn("exit 2", hooks[event][0]["hooks"][0]["command"])
+        self.assertEqual(len(hooks["Stop"][0]["hooks"]), 2)
+        self.assertIn("undertone.voice_guard", hooks["Stop"][0]["hooks"][0]["command"])
+        for event, hook in (("Stop", "stop"), ("StopFailure", "stopfailure"), ("PermissionRequest", "permissionrequest")):
+            handler = hooks[event][0]["hooks"][-1]
+            self.assertIs(handler["async"], True)
+            self.assertEqual(handler["timeout"], 10)
+            self.assertNotIn("exit 2", handler["command"])
+            self.assertEqual(
+                shlex.split(handler["command"]),
+                ["/py", "-P", "-m", "undertone.announce", hook,
+                 "--home", "/h o/me", "--session", self.TOK],
+            )
+        self.assertEqual(hooks["PermissionRequest"][0]["matcher"], "*")
+        self.assertNotIn("matcher", hooks["StopFailure"][0])
         self.assertEqual(hooks["PreToolUse"][0]["matcher"], "*")
         self.assertTrue(hooks["PreToolUse"][0]["hooks"][0]["command"].endswith("|| exit 2"))
         start = hooks["SessionStart"][0]["hooks"][0]["command"]
@@ -241,7 +258,8 @@ class SessionHelpersTest(CliTestCase):
         self.assertRegex(tok, voice_guard.TOKEN_RE)
         self.assertEqual(envcfg["UNDERTONE_HOME"], self._tmp.name)
         for entries in settings["hooks"].values():
-            self.assertIn(tok, shlex.split(entries[0]["hooks"][0]["command"]))
+            for handler in entries[0]["hooks"]:
+                self.assertIn(tok, shlex.split(handler["command"]))
         self.assertFalse((Path(self._tmp.name) / "channel.mcp.json").exists())
         self.assertEqual(argv[-2:], ["--model", "opus"])
         self.assertNotIn("CLAUDE_CODE_SIMPLE", env)
