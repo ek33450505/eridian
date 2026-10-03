@@ -146,7 +146,7 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 - Wake word: 6/6 detected in 30-min live run, 0 false accepts, 2.3% CPU average
 - STT: median 87 ms (44 ms on synthetic speech)
 - Claude first token: 1.0–2.0 s warm, 2.0–2.5 s on first turn (including spawn)
-- TTS: `say` first audio ~0.54–0.56 s (process startup dominates); Kokoro ~0.05 s + 0.085 s per second of audio (first piece capped at 50 phoneme tokens ≈ 7–8 words, so first audio 0.12–0.30 s; offline check measured 0.29 s, after trimming ~0.4 s of leading silence)
+- TTS: `say` first audio ~0.54–0.56 s (process startup dominates); Kokoro ~0.05 s + 0.085 s per second of audio (first piece capped at 32 phoneme tokens ≈ 5–6 words, so first audio is 0.12–0.27 s on an idle M4 Max, after trimming ~0.4 s of leading silence; other onnxruntime processes running at the same time slow it down)
 - **End-to-end (speech end → first audio):** `say` ~3.15 s (first token 1.95 s); Kokoro is faster due to lower TTS latency
 
 ### Modules

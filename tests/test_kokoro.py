@@ -200,6 +200,10 @@ class VoiceNameTests(KokoroTestBase):
 
 
 class ModelConstantsTests(unittest.TestCase):
+    def test_first_piece_budget(self):
+        # 32 tokens ~ 0.27 s first audio on an idle M4 Max; 47 took 0.35 s (2026-10-02).
+        self.assertEqual(kokoro.FIRST_PIECE_TOKENS, 32)
+
     def test_uses_fp32_model(self):
         # fp16 produced NaN audio on 2/8 sentences on CPU.
         self.assertEqual(kokoro.MODEL_FILE, "onnx/model.onnx")

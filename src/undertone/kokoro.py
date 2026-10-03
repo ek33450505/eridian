@@ -34,7 +34,8 @@ TOKENIZER_FILE = "tokenizer.json"
 DEFAULT_VOICE = "am_michael"
 VOICE_ENV = "UNDERTONE_KOKORO_VOICE"
 
-FIRST_PIECE_TOKENS = 50
+# ~0.27 s to render on an idle M4 Max with fp32, vs 0.35 s at 47 tokens (measured 2026-10-02).
+FIRST_PIECE_TOKENS = 32
 PIECE_TOKENS = 200
 MAX_TOKENS = 510
 
@@ -191,6 +192,9 @@ def _default_session(model_path: str) -> Any:
     import onnxruntime
 
     onnxruntime.disable_telemetry_events()
+    # Default session options on purpose: disabling intra-op spinning costs ~20% idle and
+    # only helps against competing onnxruntime processes (2 rivals: 0.99 vs 1.29 s), and
+    # undertone is normally the only one.
     try:
         return onnxruntime.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     except Exception as exc:  # noqa: BLE001 - ORT raises InvalidProtobuf etc., not OSError
