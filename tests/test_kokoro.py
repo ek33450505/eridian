@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import os
@@ -253,14 +254,6 @@ class HubTests(unittest.TestCase):
         self.assertIsNone(seen["offline"])
         self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
 
-    def test_model_paths_cache_only(self):
-        hub = mock.Mock(hf_hub_download=mock.Mock(side_effect=lambda r, f, **kw: f"/c/{f}"))
-        with mock.patch.dict(sys.modules, {"huggingface_hub": hub}):
-            paths = kokoro.model_paths("am_michael")
-        self.assertEqual(paths, ("/c/onnx/model.onnx", "/c/tokenizer.json", "/c/voices/am_michael.bin"))
-        for call in hub.hf_hub_download.call_args_list:
-            self.assertEqual(call.kwargs, {"revision": kokoro.MODEL_REVISION, "local_files_only": True})
-
     def test_model_paths_missing(self):
         hub = mock.Mock(hf_hub_download=mock.Mock(side_effect=OSError("nope")))
         with mock.patch.dict(sys.modules, {"huggingface_hub": hub}):
@@ -273,6 +266,104 @@ class HubTests(unittest.TestCase):
             with self.assertRaises(kokoro.KokoroUnavailable):
                 kokoro.model_paths("../x")
         hub.hf_hub_download.assert_not_called()
+
+
+class IntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.files = {
+            "onnx/model.onnx": b"model-bytes",
+            "tokenizer.json": b"{}",
+            "voices/am_michael.bin": b"voice-bytes",
+        }
+        for name, data in self.files.items():
+            path = self.dir / name.replace("/", "_")
+            path.write_bytes(data)
+        sha = lambda b: hashlib.sha256(b).hexdigest()  # noqa: E731
+        for patch in (
+            mock.patch.object(kokoro, "MODEL_SHA256", sha(self.files["onnx/model.onnx"])),
+            mock.patch.object(kokoro, "TOKENIZER_SHA256", sha(self.files["tokenizer.json"])),
+            mock.patch.dict(
+                kokoro.VOICE_SHA256, {"am_michael": sha(self.files["voices/am_michael.bin"])}
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.hub = mock.Mock(
+            hf_hub_download=mock.Mock(
+                side_effect=lambda r, f, **kw: str(self.dir / f.replace("/", "_"))
+            )
+        )
+
+    def paths(self, voice="am_michael"):
+        with mock.patch.dict(sys.modules, {"huggingface_hub": self.hub}):
+            return kokoro.model_paths(voice)
+
+    def test_matching_hashes_return_paths(self):
+        paths = self.paths()
+        self.assertEqual(len(paths), 3)
+        for call in self.hub.hf_hub_download.call_args_list:
+            self.assertEqual(
+                call.kwargs, {"revision": kokoro.MODEL_REVISION, "local_files_only": True}
+            )
+
+    def test_one_byte_change_rejected(self):
+        (self.dir / "tokenizer.json").write_bytes(b"{ }")
+        with self.assertRaisesRegex(kokoro.KokoroUnavailable, "tokenizer.json.*integrity"):
+            self.paths()
+        (self.dir / "tokenizer.json").write_bytes(b"{}")
+        (self.dir / "voices_am_michael.bin").write_bytes(b"voice-byteX")
+        with self.assertRaisesRegex(kokoro.KokoroUnavailable, "am_michael.bin.*integrity"):
+            self.paths()
+
+    def test_unknown_voice_rejected(self):
+        with self.assertRaisesRegex(kokoro.KokoroUnavailable, "unknown"):
+            self.paths("zz_nobody")
+
+
+class RealConstantsTests(unittest.TestCase):
+    def test_voice_pins(self):
+        self.assertEqual(len(kokoro.VOICE_SHA256), 55)
+        self.assertIn("am_michael", kokoro.VOICE_SHA256)
+        for sha in (*kokoro.VOICE_SHA256.values(), kokoro.MODEL_SHA256, kokoro.TOKENIZER_SHA256):
+            self.assertRegex(sha, r"^[0-9a-f]{64}$")
+
+
+class StartupFailureTests(KokoroTestBase):
+    def test_default_session_wraps_ort_errors(self):
+        ort = mock.Mock()
+        ort.InferenceSession.side_effect = RuntimeError("InvalidProtobuf")
+        with mock.patch.dict(sys.modules, {"onnxruntime": ort}):
+            with self.assertRaises(kokoro.KokoroUnavailable):
+                kokoro._default_session("model.onnx")
+
+    def test_warm_up_render_raises(self):
+        v = self.make()
+        self.session.run = mock.Mock(side_effect=RuntimeError("boom"))
+        with self.assertRaisesRegex(kokoro.KokoroUnavailable, "warm-up"):
+            v.warm_up()
+
+    def test_warm_up_none(self):
+        v = self.make(np.zeros(RATE, np.float32))
+        with self.assertRaisesRegex(kokoro.KokoroUnavailable, "warm-up"):
+            v.warm_up()
+
+    def test_bad_vocabs(self):
+        good = make_vocab()
+        bad = [
+            "a string",
+            {**good, "ab": 5},
+            {**good, "x": "7"},
+            {**good, "x": True},
+            {**good, "$": 1},
+            {k: v for k, v in good.items() if k != "$"},
+        ]
+        for vocab in bad:
+            self.tokenizer.write_text(json.dumps({"model": {"vocab": vocab}}))
+            with self.assertRaises(kokoro.KokoroUnavailable, msg=str(vocab)):
+                self.make()
 
 
 @unittest.skipUnless(os.environ.get("UNDERTONE_TEST_REAL_KOKORO") == "1", "real model smoke test")
