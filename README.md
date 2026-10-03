@@ -16,23 +16,28 @@ undertone lets you talk with Claude without typing: microphone → wake word →
 
 ### One-time network actions (the only Hugging Face contact)
 
-- `undertone models fetch` downloads the ~2.5 GB STT model from Hugging Face once. After that, `HF_HUB_OFFLINE=1` is forced at import, so the Hub is never contacted again.
+- `undertone models fetch` downloads the STT model (~2.5 GB) and the Kokoro voice (57 files) from Hugging Face once. After that, `HF_HUB_OFFLINE=1` is forced at import, so the Hub is never contacted again.
 - The optional `training/` Docker image downloads datasets and checkpoints when built or used.
 - Everything else: local or Claude-only.
 
 ### Verify it yourself
 
-**Offline pipeline check:** run `bash scripts/verify-offline.sh`. It generates a "Hey Jarvis. … What is the capital of France?" clip with `say`, then runs wake word → VAD → STT → TTS inside a macOS `sandbox-exec` profile that denies all network access. The check is self-proving: a canary inside the sandbox must fail to connect and resolve, or the check fails.
+**Offline pipeline check:** run `bash scripts/verify-offline.sh`. It generates a "Hey Jarvis. … What is the capital of France?" clip with `say`, then runs wake word → VAD → STT → TTS → Kokoro → self-screen → echo cancellation inside a macOS `sandbox-exec` profile that denies all network access. The check is self-proving: a canary inside the sandbox must fail to connect and resolve, or the check fails.
 
 ```
-[PASS] network canary - TCP and DNS both blocked
-[PASS] clip format - 16 kHz mono 16-bit
-[PASS] wake word - 1 wake event(s)
-[PASS] VAD + STT - heard ['What is the capital of France?'], expected to contain 'capital of france'
-[PASS] TTS exit - say rc=0
-[PASS] TTS output - 102246 bytes
+offline check
+  [PASS] network canary - TCP and DNS both blocked
+  [PASS] clip format - 16 kHz mono 16-bit
+  [PASS] wake word - 1 wake event(s)
+  [PASS] VAD + STT - heard ['What is the capital of France?'], expected to contain 'capital of france'
+  [PASS] TTS exit - say rc=0
+  [PASS] TTS output - 102246 bytes
+  [PASS] Kokoro telemetry off - ORT_DISABLE_TELEMETRY=1
+  [PASS] Kokoro render - 2 pieces, 3.87 s audio, first audio in 0.286 s
+  [PASS] Kokoro self-screen - homophone blocked; ordinary sentence played
+  [PASS] echo cancellation - ERLE 43.9 dB (need >= 20); longest speech-like run 3 chunks (talk-over needs 10); VAD>=0.5 on 3/177 chunks
 RESULT: PASS
-OFFLINE CHECK: PASS (wake, VAD, STT, TTS ran with network denied)
+OFFLINE CHECK: PASS (wake, VAD, STT, TTS, Kokoro, self-screen, echo cancellation ran with network denied)
 ```
 
 (Why not Docker `--network none`? MLX and `say` are macOS-only.)
@@ -59,11 +64,12 @@ Sure, happy to start something new. What do you want to build, and do you have a
 
 ## Quick start
 
-Requirements: macOS on Apple Silicon, `uv`, Claude Code logged in, and microphone permission for your terminal app. For Evan (Enhanced), go to System Settings → Accessibility → Spoken Content → System Voice → Manage Voices → English (US) → Evan.
+Requirements: macOS on Apple Silicon, `uv`, Claude Code logged in, and microphone permission for your terminal app. For Evan (Enhanced), go to System Settings → Accessibility → Spoken Content → System Voice → Manage Voices → English (US) → Evan. For Kokoro, install espeak-ng via Homebrew.
 
 ```bash
+brew install espeak-ng
 uv sync
-uv run undertone models fetch     # one-time ~2.5 GB download
+uv run undertone models fetch     # one-time ~2.5 GB download (STT + Kokoro voice)
 uv run undertone chat             # say "hey jarvis"
 ```
 
@@ -75,11 +81,12 @@ Run `chat` from a project directory, because Claude's file tools are confined to
 
 **Terminal 1:** Run the voice input listener.
 ```bash
-uv run undertone attach [--no-beep] [--no-aec] [--follow-up SECONDS]
+uv run undertone attach [--no-beep] [--no-aec] [--follow-up SECONDS] [--tts {kokoro,say}]
 ```
 - `--follow-up SECONDS`: seconds to keep listening after a reply without the wake word (default 6; 0 disables)
 - `--no-beep`: skip the audible wake/follow-up cues
 - `--no-aec`: play speech with `say` directly (no echo cancellation, no talk-over, wake-word barge-in only); use if AEC misbehaves
+- `--tts {kokoro,say}`: TTS engine (default `kokoro`). Falls back to `say` if espeak-ng is missing or the model isn't fetched.
 - Say "hey jarvis", then your question. It lands in the session, and Claude's `reply` is spoken aloud. The follow-up window opens only after an answer, never after an acknowledgement or a confirmation request.
 - **Echo cancellation on:** talk over a reply to stop it without the wake word. **Echo cancellation off:** say "hey jarvis" to stop a reply.
 
@@ -92,11 +99,12 @@ This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --
 
 ### Standalone voice conversation (Path B)
 
-`undertone chat [--no-beep] [--no-aec] [--resume] [--follow-up SECONDS]`
+`undertone chat [--no-beep] [--no-aec] [--resume] [--follow-up SECONDS] [--tts {kokoro,say}]`
 - `--follow-up SECONDS`: how long after a reply you can ask a follow-up without the wake word (default 6; 0 disables)
 - `--resume`: continue the last chat session (uses the saved session ID)
 - `--no-beep`: no cue sounds (normally Tink on wake, and Pop when the follow-up window opens)
 - `--no-aec`: play speech with `say` directly (no echo cancellation, no talk-over, wake-word barge-in only); use if AEC misbehaves
+- `--tts {kokoro,say}`: TTS engine (default `kokoro`). Falls back to `say` if espeak-ng is missing or the model isn't fetched.
 - Ctrl-C to quit
 - **Echo cancellation on:** talk over a reply to stop it without the wake word. **Echo cancellation off:** say "hey jarvis" to stop a reply.
 
@@ -131,15 +139,15 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 - **STT:** parakeet-mlx `mlx-community/parakeet-tdt-0.6b-v3` (in-memory float32 processing)
 - **Brain:** persistent `claude -p` stream-json subprocess with file tools confined to working directory
 - **Chunker:** splits Claude's reply into sentences
-- **TTS:** each sentence rendered to 16 kHz mono int16 WAV by `say -o` (rendering time ~0.62 s per 4.7 s sentence), then played through the echo canceller for a reference signal. macOS `say` voice is **Evan (Enhanced)** (default); override with `UNDERTONE_VOICE` env var
+- **TTS:** Kokoro-82M (default; phoneme-based, ~0.085 s per second of audio) or macOS `say` (fallback). Kokoro uses espeak-ng for grapheme-to-phoneme, onnxruntime 1.30 for inference. `say` voice is **Evan (Enhanced)**; override with `UNDERTONE_VOICE` env var. Kokoro voice is **am_adam**; override with `UNDERTONE_KOKORO_VOICE`. All TTS output is run through a single scrub (`speaker.prepare_speech`), then played through the echo canceller for a reference signal
 
 ### Measured latencies (M4 Max)
 
 - Wake word: 6/6 detected in 30-min live run, 0 false accepts, 2.3% CPU average
 - STT: median 87 ms (44 ms on synthetic speech)
 - Claude first token: 1.0–2.0 s warm, 2.0–2.5 s on first turn (including spawn)
-- `say` first audio: 0.73 s
-- **End-to-end (speech end → first `say`):** 3.15 s (first token 1.95 s)
+- TTS: `say` first audio ~0.54–0.56 s (process startup dominates); Kokoro ~0.05 s + 0.085 s per second of audio (first piece capped at 32 phoneme tokens ≈ 5–6 words, so first audio is 0.12–0.27 s on an idle M4 Max, after trimming ~0.4 s of leading silence; other onnxruntime processes running at the same time slow it down)
+- **End-to-end (speech end → first audio):** `say` ~3.15 s (first token 1.95 s); Kokoro is faster due to lower TTS latency
 
 ### Modules
 
@@ -147,15 +155,23 @@ The wake detector stays live while Claude thinks or speaks. Saying "hey jarvis" 
 
 ## Safety model for voice
 
+### One scrub, one gate
+
+Every text that undertone speaks goes through `speaker.prepare_speech` before any TTS engine sees it: NUL-strip, NFKC normalize, `spoken.sanitize_for_tts` (wake-word replace, bracket strip, zero-width chars), and a 1000-character cap (`MAX_SPEECH_CHARS`). This is the single place text is cleaned for TTS. Both `say` and Kokoro-82M exit via this scrub.
+
+### Acoustic self-screen (Kokoro only)
+
+Homophones ("hey jarviss", "djarvis", "jarvice") pass the text scrub but fire the wake detector when spoken by Kokoro. `screen.ScreenedSink` wraps the echo-cancellation playback path (AEC on only; `--no-aec` bypasses this): before each speaker chunk plays, a fresh wake detector (cutoff `0.8`; live detector fires at 0.97) runs on the last 2 s of played audio plus lookahead silence. A firing chunk is dropped, with `[skipped speech that sounded like the wake word]`. Calibration: 0/200 ordinary sentences blocked; 67/80 homophone attack clips blocked. Fails closed: any detector error blocks the chunk.
+
 ### Path A: voice into a Claude Code session
 
 Voice turns keep full session power but are unverified input. A hard control (`voice_guard.py`) gates tool calls during spoken turns: before anything destructive, irreversible or outward-facing, Claude must send a `reply` tool with `kind="confirm"` asking the user to speak the wake word, then "confirm <word1> <word2>" with two uncommon nouns. The listener strips the wake word from every transcript, so Claude receives "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. Both words must be at least 3 letters, uncommon, and fresh (not used before in the session); one attempt, valid 300 s. Any other message cancels the challenge. On a successful confirm, gated calls are allowed for the rest of the turn. The confirm flow is enforced by hooks injected into the session; see [`SECURITY.md`](SECURITY.md) §7a for the gating rules and residual risks.
 
-- **Confirm by wake word only:** every utterance carries a `via` field (`wake`, `follow_up`, or `talk_over`). Only a wake-word turn (`via: "wake"`) can satisfy a confirm challenge, preventing a mishearing of ambient audio or undertone's own speech (via echo cancellation imperfection) from bypassing the guard. Talk-over and follow-up turns cannot grant gated calls.
+- **Confirm by wake word only:** every utterance carries a `via` field (`wake`, `wake_barge_in`, `follow_up`, or `talk_over`). Only an exact wake-word turn (`via: "wake"`, detected during silence) can satisfy a confirm challenge. A wake word heard while undertone is speaking, or within 1–10 s after (configurable via `UNDERTONE_SELF_WAKE_GUARD_S`, default 1.0 s), lands as `via: "wake_barge_in"` and cannot grant gated calls—fail-closed. Talk-over and follow-up turns also cannot grant gated calls. This prevents ambient audio, undertone's own speech leaking through echo cancellation imperfection, or Kokoro homophones from bypassing the guard.
 
 - **Talk-over barge-in:** while Claude is speaking, 0.3 s of sustained speech stops the reply without saying the wake word. Your speech becomes your next turn, with 0.5 s of your first words preserved. Exception: a confirm prompt (or a reply of unknown kind) can't be talked over, so you always hear the whole phrase; "hey jarvis" still interrupts it, and you answer with "hey jarvis" plus the phrase. In `chat`, talk-over also interrupts Claude's in-flight turn.
 
-- **Wake word never spoken:** `speaker.build_say_argv()` runs `spoken.sanitize_for_tts()`, which strips invisible characters, removes `[` and `]` (macOS `say` uses `[[…]]` for inline commands), and replaces any utterance of "hey jarvis" or obfuscated forms with "the wake word". Undertone's instructions also tell Claude never to say it.
+- **Confirmation hint:** the new phrase is `[confirmation needed: when I finish, say "hey jarvis" and the phrase]`, clarifying that a silent period before the wake word is required.
 
 ### Path B: standalone `undertone chat`
 
@@ -183,6 +199,9 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | mlx | ML framework; MIT |
 | sounddevice 0.5.6 | Audio I/O; MIT |
 | livekit 1.1.20 | echo cancellation; Apache-2.0 |
+| Kokoro-82M weights | TTS model; Apache-2.0 |
+| onnxruntime 1.30 | ONNX runtime; MIT |
+| espeak-ng | grapheme-to-phoneme for Kokoro; GPL-3.0-or-later (installed separately via Homebrew, run as subprocess) |
 | numpy | Linear algebra; BSD-3-Clause and others |
 | macOS `say` | text-to-speech; part of macOS |
 | Claude Code | Anthropic's terms |
@@ -200,22 +219,26 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 | **D** | documentation: this README, local-first, architecture, training, SECURITY, CHANGELOG, offline check | ✓ done (refreshed at each phase end) |
 | **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
 | **4a** | echo cancellation via livekit AEC + talking over replies without wake word | ✓ done (live-tested 2026-10-02 (MacBook Pro speakers and mic, one room)) |
-| **4b** | Kokoro voice | planned |
+| **4b** | Kokoro voice | ✓ done (live-tested 2026-10-02) |
 | **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
 
 For the full research and component justification: see [`docs/plan.md`](docs/plan.md).
 
 ## Testing
 
-359 unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
+Unit tests run with `uv run python -m unittest discover -s tests`. They use fakes only: no microphone, no speakers, no real `claude`, never `~/.undertone`. Temp directories and stubs isolate each test.
 
-Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word → VAD → STT → TTS inside a `sandbox-exec` profile that denies all network access. Now also covers echo cancellation (ERLE ≥ 20 dB, and no speech-like run on the residual long enough to trigger talk-over). See "Verify it yourself" above.
+Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word → VAD → STT → TTS → Kokoro → self-screen → echo cancellation inside a `sandbox-exec` profile that denies all network access. Covers: network canary, clip format, wake word, VAD + STT, TTS exit/output, Kokoro telemetry off, Kokoro render, Kokoro self-screen, and echo cancellation (ERLE ≥ 20 dB, no speech-like run long enough to trigger talk-over). See "Verify it yourself" above.
 
 ## Environment variables
 
 - `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
 - `UNDERTONE_SESSION` (set by `undertone session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Samantha"`); empty string uses system voice
+- `UNDERTONE_KOKORO_VOICE` — voice name for Kokoro (e.g., `am_michael`, `bm_george`; default `am_adam`)
+- `UNDERTONE_SELF_WAKE_GUARD_S` — window (seconds) after undertone stops speaking during which a wake word is treated as barge-in, not exact wake (default 1.0 s, floor 1.0, cap 10.0; for AirPlay latency, try 3)
+- `UNDERTONE_ESPEAK_CMD` (tests only) — path to espeak-ng or stub
+- `UNDERTONE_TEST_REAL_KOKORO` (tests only) — set to `1` to run real Kokoro smoke tests
 - `UNDERTONE_SAY_CMD` (tests only) — override `say` with a stub
 - `UNDERTONE_CLAUDE_CMD` (tests only) — the binary the safety flags are applied to; `system/init` checks that it actually advertises the restricted tool set, so a wrapper that drops the flags is caught
 

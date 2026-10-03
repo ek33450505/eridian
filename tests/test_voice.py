@@ -20,9 +20,15 @@ import time
 import unittest
 from pathlib import Path
 
-from undertone.listener import VAD_CHUNK_BYTES
+from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
 from undertone.spoken import sanitize_terminal
-from undertone.voice import MAX_CONNECTIONS, MAX_LINE_BYTES, NO_SESSION_SPEECH, VoiceBridge
+from undertone.voice import (
+    MAX_CONNECTIONS,
+    MAX_LINE_BYTES,
+    NO_SESSION_SPEECH,
+    VoiceBridge,
+    self_wake_guard_from_env,
+)
 
 FRAME = bytes(VAD_CHUNK_BYTES)
 
@@ -597,6 +603,18 @@ class TalkOverTest(VoiceTestCase):
         self.assertIn(f'[removed my own words: "{heard}" -> "wait what\'s the time"]', out)
         self.assertIn("you: wait what's the time", out)
 
+    def test_wake_while_speaking_sends_wake_barge_in_via(self) -> None:
+        self._bridge()
+        self.start()
+        channel = self.attach()
+        self._reply(channel, "Still talking here.", kind="answer")
+        self.wake()  # player busy: may be our own voice
+        self.speak("what was that")
+        self.assertEqual(
+            channel.read_line(),
+            {"type": "utterance", "text": "what was that", "via": "wake_barge_in"},
+        )
+
     def test_wake_turn_is_never_echo_filtered(self) -> None:
         self._bridge()
         self.start()
@@ -609,7 +627,7 @@ class TalkOverTest(VoiceTestCase):
             {
                 "type": "utterance",
                 "text": "I finished the refactor and all the tests pass",
-                "via": "wake",
+                "via": "wake_barge_in",
             },
         )
 
@@ -628,6 +646,139 @@ class TalkOverTest(VoiceTestCase):
         self._talk(30)
         self.assertEqual(calls, [])
         self.assertEqual(self.state, "IDLE")
+
+
+class SelfWakeViaTest(unittest.TestCase):
+    """Socket-free: never calls start(); drives process_frame directly."""
+
+    guard_kwargs: dict = {}
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.clock = _FakeClock()
+        self.player = _FakePlayer()
+        self.wake_flag = False
+        self.bridge = VoiceBridge(
+            **self.guard_kwargs,
+            wake_factory=self._wake_factory,
+            vad=lambda chunk: 0.0,
+            stt=lambda audio: "",
+            clock=self.clock,
+            socket_path=Path(tmp.name) / "voice.sock",
+            player_factory=lambda: self.player,
+            out=io.StringIO(),
+        )
+        self.addCleanup(self.bridge.close)
+
+    def _wake_factory(self):
+        def detect(frame: bytes) -> bool:
+            hit, self.wake_flag = self.wake_flag, False
+            return hit
+
+        return detect
+
+    def _frame(self) -> None:
+        self.bridge.process_frame(FRAME)
+
+    def _wake(self) -> None:
+        self.wake_flag = True
+        self._frame()
+
+    def _idle_for(self, seconds: float) -> None:
+        """Player idle: one frame at the busy->idle edge, one at `seconds` later."""
+        self.player.busy = True
+        self._frame()  # records _last_busy at the current time
+        self.player.busy = False
+        self.clock.now += seconds
+
+    def test_wake_while_busy_is_barge_in_and_stops_player(self) -> None:
+        self.player.busy = True
+        self._frame()
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake_barge_in")
+        self.assertEqual(self.player.stops, 1)
+
+    def test_wake_on_first_busy_frame_without_recorded_window(self) -> None:
+        # busy flips True and the wake fires before any frame recorded it
+        self.player.busy = True
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake_barge_in")
+        self.assertEqual(self.player.stops, 1)
+
+    def test_wake_event_while_busy_without_any_frame_is_barge_in(self) -> None:
+        # the live `busy` term alone: no process_frame ever recorded the window
+        self.player.busy = True
+        self.bridge._on_listener_event(ListenerEvent(kind="wake"))
+        self.assertEqual(self.bridge._turn_via, "wake_barge_in")
+
+    def test_wake_shortly_after_speech_is_barge_in(self) -> None:
+        self._idle_for(0.5)
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake_barge_in")
+
+    def test_wake_long_after_speech_is_wake(self) -> None:
+        self._idle_for(1.5)
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake")
+
+    def test_wake_with_player_never_busy_is_wake(self) -> None:
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake")
+        self.assertEqual(self.player.stops, 0)
+
+    def test_guard_boundary(self) -> None:
+        self._idle_for(1.0)
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake_barge_in")
+
+    def test_just_past_guard_boundary(self) -> None:
+        self._idle_for(1.01)
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake")
+
+
+class SelfWakeConfiguredGuardTest(SelfWakeViaTest):
+    guard_kwargs = {"self_wake_guard_s": 3.0}
+
+    # inherited default-window tests do not apply to a 3.0 s window
+    test_wake_long_after_speech_is_wake = None
+    test_just_past_guard_boundary = None
+
+    def test_configured_window_is_honoured(self) -> None:
+        self._idle_for(2.0)
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake_barge_in")
+
+    def test_configured_window_expires(self) -> None:
+        self._idle_for(3.1)
+        self._wake()
+        self.assertEqual(self.bridge._turn_via, "wake")
+
+
+class SelfWakeGuardEnvTest(unittest.TestCase):
+    def _read(self, **env) -> tuple[float, str]:
+        err = io.StringIO()
+        return self_wake_guard_from_env(env, err), err.getvalue()
+
+    def test_unset_and_empty_use_default_silently(self) -> None:
+        self.assertEqual(self._read(), (1.0, ""))
+        self.assertEqual(self._read(UNDERTONE_SELF_WAKE_GUARD_S=""), (1.0, ""))
+
+    def test_valid_values(self) -> None:
+        self.assertEqual(self._read(UNDERTONE_SELF_WAKE_GUARD_S="3"), (3.0, ""))
+        self.assertEqual(self._read(UNDERTONE_SELF_WAKE_GUARD_S="50"), (10.0, ""))
+
+    def test_invalid_or_low_values_fall_back_with_message(self) -> None:
+        for raw in ("0.5", "abc", "nan", "inf", "-1"):
+            value, err = self._read(UNDERTONE_SELF_WAKE_GUARD_S=raw)
+            self.assertEqual(value, 1.0, raw)
+            self.assertEqual(
+                err,
+                f"undertone: ignoring UNDERTONE_SELF_WAKE_GUARD_S={raw!r}; "
+                "using 1.0 (minimum 1.0)\n",
+                raw,
+            )
 
 
 class MultiChannelTest(VoiceTestCase):

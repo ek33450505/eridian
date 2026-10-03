@@ -43,6 +43,44 @@ class NulByteTest(unittest.TestCase):
     def test_only_nul_bytes_yields_none(self) -> None:
         self.assertIsNone(speaker.build_say_argv("\x00\x00"))
 
+    def test_lone_surrogate_is_stripped(self) -> None:
+        argv = speaker.build_say_argv("hello \ud800 world")
+        self.assertIsNotNone(argv)
+        self.assertNotIn("\ud800", argv[-1])
+        argv[-1].encode("utf-8")
+
+    def test_surrogate_cannot_split_wake_word(self) -> None:
+        argv = speaker.build_say_argv("jar\ud800vis")
+        self.assertIsNotNone(argv)
+        self.assertIn("the wake word", argv[-1])
+        self.assertNotIn("jarvis", argv[-1].lower())
+
+    def test_only_surrogates_yields_none(self) -> None:
+        self.assertIsNone(speaker.build_say_argv("\ud800\udfff"))
+
+    def test_fullwidth_brackets_are_stripped(self) -> None:
+        argv = speaker.build_say_argv("\uff3b\uff3binpt PHON\uff3d\uff3dhi")
+        self.assertIsNotNone(argv)
+        for ch in "[]\uff3b\uff3d":
+            self.assertNotIn(ch, argv[-1])
+
+    def test_fullwidth_wake_word_is_scrubbed(self) -> None:
+        argv = speaker.build_say_argv("hey \uff4a\uff41\uff52\uff56\uff49\uff53")
+        self.assertIn("the wake word", argv[-1])
+        self.assertNotIn("jarvis", argv[-1].casefold())
+
+    def test_long_text_is_cut_at_word_boundary(self) -> None:
+        argv = speaker.build_say_argv("word " * 1000)
+        self.assertLessEqual(len(argv[-1]), speaker.MAX_SPEECH_CHARS)
+        self.assertTrue(argv[-1].endswith("word"))
+
+    def test_long_unbroken_text_is_hard_cut(self) -> None:
+        argv = speaker.build_say_argv("x" * 5000)
+        self.assertEqual(len(argv[-1]), speaker.MAX_SPEECH_CHARS)
+
+    def test_whitespace_only_yields_none(self) -> None:
+        self.assertIsNone(speaker.build_say_argv(" \n\t "))
+
 
 class VoiceSelectionTest(unittest.TestCase):
     """Pure argv tests for build_say_argv -- `say` is never run."""

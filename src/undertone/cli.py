@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -21,12 +22,16 @@ _WAKE_CUE = "/System/Library/Sounds/Tink.aiff"
 _FOLLOW_UP_CUE = "/System/Library/Sounds/Pop.aiff"
 
 
-def _make_wake_factory() -> Callable[[], Callable[[bytes], bool]]:
+def _make_wake_factory(
+    *, probability_cutoff: float | None = None
+) -> Callable[[], Callable[[bytes], bool]]:
     # Lazy import: pymicro-wakeword is heavy and only the voice commands need it.
     from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures, Model
 
     def wake_factory():
         mww = MicroWakeWord.from_builtin(Model.HEY_JARVIS)
+        if probability_cutoff is not None:
+            mww.probability_cutoff = probability_cutoff
         feats = MicroWakeWordFeatures()
 
         def detect(frame: bytes) -> bool:
@@ -98,10 +103,12 @@ class AudioIO:
         player_factory: Callable[..., object],
         talk_over: bool,
         engine: object | None = None,
+        voice_label: str = "",
     ) -> None:
         self.player_factory = player_factory
         self.talk_over = talk_over
         self.engine = engine
+        self.voice_label = voice_label
 
     def frames(self):
         if self.engine is not None:
@@ -119,28 +126,90 @@ class AudioIO:
             self.engine.close()
 
 
-def make_audio_io(no_aec: bool, *, engine_factory: Callable[[], object] | None = None) -> AudioIO:
-    """Echo-cancelled full-duplex audio by default; plain mic + `say` with no_aec."""
-    from .player import RenderedSpeechQueue, SpeechQueue
+def _say_voice_label() -> str:
+    return f"say ({os.environ.get('UNDERTONE_VOICE') or 'Evan (Enhanced)'})"
+
+
+def _load_kokoro_voice():
+    from .kokoro import KokoroVoice
+
+    voice = KokoroVoice()
+    voice.warm_up()
+    return voice
+
+
+def make_audio_io(
+    no_aec: bool,
+    *,
+    tts: str = "kokoro",
+    engine_factory: Callable[[], object] | None = None,
+    screen_factory: Callable[[], Callable[[bytes], bool]] | None = None,
+    kokoro_factory: Callable[[], object] | None = None,
+    err=sys.stderr,
+) -> AudioIO:
+    """Echo-cancelled full-duplex audio by default; plain mic + `say` with no_aec.
+
+    On the AEC path the voice is Kokoro unless tts == "say" or Kokoro is
+    unavailable (then it falls back to `say` with one line on `err`).
+    """
+    from .player import KokoroRenderer, RenderedSpeechQueue, SayRenderer, SpeechQueue
+    from .screen import SCREEN_CUTOFF, ScreenedSink
 
     if no_aec:
         return AudioIO(
-            player_factory=lambda on_start=None: SpeechQueue(on_start), talk_over=False
+            player_factory=lambda on_start=None: SpeechQueue(on_start),
+            talk_over=False,
+            voice_label=_say_voice_label(),
         )
+
+    voice = None
+    if tts == "kokoro":
+        from .kokoro import KokoroUnavailable
+
+        try:
+            espeak = os.environ.get("UNDERTONE_ESPEAK_CMD", "espeak-ng")
+            if shutil.which(espeak) is None:
+                raise KokoroUnavailable("espeak-ng not found; install it with `brew install espeak-ng`")
+            voice = (kokoro_factory or _load_kokoro_voice)()
+        except KokoroUnavailable as exc:
+            print(f"undertone: Kokoro voice unavailable ({exc}); using say", file=err, flush=True)
+
     if engine_factory is None:
         from .duplex import DuplexAudio as engine_factory
     engine = engine_factory()
+
+    def on_blocked() -> None:
+        print("[skipped speech that sounded like the wake word]", file=sys.stderr, flush=True)
+
+    def on_error(exc: BaseException) -> None:
+        print(
+            f"undertone: the wake-word screen failed ({exc}); speech stays muted until restart",
+            file=err,
+            flush=True,
+        )
+
+    sink = ScreenedSink(
+        engine,
+        detector_factory=screen_factory or _make_wake_factory(probability_cutoff=SCREEN_CUTOFF),
+        on_blocked=on_blocked,
+        on_error=on_error,
+    )
     return AudioIO(
-        player_factory=lambda on_start=None: RenderedSpeechQueue(on_start, sink=engine),
+        player_factory=lambda on_start=None: RenderedSpeechQueue(
+            on_start, sink=sink, renderer=KokoroRenderer(voice) if voice else SayRenderer()
+        ),
         talk_over=True,
         engine=engine,
+        voice_label=f"Kokoro ({voice.voice})" if voice else _say_voice_label(),
     )
 
 
 def banner_line(io: AudioIO) -> str:
     if io.talk_over:
-        return "Echo cancellation on: talk over a reply to stop it."
-    return "Echo cancellation off: say 'hey jarvis' to stop a reply."
+        line = "Echo cancellation on: talk over a reply to stop it."
+    else:
+        line = "Echo cancellation off: say 'hey jarvis' to stop a reply."
+    return f"{line} Voice: {io.voice_label}."
 
 
 AUDIO_START_ERROR = (
@@ -217,7 +286,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     cues = {"wake": _WAKE_CUE, "follow_up": _FOLLOW_UP_CUE}
 
-    io = make_audio_io(args.no_aec)
+    io = make_audio_io(args.no_aec, tts=args.tts)
     session = ChatSession(
         wake_factory=_make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -404,17 +473,24 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     from . import voice
 
     return voice.run_attach(
-        no_beep=args.no_beep, follow_up_s=args.follow_up, no_aec=args.no_aec
+        no_beep=args.no_beep, follow_up_s=args.follow_up, no_aec=args.no_aec, tts=args.tts
     )
 
 
 def _cmd_models_fetch(args: argparse.Namespace) -> int:
     del args
-    from .stt import MODEL_ID, fetch_model
+    from . import kokoro, stt
 
-    print(f"undertone: fetching {MODEL_ID} (contacts the Hugging Face Hub)...")
-    fetch_model()
-    print("undertone: model cached")
+    print(f"undertone: fetching {stt.MODEL_ID} (contacts the Hugging Face Hub)...")
+    stt.fetch_model()
+    print(
+        "undertone: fetching onnx-community/Kokoro-82M-v1.0-ONNX (Kokoro voice, "
+        "about 330 MB; contacts the Hugging Face Hub)..."
+    )
+    kokoro.fetch_model()
+    print("undertone: models cached")
+    if shutil.which("espeak-ng") is None:
+        print("undertone: the Kokoro voice also needs espeak-ng: brew install espeak-ng")
     return 0
 
 
@@ -453,6 +529,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="play speech with `say` directly; no echo cancellation, so only the "
         "wake word interrupts a reply (use if AEC misbehaves)",
     )
+    chat_parser.add_argument(
+        "--tts",
+        choices=["kokoro", "say"],
+        default="kokoro",
+        help="voice engine: kokoro (default; needs `undertone models fetch` and "
+        "espeak-ng) or the macOS say voice",
+    )
     chat_parser.set_defaults(func=_cmd_chat)
 
     sub.add_parser(
@@ -485,12 +568,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="play speech with `say` directly; no echo cancellation, so only the "
         "wake word interrupts a reply (use if AEC misbehaves)",
     )
+    attach_parser.add_argument(
+        "--tts",
+        choices=["kokoro", "say"],
+        default="kokoro",
+        help="voice engine: kokoro (default; needs `undertone models fetch` and "
+        "espeak-ng) or the macOS say voice",
+    )
     attach_parser.set_defaults(func=_cmd_attach)
 
     models_parser = sub.add_parser("models", help="manage local speech models")
     models_sub = models_parser.add_subparsers(dest="models_command", required=True)
     models_sub.add_parser(
-        "fetch", help="download the Parakeet STT model once (needs network)"
+        "fetch", help="download the speech models once (needs network)"
     ).set_defaults(func=_cmd_models_fetch)
 
     return parser

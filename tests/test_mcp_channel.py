@@ -380,6 +380,9 @@ class VoiceBridgeTest(ChannelTestCase):
     def test_follow_up_turn_cannot_confirm(self) -> None:
         self._assert_cannot_confirm(via="follow_up")
 
+    def test_wake_barge_in_turn_cannot_confirm(self) -> None:
+        self._assert_cannot_confirm(via="wake_barge_in")
+
     def test_missing_via_cannot_confirm(self) -> None:
         self._assert_cannot_confirm()
 

@@ -327,21 +327,45 @@ class FakeEngine:
 class MakeAudioIoTest(unittest.TestCase):
     def test_aec_on_builds_rendered_queue_on_the_engine(self) -> None:
         from undertone.player import RenderedSpeechQueue
+        from undertone.screen import ScreenedSink
 
         engine = FakeEngine()
-        io_ = cli.make_audio_io(False, engine_factory=lambda: engine)
+        io_ = cli.make_audio_io(
+            False,
+            tts="say",
+            engine_factory=lambda: engine,
+            screen_factory=lambda: (lambda frame: False),
+        )
         queues = [io_.player_factory(), io_.player_factory(lambda text: None)]
         try:
             for q in queues:
                 self.assertIsInstance(q, RenderedSpeechQueue)
-                self.assertIs(q._sink, engine)
+                self.assertIsInstance(q._sink, ScreenedSink)
+                self.assertIs(q._sink._inner, engine)
         finally:
             for q in queues:
                 q.close()
 
+    def test_wake_factory_applies_probability_cutoff(self) -> None:
+        mww = mock.MagicMock()
+        fake_mod = mock.MagicMock()
+        fake_mod.MicroWakeWord.from_builtin.return_value = mww
+        with mock.patch.dict(sys.modules, {"pymicro_wakeword": fake_mod}):
+            cli._make_wake_factory(probability_cutoff=0.8)()
+            self.assertEqual(mww.probability_cutoff, 0.8)
+            mww2 = mock.MagicMock(probability_cutoff=0.97)
+            fake_mod.MicroWakeWord.from_builtin.return_value = mww2
+            cli._make_wake_factory()()
+            self.assertEqual(mww2.probability_cutoff, 0.97)
+
     def test_aec_on_talk_over_and_engine_delegation(self) -> None:
         engine = FakeEngine()
-        io_ = cli.make_audio_io(False, engine_factory=lambda: engine)
+        io_ = cli.make_audio_io(
+            False,
+            tts="say",
+            engine_factory=lambda: engine,
+            screen_factory=lambda: (lambda frame: False),
+        )
         self.assertTrue(io_.talk_over)
         self.assertIs(io_.engine, engine)
         io_.start()
@@ -350,6 +374,7 @@ class MakeAudioIoTest(unittest.TestCase):
         io_.close()
         self.assertTrue(engine.closed)
         self.assertIn("on", cli.banner_line(io_))
+        self.assertIn("Voice: say (", cli.banner_line(io_))
 
     def test_no_aec_uses_say_queue_without_engine(self) -> None:
         from undertone.player import SpeechQueue
@@ -375,6 +400,149 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertTrue(parser.parse_args(["attach", "--no-aec"]).no_aec)
         self.assertFalse(parser.parse_args(["chat"]).no_aec)
         self.assertFalse(parser.parse_args(["attach"]).no_aec)
+
+    def _kokoro_io(self, *, factory, which="/usr/bin/espeak-ng", err=None, **kw):
+        err = err if err is not None else io.StringIO()
+        kw.setdefault("screen_factory", lambda: (lambda frame: False))
+        with mock.patch.object(cli.shutil, "which", return_value=which):
+            return cli.make_audio_io(
+                False,
+                engine_factory=FakeEngine,
+                kokoro_factory=factory,
+                err=err,
+                **kw,
+            )
+
+    def test_kokoro_path_shares_one_voice_across_players(self) -> None:
+        from undertone.player import KokoroRenderer
+
+        voice = mock.Mock(voice="am_michael")
+        factory = mock.Mock(return_value=voice)
+        err = io.StringIO()
+        io_ = self._kokoro_io(factory=factory, err=err)
+        queues = [io_.player_factory(), io_.player_factory(lambda text: None)]
+        try:
+            for q in queues:
+                self.assertIsInstance(q._renderer, KokoroRenderer)
+                self.assertIs(q._renderer._voice, voice)
+        finally:
+            for q in queues:
+                q.close()
+        factory.assert_called_once_with()
+        self.assertEqual(io_.voice_label, "Kokoro (am_michael)")
+        self.assertIn("Voice: Kokoro (am_michael).", cli.banner_line(io_))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_kokoro_unavailable_falls_back_to_say_with_one_line(self) -> None:
+        from undertone.kokoro import KokoroUnavailable
+        from undertone.player import SayRenderer
+
+        err = io.StringIO()
+        io_ = self._kokoro_io(factory=mock.Mock(side_effect=KokoroUnavailable("x")), err=err)
+        q = io_.player_factory()
+        try:
+            self.assertIsInstance(q._renderer, SayRenderer)
+        finally:
+            q.close()
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("using say", lines[0])
+        self.assertTrue(io_.voice_label.startswith("say ("))
+
+    def test_missing_espeak_falls_back_without_loading_the_voice(self) -> None:
+        from undertone.player import SayRenderer
+
+        factory = mock.Mock()
+        err = io.StringIO()
+        io_ = self._kokoro_io(factory=factory, which=None, err=err)
+        q = io_.player_factory()
+        try:
+            self.assertIsInstance(q._renderer, SayRenderer)
+        finally:
+            q.close()
+        factory.assert_not_called()
+        self.assertIn("brew install espeak-ng", err.getvalue())
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+
+    def test_screen_failure_prints_one_distinct_line(self) -> None:
+        def broken_screen():
+            raise RuntimeError("detector down")
+
+        err = io.StringIO()
+        io_ = self._kokoro_io(factory=mock.Mock(), tts="say", err=err, screen_factory=broken_screen)
+        q = io_.player_factory()
+        try:
+            self.assertFalse(q._sink.play(b"\x00\x00" * 160))
+            self.assertFalse(q._sink.play(b"\x00\x00" * 160))
+        finally:
+            q.close()
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("wake-word screen failed (detector down)", lines[0])
+        self.assertIn("muted until restart", lines[0])
+
+    def test_tts_say_never_loads_kokoro(self) -> None:
+        factory = mock.Mock()
+        io_ = self._kokoro_io(factory=factory, tts="say")
+        factory.assert_not_called()
+        self.assertTrue(io_.voice_label.startswith("say ("))
+
+    def test_no_aec_keeps_say_queue_even_with_kokoro_tts(self) -> None:
+        from undertone.player import SpeechQueue
+
+        factory = mock.Mock()
+        io_ = cli.make_audio_io(True, tts="kokoro", kokoro_factory=factory)
+        q = io_.player_factory()
+        try:
+            self.assertIsInstance(q, SpeechQueue)
+        finally:
+            q.close()
+        factory.assert_not_called()
+        self.assertTrue(io_.voice_label.startswith("say ("))
+        self.assertIn("Voice: say (", cli.banner_line(io_))
+
+    def test_voice_label_honors_undertone_voice(self) -> None:
+        with mock.patch.dict(os.environ, {"UNDERTONE_VOICE": "Samantha"}):
+            io_ = cli.make_audio_io(True)
+        self.assertEqual(io_.voice_label, "say (Samantha)")
+
+    def test_parser_tts_option(self) -> None:
+        parser = cli.build_parser()
+        for cmd in ("chat", "attach"):
+            self.assertEqual(parser.parse_args([cmd]).tts, "kokoro")
+            self.assertEqual(parser.parse_args([cmd, "--tts", "say"]).tts, "say")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parser.parse_args([cmd, "--tts", "foo"])
+
+    def test_models_fetch_calls_both_fetchers_in_order(self) -> None:
+        from undertone import kokoro, stt
+
+        calls: list[str] = []
+        out = io.StringIO()
+        with (
+            mock.patch.object(stt, "fetch_model", lambda: calls.append("stt")),
+            mock.patch.object(kokoro, "fetch_model", lambda: calls.append("kokoro")),
+            mock.patch.object(cli.shutil, "which", return_value=None),
+            contextlib.redirect_stdout(out),
+        ):
+            rc = cli._cmd_models_fetch(mock.Mock())
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["stt", "kokoro"])
+        self.assertIn("models cached", out.getvalue())
+        self.assertIn("brew install espeak-ng", out.getvalue())
+
+    def test_models_fetch_omits_espeak_hint_when_installed(self) -> None:
+        from undertone import kokoro, stt
+
+        out = io.StringIO()
+        with (
+            mock.patch.object(stt, "fetch_model"),
+            mock.patch.object(kokoro, "fetch_model"),
+            mock.patch.object(cli.shutil, "which", return_value="/x/espeak-ng"),
+            contextlib.redirect_stdout(out),
+        ):
+            cli._cmd_models_fetch(mock.Mock())
+        self.assertNotIn("espeak", out.getvalue())
 
 
 if __name__ == "__main__":
