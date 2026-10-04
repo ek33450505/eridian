@@ -550,5 +550,127 @@ class ReadBackTest(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+class SafePhraseTest(unittest.TestCase):
+    """Socket-free: safe-phrase mode instructions, confirm replies and utterance redaction."""
+
+    PHRASE = "copper maple"
+    CONFIRM = "I will delete scratch.txt. Shall I?"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="ut")
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.token = secrets.token_hex(16)
+        voice_guard.record_armed(self.home, self.token)
+
+    def make(self, phrase: bool) -> mcp_channel.ChannelServer:
+        if phrase:
+            voice_guard.set_safe_phrase(self.home, self.PHRASE)
+        self.stdout = io.StringIO()
+        server = mcp_channel.ChannelServer(
+            stdin=io.StringIO(),
+            stdout=self.stdout,
+            socket_path=self.home / "none.sock",
+            session_token=self.token,
+            undertone_home=self.home,
+        )
+        self.sent: list[dict] = []
+        server._send_voice = lambda obj: self.sent.append(obj) or True
+        return server
+
+    def last(self) -> dict:
+        return json.loads(self.stdout.getvalue().strip().splitlines()[-1])
+
+    def initialize(self, server: mcp_channel.ChannelServer) -> str:
+        server._handle_initialize(1, {})
+        return self.last()["result"]["instructions"]
+
+    def confirm(self, server: mcp_channel.ChannelServer, text: str) -> dict:
+        server._handle_tool_call(2, {"name": "reply", "arguments": {"text": text, "kind": "confirm"}})
+        return self.last()["result"]
+
+    def utter(self, server: mcp_channel.ChannelServer, text: str, via: str = "wake") -> None:
+        raw = json.dumps({"type": "utterance", "text": text, "via": via}).encode()
+        server._handle_voice_line(raw)
+
+    def test_safe_phrase_instructions(self) -> None:
+        text = self.initialize(self.make(True))
+        for name in voice_guard.READ_ONLY_MCP_TOOLS:
+            self.assertIn(name, text)
+        self.assertNotIn("<word1>", text)
+        self.assertNotIn("Never reuse a phrase", text)
+        self.assertIn("then their safe phrase", text)
+        self.assertIn('contains "[safe phrase]"', text)
+        self.assertIn("never guess it, say it, spell it", text)
+        self.assertNotIn("copper", text)
+        self.assertIn("Before your confirm prompt is spoken", text)
+        self.assertNotIn("After a confirm reply", text)
+
+    def test_two_word_instructions_list_tools(self) -> None:
+        text = self.initialize(self.make(False))
+        self.assertEqual(text, mcp_channel.INSTRUCTIONS)
+        self.assertIn("confirm <word1> <word2>", text)
+        self.assertNotIn("safe phrase", text)
+        for name in voice_guard.READ_ONLY_MCP_TOOLS:
+            self.assertIn(name, text)
+        self.assertIn("Before your confirm prompt is spoken", text)
+
+    def test_mode_needs_a_token(self) -> None:
+        voice_guard.set_safe_phrase(self.home, self.PHRASE)
+        server = mcp_channel.ChannelServer(
+            stdin=io.StringIO(), stdout=io.StringIO(), socket_path=self.home / "none.sock",
+            undertone_home=self.home,
+        )
+        server._handle_initialize(1, {})
+        self.assertFalse(server._safe_phrase)
+
+    def test_safe_phrase_confirm_needs_no_phrase_in_text(self) -> None:
+        server = self.make(True)
+        self.initialize(server)
+        result = self.confirm(server, self.CONFIRM)
+        self.assertNotIn("isError", result)
+        self.assertEqual(
+            voice_guard.load_state(self.home, self.token)["challenge"]["phrase"],
+            voice_guard.SAFE_PHRASE_MARKER,
+        )
+        text = result["content"][0]["text"]
+        self.assertTrue(text.startswith("Spoken aloud. undertone will accept only the user's safe phrase."))
+        self.assertIn("undertone also read back, in its own voice, before your words: ", text)
+        self.assertIn(self.sent[0]["check"], text)
+
+    def test_two_word_confirm_without_phrase_still_fails(self) -> None:
+        server = self.make(False)
+        self.initialize(server)
+        result = self.confirm(server, self.CONFIRM)
+        self.assertTrue(result["isError"])
+        self.assertEqual(self.sent, [])
+
+    def test_two_word_confirm_result_wording(self) -> None:
+        server = self.make(False)
+        self.initialize(server)
+        result = self.confirm(server, "To delete x, say the wake word, then 'confirm walnut lantern'.")
+        text = result["content"][0]["text"]
+        self.assertIn("undertone will accept only 'confirm walnut lantern'.", text)
+        self.assertIn("undertone also read back, in its own voice, before your words: ", text)
+
+    def test_utterance_is_redacted_and_still_grants(self) -> None:
+        server = self.make(True)
+        self.initialize(server)
+        self.confirm(server, self.CONFIRM)
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.utter(server, "Copper maple.")
+        pushed = self.last()
+        self.assertEqual(pushed["method"], "notifications/claude/channel")
+        self.assertEqual(pushed["params"]["content"], "[safe phrase].")
+        self.assertNotIn("copper", self.stdout.getvalue().lower())
+        self.assertIsNotNone(voice_guard.load_state(self.home, self.token)["grant"])
+
+    def test_no_phrase_configured_pushes_unchanged(self) -> None:
+        server = self.make(False)
+        self.utter(server, "Copper maple.")
+        self.assertEqual(self.last()["params"]["content"], "Copper maple.")
+
+
 if __name__ == "__main__":
     unittest.main()
