@@ -33,7 +33,10 @@ Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
     normal permission prompts still apply.
 
 State lives in <home>/sessions/<token>.json (0600, dir 0700), updated under an
-flock. The log, <home>/logs/guard.log, never holds command or prompt text.
+flock. The log, <home>/logs/guard.log, never holds command or prompt text. The state
+file also keeps a short spoken summary of up to 3 blocked calls for the confirm
+read-back: tool kinds, program and file names, location classes, and never an
+argument value.
 
 Imports stay light on purpose: the hook starts a fresh interpreter per tool
 call, so this module must not pull in undertone.paths or anything heavy.
@@ -43,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import ipaddress
 import json
 import math
 import os
@@ -51,6 +55,7 @@ import shlex
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -62,6 +67,10 @@ MAX_USED = 200
 MAX_STATE_BYTES = 64 * 1024
 MAX_AGENTS = 100
 MAX_AGENT_ID = 128
+MAX_BLOCKED = 3
+MAX_WHAT_CHARS = 160
+MAX_BLOCKED_MORE = 1_000_000
+NOTHING_BLOCKED = "undertone has not blocked anything yet."
 _NO_AGENT: Any = object()  # payload had no agent_id key: the main thread
 
 STOPWORDS = frozenset({
@@ -81,6 +90,16 @@ UNGATED_TOOLS = frozenset({
     "Read", "Grep", "Glob", "LS", "WebSearch", "TodoWrite", "Task", "Agent",
     "AskUserQuestion", "ToolSearch", "Skill", "EnterPlanMode", "ExitPlanMode",
     "BashOutput", "TaskOutput", "mcp__undertone__reply",
+})
+
+# Exact MCP tool names that run ungated on a voice turn. They live in code, not a
+# config file, because a typed turn could edit a config file to widen the voice
+# gate. Each one is vetted read-only: cast-record opens cast.db with mode=ro and
+# exposes no SQL tool (claude-agent-team scripts/cast-mcp-server.py, 2026-10-03).
+READ_ONLY_MCP_TOOLS = frozenset({
+    "mcp__cast-record__cast_decisions", "mcp__cast-record__cast_incidents",
+    "mcp__cast-record__cast_cost", "mcp__cast-record__cast_sessions",
+    "mcp__cast-record__cast_ask",
 })
 
 PLAIN_READ = frozenset({
@@ -177,6 +196,8 @@ def _default_state() -> dict[str, Any]:
         "grant": None,
         "used_phrases": [],
         "agents": {},
+        "blocked": [],
+        "blocked_more": 0,
     }
 
 
@@ -229,6 +250,18 @@ def _validate(raw: Any) -> dict[str, Any]:
         clean[agent_id] = {"voice": rec["voice"], "granted_at": rec.get("granted_at"),
                            "started_at": rec["started_at"]}
     state["agents"] = clean
+    blocked = raw.get("blocked", [])
+    if not isinstance(blocked, list) or len(blocked) > MAX_BLOCKED:
+        raise GuardError("state field blocked has the wrong type")
+    for entry in blocked:
+        if not (isinstance(entry, dict) and _is_num(entry.get("at"))
+                and isinstance(entry.get("what"), str) and 0 < len(entry["what"]) <= MAX_WHAT_CHARS):
+            raise GuardError("state field blocked has the wrong type")
+    state["blocked"] = [{"at": e["at"], "what": e["what"]} for e in blocked]
+    more = raw.get("blocked_more", 0)
+    if not isinstance(more, int) or isinstance(more, bool) or not 0 <= more <= MAX_BLOCKED_MORE:
+        raise GuardError("state field blocked_more has the wrong type")
+    state["blocked_more"] = more
     return state
 
 
@@ -374,6 +407,8 @@ def record_voice(
         )
         state["grant"] = {"at": stamp} if granted else None
         state["challenge"] = None  # one attempt per challenge
+        state["blocked"] = []  # a new utterance starts fresh
+        state["blocked_more"] = 0
         return granted
 
     return _update(home, token, fn)
@@ -416,6 +451,8 @@ def record_typed(home: Any, token: str, *, now: float | None = None) -> None:
         state["typed_at"] = stamp
         state["grant"] = None
         state["challenge"] = None
+        state["blocked"] = []
+        state["blocked_more"] = 0
         for rec in state["agents"].values():
             rec["granted_at"] = None  # a typed "stop" revokes inherited grants
 
@@ -627,7 +664,7 @@ def bash_gate_reason(command: str) -> str | None:
 
 def gate_reason(tool_name: str, tool_input: Any) -> str | None:
     """None when the tool call is ungated, else a short log reason (never command text)."""
-    if tool_name in UNGATED_TOOLS:
+    if tool_name in UNGATED_TOOLS or tool_name in READ_ONLY_MCP_TOOLS:
         return None
     if tool_name == "Bash":
         if not isinstance(tool_input, dict) or not isinstance(tool_input.get("command"), str):
@@ -635,6 +672,430 @@ def gate_reason(tool_name: str, tool_input: Any) -> str | None:
         reason = bash_gate_reason(tool_input["command"])
         return None if reason is None else f"Bash:{reason}"
     return tool_name
+
+
+# -- spoken summary of a blocked call ---------------------------------------
+
+
+def _cut(text: str, limit: int) -> str:
+    """Cut at a word boundary to at most `limit` chars."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    if text[limit] != " " and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.strip(" ,")
+
+
+def _speakable(text: str, limit: int = MAX_WHAT_CHARS) -> str:
+    words = (w.strip(".") for w in re.sub(r"[^A-Za-z0-9.]+", " ", text).split())
+    return _cut(" ".join(w for w in words if w), limit)
+
+
+_LONG_NAME = "a long name"
+_UNREADABLE_BASH = "a shell command undertone could not read"
+_COMPLEX_MARKERS = ("`", "$(", "<(", ">(", "<<")
+_SCRIPT_COMPLEX_CHARS = ";&|\n`<>()${}"
+_SUBCOMMAND_PROGRAMS = frozenset({
+    "git", "npm", "pnpm", "yarn", "uv", "cargo", "go", "make", "just", "brew", "pip",
+    "pip3", "docker", "kubectl", "gh",
+})
+_WRAPPER_VALUE_FLAGS = {
+    "sudo": frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-R", "-r", "-t", "-T", "-U"}),
+    "env": frozenset({"-u", "-C", "-S"}),
+    "xargs": frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"}),
+    "nohup": frozenset(),
+    "time": frozenset({"-f", "-o"}),
+    "nice": frozenset({"-n"}),
+    "exec": frozenset({"-a"}),
+    "command": frozenset(),
+    "builtin": frozenset(),
+    "timeout": frozenset({"-s", "-k"}),
+    "watch": frozenset({"-n", "-d"}),
+    "caffeinate": frozenset({"-t", "-w"}),
+}
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
+_SHELL_C_FLAG_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*", re.ASCII)
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_REDIRECT_OUT = frozenset({">", ">>", "&>", "&>>", ">|", "<>"})
+_APPEND_REDIRECTS = frozenset({">>", "&>>"})
+_FD_DUP_RE = re.compile(r"[0-9]+-?|-", re.ASCII)
+_MAX_FLAG_WORDS = 3
+_MAX_FLAG_CHARS = 10
+_MAX_REDIRECT_PHRASES = 2
+_MAX_WRAPPER_DEPTH = 3
+_Segment = tuple[list[str], list[tuple[bool, str]]]  # (program and args, (append?, target) redirects)
+
+
+def _name(raw: str) -> str:
+    """A short name safe to speak: at most 2 words and 20 chars, else a fixed phrase."""
+    text = _speakable(raw, 200)
+    if text and len(text.split()) <= 2 and len(text) <= 20:
+        return text
+    return _LONG_NAME
+
+
+def _under(path: str, base: str) -> bool:
+    return (path.rstrip("/") + "/").startswith(base.rstrip("/") + "/")
+
+
+def _loc(path: str, cwd: str | None) -> str:
+    """Class a path as a location; string work only, no filesystem access."""
+    if "$" in path or "`" in path:
+        return "somewhere unknown"
+    home = os.path.normpath(os.path.expanduser("~"))
+    full = os.path.expanduser(path) if path.startswith("~") else path
+    if full.startswith("~"):
+        return "somewhere unknown"
+    if not os.path.isabs(full):
+        if not cwd:
+            return "at a relative path"
+        full = os.path.join(cwd, full)
+    full = re.sub(r"^/+", "/", os.path.normpath(full))
+    base = re.sub(r"^/+", "/", os.path.normpath(cwd)) if cwd else None
+    # A project that is the home folder (or contains it) would hide the home class.
+    if base is not None and _under(full, base) and not _under(home, base):
+        first = os.path.relpath(full, base).split("/")[0]
+        if first in (".git", ".claude", ".mcp.json"):
+            return "in the project git or Claude settings"
+        return "in this project"
+    if _under(full, home):
+        first = os.path.relpath(full, home).split("/")[0]
+        if first.startswith(".") and first != ".":
+            return "in your home settings files"
+        return "in your home folder"
+    return "outside your home folder"
+
+
+def _file_phrase(path: Any, cwd: str | None) -> str:
+    """`named <name> <class>` for a path, or "" when there is none."""
+    if not isinstance(path, str) or not path.strip():
+        return ""
+    return f"named {_name(os.path.basename(path.rstrip('/')))} {_loc(path, cwd)}"
+
+
+def _is_path_like(arg: str) -> bool:
+    return arg == "*" or "/" in arg or arg.startswith(("~", "."))
+
+
+_REMOTE_HOST_RE = re.compile(r"(?:[A-Za-z0-9._-]+@)?([A-Za-z0-9.-]+):", re.ASCII)
+_BARE_USER_HOST_RE = re.compile(r"[A-Za-z0-9._-]+@([A-Za-z0-9.-]+)", re.ASCII)
+
+
+def _url_class(value: str) -> str:
+    """`to <host class>` for a URL, or `to a web address` when it has no readable host."""
+    try:
+        host = urllib.parse.urlsplit(value).hostname
+    except ValueError:
+        host = None
+    return f"to {_host_class(host)}" if host else "to a web address"
+
+
+def _remote_class(arg: str) -> str:
+    """`to a remote computer <host class>` for `[user@]host:...` or `user@host`, else ""."""
+    match = _REMOTE_HOST_RE.match(arg) or _BARE_USER_HOST_RE.fullmatch(arg)
+    if match and ("." in match.group(1) or _is_ip(match.group(1))):
+        return f"to a remote computer {_host_class(match.group(1))}"
+    return ""
+
+
+def _arg_clauses(args: list[str], cwd: str | None, detail: bool) -> str:
+    """Flags (a few short ones), the location classes touched, and a flag for the rest.
+
+    Never speaks a plain argument or a flag's value.
+    """
+    if not args:
+        return ""
+    if not detail:
+        return " with arguments"
+    flags: list[str] = []
+    classes: list[str] = []
+    other = False
+    for arg in args:
+        cls = ""
+        if arg.startswith("-"):
+            word = _speakable(arg)
+            if len(flags) < _MAX_FLAG_WORDS and word and " " not in word and len(word) <= _MAX_FLAG_CHARS:
+                flags.append(word)
+            else:
+                other = True
+            value = arg.partition("=")[2]
+            if "=" in arg and "://" in value:
+                cls = _url_class(value)
+        elif "://" in arg:
+            cls = _url_class(arg)
+        elif _remote_class(arg):
+            cls = _remote_class(arg)
+        elif _is_path_like(arg):
+            cls = "on everything" if arg == "*" else f"on files {_loc(arg, cwd)}"
+        else:
+            other = True
+        if cls and cls not in classes:
+            classes.append(cls)
+    text = "".join(f" {f}" for f in flags) + "".join(f" {c}" for c in classes)
+    return text + (" with other arguments" if other else "")
+
+
+def _wrapped_command(prog: str, args: list[str]) -> list[str]:
+    """The words after a wrapper's own flags (and env assignments, timeout duration)."""
+    value_flags = _WRAPPER_VALUE_FLAGS[prog]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-") and len(arg) > 1:
+            i += 2 if arg in value_flags else 1
+        elif prog == "env" and _ENV_ASSIGN_RE.match(arg):
+            i += 1
+        else:
+            break
+    rest = args[i:]
+    if prog == "timeout" and rest:
+        rest = rest[1:]  # the duration
+    return rest
+
+
+def _script_label(script: str) -> str:
+    """The program a `sh -c` script runs, or `a script` when it is more than one plain command."""
+    if any(ch in script for ch in _SCRIPT_COMPLEX_CHARS):
+        return "a script"
+    try:
+        words = shlex.split(script)
+    except ValueError:
+        return "a script"
+    while words and _ENV_ASSIGN_RE.match(words[0]):
+        words = words[1:]
+    if not words:
+        return "a script"
+    label, rest = _resolve(words, False, 1)
+    return f"{label} with other arguments" if rest else label
+
+
+def _resolve(words: list[str], with_sub: bool, depth: int = 0) -> tuple[str, list[str]]:
+    """Name what a command runs (program, subcommand, wrapped program); also return the
+    arguments left over to describe."""
+    prog = os.path.basename(words[0])
+    args = words[1:]
+    if "$" in words[0]:
+        return "a program chosen at run time", []
+    name = _name(prog)
+    if prog in _WRAPPER_VALUE_FLAGS:
+        if depth >= _MAX_WRAPPER_DEPTH:
+            return f"{name} wrapping other commands", []
+        inner = _wrapped_command(prog, args)
+        if not inner:
+            return name, []
+        label, rest = _resolve(inner, with_sub, depth + 1)
+        return f"{name} {label}", rest
+    if prog in _SHELLS:
+        for j, arg in enumerate(args):
+            if not arg.startswith("-"):
+                break
+            if _SHELL_C_FLAG_RE.fullmatch(arg):
+                script = args[j + 1] if j + 1 < len(args) else ""
+                return f"{name} running {_script_label(script)}", []
+        return name, args
+    if prog == "find":
+        for j, arg in enumerate(args):
+            if arg == "-delete":
+                return f"{name} delete", args[:j] + args[j + 1:]
+            if arg in _FIND_EXEC:
+                tail = args[j + 1:]
+                label = f"{name} exec" + (f" {_resolve(tail, False, depth + 1)[0]}" if tail else "")
+                return label, args[:j] + (["tail"] if len(tail) > 1 else [])
+    if with_sub and prog in _SUBCOMMAND_PROGRAMS:
+        for j, arg in enumerate(args):
+            if not arg.startswith("-") and not _is_path_like(arg):
+                return f"{name} {_name(arg)}", args[:j] + args[j + 1:]
+    return name, args
+
+
+def _command_phrase(words: list[str], cwd: str | None, detail: bool, with_sub: bool) -> str:
+    label, args = _resolve(words, with_sub)
+    return label + _arg_clauses(args, cwd, detail)
+
+
+def _redirect_words(redirects: list[tuple[bool, str]], cwd: str | None, with_target: bool) -> str:
+    if not redirects:
+        return ""
+    if not with_target:
+        return " with a redirect"
+    text = ""
+    for append, target in redirects[:_MAX_REDIRECT_PHRASES]:
+        verb = "appending to" if append else "overwriting"
+        text += f" {verb} a file {_file_phrase(target, cwd) or 'named a long name somewhere unknown'}"
+    if len(redirects) > _MAX_REDIRECT_PHRASES:
+        text += " and other redirects"
+    return text
+
+
+def _bash_segments(command: str) -> list[_Segment]:
+    """Split into (program + args, output redirects) segments. Raises ValueError."""
+    lex = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""  # bash treats `a#` as a word, not a comment
+    tokens = list(lex)
+    segments: list[_Segment] = [([], [])]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        nxt_is_word = nxt is not None and not set(nxt) <= _OPERATOR_CHARS
+        if set(tok) <= _SEPARATOR_CHARS:
+            segments.append(([], []))
+        elif tok.isdigit() and nxt is not None and set(nxt) <= _OPERATOR_CHARS and set(nxt) & set("<>"):
+            pass  # an fd number in front of a redirect, such as the 2 in 2>&1
+        elif tok in _REDIRECT_OUT or (tok == ">&" and nxt_is_word and not _FD_DUP_RE.fullmatch(nxt)):
+            if nxt_is_word:
+                if nxt != "/dev/null":
+                    segments[-1][1].append((tok in _APPEND_REDIRECTS, nxt))
+                i += 1
+        elif set(tok) <= _OPERATOR_CHARS:
+            if tok in ("<", "<&", ">&") and nxt_is_word:
+                i += 1  # an input file or fd dup: not shown
+        else:
+            segments[-1][0].append(tok)
+        i += 1
+    out = []
+    for words, redirects in segments:
+        while words and _ENV_ASSIGN_RE.match(words[0]):
+            words = words[1:]
+        if not words and redirects:
+            words = ["redirect"]
+        if words:
+            out.append((words, redirects))
+    return out
+
+
+def _bash_words(command: str, cwd: str | None = None) -> str:
+    """Fixed vocabulary plus capped names; never an argument value. Vague is fine, but
+    never omit a program that runs, a redirect, or the fact that more was left out."""
+    try:
+        segments = _bash_segments(command)
+    except ValueError:
+        return _UNREADABLE_BASH
+    if not segments:
+        return _UNREADABLE_BASH
+    if any(marker in command for marker in _COMPLEX_MARKERS):
+        return f"a complex shell command starting with {_name(os.path.basename(segments[0][0][0]))}"
+    total = len(segments)
+    shown = segments[:3]
+    n_more = total - 3
+    more = f", and {n_more} more command{'s' if n_more > 1 else ''}" if n_more > 0 else ""
+    prefix = "the shell command " if total == 1 else "the shell commands "
+    for detail, with_sub, with_target in (
+        (True, True, True), (False, True, True), (False, True, False), (False, False, False),
+    ):
+        parts = [
+            _command_phrase(words, cwd, detail, with_sub) + _redirect_words(redirects, cwd, with_target)
+            for words, redirects in shown
+        ]
+        text = prefix + ", then ".join(parts) + more
+        if len(text) <= MAX_WHAT_CHARS:
+            return text
+    first = _resolve(segments[0][0], False)[0]
+    n_rest = total - 1
+    text = f"the shell commands {first} and {n_rest} more command{'s' if n_rest > 1 else ''}"
+    return text + (" with a redirect" if any(r for _, r in segments) else "")
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _host_class(host: str) -> str:
+    labels = host.split(".")
+    if not host.isascii() or any(label.startswith("xn--") for label in labels):
+        return "an international address"
+    if _is_ip(host):
+        return "an IP address"
+    last2 = ".".join(_name(label) for label in labels[-2:])
+    return f"{'a site under ' if len(labels) > 2 else ''}{last2}"
+
+
+def _fetch_words(url: Any) -> str:
+    try:
+        host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) else None
+    except ValueError:
+        host = None
+    if not host:
+        return "fetch a web page"
+    return f"fetch a web page from {_host_class(host)}"
+
+
+def _describe(tool_name: str, tool_input: Any, cwd: str | None) -> str:
+    args = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name == "Bash":
+        command = args.get("command")
+        return _bash_words(command, cwd) if isinstance(command, str) else _UNREADABLE_BASH
+    for names, verb, noun, key in (
+        (("Write",), "write", "file", "file_path"),
+        (("Edit", "MultiEdit"), "edit", "file", "file_path"),
+        (("NotebookEdit",), "edit", "notebook", "notebook_path"),
+    ):
+        if tool_name in names:
+            where = _file_phrase(args.get(key), cwd)
+            return f"{verb} a {noun} {where}" if where else f"{verb} a {noun}"
+    if tool_name == "WebFetch":
+        return _fetch_words(args.get("url"))
+    if tool_name.startswith("mcp__") and tool_name.count("__") >= 2:
+        server, tool = tool_name[5:].split("__", 1)
+        text = f"the {_name(server)} tool {_name(tool)}"
+        if args:
+            text += f" with {len(args)} argument{'s' if len(args) > 1 else ''}"
+        return text
+    return f"the {_name(tool_name)} tool"
+
+
+def describe_call(tool_name: Any, tool_input: Any, cwd: str | None = None) -> str:
+    """A short plain-words phrase for what a call would do; never raises.
+
+    Speaks only fixed vocabulary plus short capped names (programs, files, hosts,
+    tools) and location classes; never an argument value, free text or a message.
+    Output holds only [A-Za-z0-9. ,] and at most MAX_WHAT_CHARS characters.
+    """
+    try:
+        text = _describe(tool_name, tool_input, cwd)
+    except Exception:
+        try:
+            text = f"the {_name(tool_name)} tool"
+        except Exception:
+            text = "a tool call"
+    text = _cut(re.sub(r"[^A-Za-z0-9. ,]", "", text), MAX_WHAT_CHARS)
+    return text if text.strip() else "a tool call"
+
+
+def record_blocked(home: Any, token: str, what: str, *, now: float | None = None) -> None:
+    """Remember a denied call's spoken summary (latest MAX_BLOCKED, deduped); count evictions."""
+    stamp = _now(now)
+
+    def fn(state: dict[str, Any]) -> None:
+        kept = [e for e in state["blocked"] if e["what"] != what]
+        evicted = max(0, len(kept) + 1 - MAX_BLOCKED)
+        state["blocked"] = (kept + [{"at": stamp, "what": what}])[-MAX_BLOCKED:]
+        state["blocked_more"] = min(state["blocked_more"] + evicted, MAX_BLOCKED_MORE)
+
+    _update(home, token, fn)
+
+
+def read_back(home: Any, token: str, *, now: float | None = None) -> str:
+    """Spoken summary of the recently blocked calls, for the confirm request."""
+    stamp = _now(now)
+    state = load_state(home, token)
+    whats = [
+        e["what"] for e in (state["blocked"] if state else [])
+        if 0 <= stamp - e["at"] <= CHALLENGE_TTL_S
+    ]
+    if not whats:
+        return NOTHING_BLOCKED
+    text = "undertone blocked: " + "; and ".join(whats)
+    more = state["blocked_more"]
+    if more:
+        text += f", and {more} more blocked call{'s' if more > 1 else ''}"
+    return text + "."
 
 
 def _agent_tainted(state: dict[str, Any], agent_id: Any) -> bool:
@@ -798,6 +1259,12 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         }
     }))
     stdout.flush()
+    try:
+        cwd = payload.get("cwd")
+        record_blocked(home, token, describe_call(
+            tool_name, tool_input, cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
+    except Exception:
+        _log(home, "pretooluse", "error", tool_name, "record_blocked")
 
 
 _EVENTS = ("sessionstart", "userpromptsubmit", "stop", "subagentstart", "subagentstop", "pretooluse")

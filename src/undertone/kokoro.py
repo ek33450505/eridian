@@ -35,6 +35,11 @@ TOKENIZER_FILE = "tokenizer.json"
 # (am_michael: 2 blocked, 11/11).
 DEFAULT_VOICE = "am_adam"
 VOICE_ENV = "UNDERTONE_KOKORO_VOICE"
+# undertone's own words (confirm read-backs) use a second voice so they sound different
+# from Claude's replies; Claude's text then can't imitate them. af_heart contrasts with
+# am_adam and is American English, so the en-us espeak phonemes fit.
+OWN_VOICE_ENV = "UNDERTONE_KOKORO_OWN_VOICE"
+DEFAULT_OWN_VOICE = "af_heart"
 
 # ~0.27 s to render on an idle M4 Max with fp32, vs 0.35 s at 47 tokens (measured 2026-10-02).
 FIRST_PIECE_TOKENS = 32
@@ -224,6 +229,8 @@ class KokoroVoice:
         paths: tuple[str, str, str] | None = None,
         session_factory: Callable[[str], Any] | None = None,
         resample: Callable[[bytes], bytes] | None = None,
+        own_voice: str | None = None,
+        own_voice_path: str | None = None,
     ) -> None:
         self.voice = _check_voice_name(voice or os.environ.get(VOICE_ENV) or DEFAULT_VOICE)
         model_path, tokenizer_path, voice_path = paths or model_paths(self.voice)
@@ -248,6 +255,21 @@ class KokoroVoice:
             )
         self._vocab: dict[str, int] = vocab
         self._styles = styles.reshape(-1, STYLE_DIM)
+
+        self.own_voice = _check_voice_name(
+            own_voice or os.environ.get(OWN_VOICE_ENV) or DEFAULT_OWN_VOICE
+        )
+        try:
+            own_styles = np.fromfile(
+                own_voice_path or model_paths(self.own_voice)[2], dtype=np.float32
+            )
+        except (OSError, ValueError) as exc:
+            raise KokoroUnavailable(f"undertone: could not load Kokoro assets: {exc}") from exc
+        if own_styles.size == 0 or own_styles.size % STYLE_DIM:
+            raise KokoroUnavailable(
+                f"undertone: Kokoro voice {self.own_voice!r} has an unexpected shape"
+            )
+        self._own_styles = own_styles.reshape(-1, STYLE_DIM)
 
         self._session = (session_factory or _default_session)(model_path)
         self._resample = resample or _default_resample
@@ -310,12 +332,16 @@ class KokoroVoice:
             out.append(cur)
         return out
 
-    def render(self, phonemes: str) -> bytes | None:
-        """Render one piece to 16 kHz int16 PCM, or None if there is nothing safe to play."""
+    def render(self, phonemes: str, *, own: bool = False) -> bytes | None:
+        """Render one piece to 16 kHz int16 PCM, or None if there is nothing safe to play.
+
+        own=True uses undertone's own voice instead of the reply voice.
+        """
         ids = [self._vocab[c] for c in phonemes if c in self._vocab]
         if not ids:
             return None
-        style = self._styles[min(len(ids), len(self._styles)) - 1][None, :]
+        styles = self._own_styles if own else self._styles
+        style = styles[min(len(ids), len(styles)) - 1][None, :]
         feeds = {
             "input_ids": np.array([[0, *ids, 0]], dtype=np.int64),
             "style": style.astype(np.float32),

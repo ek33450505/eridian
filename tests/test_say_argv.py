@@ -33,6 +33,35 @@ class ArgvInjectionTest(unittest.TestCase):
         self.assertEqual(argv, ["say-stub", "--", "-o/tmp/pwned"])
 
 
+class OwnVoiceTest(unittest.TestCase):
+    def test_default_voices_differ(self) -> None:
+        env = {"UNDERTONE_SAY_CMD": "say", "UNDERTONE_VOICE": "Evan", "UNDERTONE_OWN_VOICE": ""}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("UNDERTONE_OWN_VOICE")
+            self.assertEqual(speaker.build_say_argv("hi"), ["say", "-v", "Evan", "--", "hi"])
+            self.assertEqual(
+                speaker.build_say_argv("hi", own=True), ["say", "-v", "Samantha", "--", "hi"]
+            )
+
+    def test_own_env_override(self) -> None:
+        env = {"UNDERTONE_SAY_CMD": "say", "UNDERTONE_OWN_VOICE": "Fred"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(speaker.build_say_argv("hi", own=True)[:3], ["say", "-v", "Fred"])
+
+    def test_own_with_out_path_keeps_flags_before_double_dash(self) -> None:
+        env = {"UNDERTONE_SAY_CMD": "say", "UNDERTONE_OWN_VOICE": "Fred"}
+        with mock.patch.dict(os.environ, env):
+            argv = speaker.build_say_argv("hi", out_path="/p.wav", own=True)
+        self.assertEqual(argv[-2:], ["--", "hi"])
+        self.assertLess(argv.index("-o"), argv.index("--"))
+
+    def test_flag_injection_text_stays_after_double_dash_when_own(self) -> None:
+        env = {"UNDERTONE_SAY_CMD": "say-stub", "UNDERTONE_OWN_VOICE": ""}
+        with mock.patch.dict(os.environ, env):
+            argv = speaker.build_say_argv("-o/tmp/pwned", own=True)
+        self.assertEqual(argv, ["say-stub", "--", "-o/tmp/pwned"])
+
+
 class NulByteTest(unittest.TestCase):
     def test_nul_byte_is_stripped(self) -> None:
         argv = speaker.build_say_argv("hel\x00lo")

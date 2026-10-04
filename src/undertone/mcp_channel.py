@@ -19,7 +19,9 @@ Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
                     or unknown `via` cannot -- fail closed. "wake_barge_in" is a
                     wake heard while/just after the voice spoke, possibly its own
                     echo: it opens a turn but never grants)
-  channel -> voice  {"type":"reply","text":"...","kind":"ack|answer|confirm"}
+  channel -> voice  {"type":"reply","text":"...","kind":"ack|answer|confirm"[,"check":"..."]}
+                    (`check`, confirm only: what the voice guard blocked, spoken in
+                    undertone's own voice after the reply)
   voice -> channel  {"type":"detached"}  (a newer session won; stop retrying)
 
 Test seams: ChannelServer takes its stdin/stdout streams, socket path and
@@ -64,10 +66,11 @@ INSTRUCTIONS = (
     "word\" -- your own speech can retrigger the wake detector. "
     'Set `kind` on every call. kind="ack" is a brief early acknowledgement (for example '
     '"Running the tests now.") when the work will take more than a few seconds. '
-    'kind="answer" is the actual spoken answer and is the default. kind="confirm" comes '
-    "before anything destructive, irreversible or outward-facing requested by voice -- "
+    'kind="answer" is the actual spoken answer and is the default. kind="confirm" is for '
+    "anything destructive, irreversible or outward-facing requested by voice -- "
     "deleting or overwriting files, git commit/push/reset/rebase, installing or removing "
-    "packages, sending messages, or changing remote state: restate the exact action and ask "
+    "packages, sending messages, or changing remote state: make the tool call first; undertone's "
+    'voice guard refuses it; then send kind="confirm", restating the exact action and asking '
     'the user to say the wake word, then "confirm <word1> <word2>" (for example "To delete '
     "scratch.txt, say the wake word, then 'confirm walnut lantern'.\"), where the two words are "
     "uncommon-but-easy-to-pronounce nouns (for example \"copper maple\") you pick fresh each "
@@ -78,11 +81,12 @@ INSTRUCTIONS = (
     '"confirm velvet harbor". Proceed ONLY if the next voice message contains "confirm" '
     'followed immediately by the two words as consecutive words. '
     "undertone enforces this in code: during a voice turn it refuses file edits, web fetches, "
-    "other MCP tools and any shell command that is not read-only or a test run, until the user "
+    "MCP tools other than a few read-only ones, and any shell command that is not read-only or a test run, until the user "
     "speaks the exact phrase from your latest confirm reply, so a confirm reply's text must "
     'contain "confirm <word1> <word2>". '
     'If a tool call is refused by "undertone voice guard", ask for confirmation with '
     'kind="confirm"; never try another tool or command to get around it. '
+    "After a confirm reply, undertone reads back, in its own voice, what it blocked. "
     "During a voice turn, run shell commands in their plainest form -- no redirects to files, "
     "no $ variables such as $?, no globs -- and read the exit code from the tool result; plain "
     "read-only commands and test runs need no confirmation. "
@@ -120,6 +124,7 @@ REPLY_TOOL: dict[str, Any] = {
 }
 
 _NOT_CONNECTED = "Not spoken: no `undertone attach` voice process is connected."
+READ_BACK_UNAVAILABLE = "undertone could not read back what it blocked."
 
 
 def _open_log() -> int:
@@ -356,12 +361,23 @@ class ChannelServer:
             except (voice_guard.GuardError, OSError):
                 fail("Not spoken: undertone could not record the confirmation request; try again.")
                 return
-        if not self._send_voice({"type": "reply", "text": text, "kind": kind}):
+        reply: dict[str, Any] = {"type": "reply", "text": text, "kind": kind}
+        check = None
+        if phrase is not None:
+            try:
+                check = voice_guard.read_back(self._home, self._token)
+            except (voice_guard.GuardError, OSError):
+                check = READ_BACK_UNAVAILABLE
+            reply["check"] = check
+        if not self._send_voice(reply):
             fail(_NOT_CONNECTED)
             return
         spoken = "Spoken aloud."
         if phrase is not None:
-            spoken = f"Spoken aloud. undertone will accept only 'confirm {phrase}'."
+            spoken = (
+                f"Spoken aloud. undertone will accept only 'confirm {phrase}'. "
+                f"Then undertone read back, in its own voice: {check}"
+            )
         self._result(req_id, {"content": [{"type": "text", "text": spoken}]})
 
     def _handle_message(self, msg: Any) -> None:

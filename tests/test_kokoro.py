@@ -52,13 +52,18 @@ class KokoroTestBase(unittest.TestCase):
         rows = np.arange(510, dtype=np.float32)[:, None] * np.ones((1, 256), np.float32)
         rows.tofile(self.voice_file)
         self.paths = ("model.onnx", str(self.tokenizer), str(self.voice_file))
+        # Distinguishable from the reply voice: every style value is 1000 higher.
+        self.own_file = d / "own.bin"
+        (rows + 1000).tofile(self.own_file)
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop(kokoro.VOICE_ENV, None)
+        os.environ.pop(kokoro.OWN_VOICE_ENV, None)
 
     def make(self, waveform=None, resample=lambda b: b, **kw):
         self.session = FakeSession(waveform)
+        kw.setdefault("own_voice_path", str(self.own_file))
         return kokoro.KokoroVoice(
             paths=self.paths, session_factory=lambda _p: self.session, resample=resample, **kw
         )
@@ -114,7 +119,9 @@ class RenderTests(KokoroTestBase):
 
     def test_real_resampler_length(self):
         v = kokoro.KokoroVoice(
-            paths=self.paths, session_factory=lambda _p: FakeSession(tone_clip())
+            paths=self.paths,
+            session_factory=lambda _p: FakeSession(tone_clip()),
+            own_voice_path=str(self.own_file),
         )
         out = v.render("ab.")
         n24 = int((0.02 + 0.2 + 0.05 + 0.25) * RATE) * 2
@@ -125,6 +132,65 @@ class RenderTests(KokoroTestBase):
         v = self.make()
         v.warm_up()
         self.assertEqual(len(self.session.calls), 1)
+
+
+class OwnVoiceTests(KokoroTestBase):
+    def style_fed(self, **render_kw):
+        v = self.make()
+        v.render("ab.", **render_kw)
+        return float(self.session.calls[-1]["style"][0][0])
+
+    def test_reply_voice_is_the_default(self):
+        self.assertLess(self.style_fed(), 1000)
+
+    def test_own_styles_used_when_own(self):
+        self.assertGreaterEqual(self.style_fed(own=True), 1000)
+
+    def test_default_own_name(self):
+        self.assertEqual(self.make().own_voice, "af_heart")
+        self.assertEqual(kokoro.DEFAULT_OWN_VOICE, "af_heart")
+
+    def test_env_override(self):
+        os.environ[kokoro.OWN_VOICE_ENV] = "bf_emma"
+        self.assertEqual(self.make().own_voice, "bf_emma")
+        self.assertEqual(self.make(own_voice="bm_lewis").own_voice, "bm_lewis")
+
+    def test_invalid_own_name_raises(self):
+        for bad in ("../x", "AM_michael", "a_b"):
+            with self.assertRaises(kokoro.KokoroUnavailable, msg=bad):
+                self.make(own_voice=bad)
+        os.environ[kokoro.OWN_VOICE_ENV] = "../x"
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.make()
+
+    def test_bad_shape_own_file_raises(self):
+        self.own_file.write_bytes(np.zeros(100, np.float32).tobytes())
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.make()
+        self.own_file.write_bytes(b"")
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.make()
+
+    def test_missing_own_file_raises(self):
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.make(own_voice_path=str(self.own_file) + ".gone")
+
+    def test_absent_path_resolves_via_model_paths(self):
+        with mock.patch.object(
+            kokoro, "model_paths", return_value=("m", "t", str(self.own_file))
+        ) as mp:
+            v = kokoro.KokoroVoice(
+                paths=self.paths, session_factory=lambda _p: FakeSession(), resample=lambda b: b
+            )
+        mp.assert_called_once_with("af_heart")
+        v.render("ab.", own=True)
+
+    def test_model_paths_failure_means_unavailable(self):
+        with mock.patch.object(
+            kokoro, "model_paths", side_effect=kokoro.KokoroUnavailable("not cached")
+        ):
+            with self.assertRaises(kokoro.KokoroUnavailable):
+                kokoro.KokoroVoice(paths=self.paths, session_factory=lambda _p: FakeSession())
 
 
 class PiecesTests(KokoroTestBase):

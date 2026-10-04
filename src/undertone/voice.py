@@ -12,8 +12,10 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
 
     channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"[,"session":"<32 hex>"]}
                                                                     (first line)
-                       {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"}
-                                                                    (any number)
+                       {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"[,"check":"..."]}
+                                                                    (any number; `check` is
+                        honoured on a confirm only: what the voice guard blocked,
+                        spoken in undertone's own voice after Claude's words)
     voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                        (`via` = what opened the turn; the channel lets only "wake"
                         satisfy a confirm phrase)
@@ -128,6 +130,7 @@ ANNOUNCE_REPEAT_S = 3.0  # the same event is not spoken twice within this
 
 _BACKLOG = 32  # above MAX_CONNECTIONS so the cap, not the kernel queue, is the limit
 MAX_CONNECTIONS = 16
+MAX_CHECK_CHARS = 600  # a confirm reply's read-back is ~400 chars at most
 # A wake word heard while we speak, or this long after we stop, is treated as
 # possibly our own voice. The detector fires 50-250 ms after the phrase ends
 # (measured) plus output latency, so a self-wake on a reply's last words can
@@ -143,7 +146,7 @@ _LOCK_TIMEOUT_S = 5.0
 class PlayerLike(Protocol):
     busy: bool
 
-    def enqueue(self, text: str) -> None: ...
+    def enqueue(self, text: str, *, own: bool = False) -> None: ...
     def stop(self) -> None: ...
     def wait_idle(self, timeout: float | None = None) -> bool: ...
     def close(self) -> None: ...
@@ -571,7 +574,15 @@ class VoiceBridge:
             text = msg.get("text")
             if isinstance(text, str):
                 reply_kind = msg.get("kind", "answer")
-                self._on_reply(conn, text, reply_kind if isinstance(reply_kind, str) else "?")
+                reply_kind = reply_kind if isinstance(reply_kind, str) else "?"
+                check = msg.get("check")
+                if not (
+                    reply_kind == "confirm"
+                    and isinstance(check, str)
+                    and 0 < len(check) <= MAX_CHECK_CHARS
+                ):
+                    check = None
+                self._on_reply(conn, text, reply_kind, check)
 
     def _on_announce_line(self, event: object, session: object) -> None:
         """Reader thread: validate and hand off; never speaks or touches the player."""
@@ -608,14 +619,22 @@ class VoiceBridge:
         if was_current and not closed:
             self._print("[detached]\n")
 
-    def _on_reply(self, conn: _Conn, text: str, kind: str = "answer") -> None:
+    def _on_reply(
+        self, conn: _Conn, text: str, kind: str = "answer", check: str | None = None
+    ) -> None:
         with _bounded(self._lock):
             if conn is not self._conn:
                 return  # a replaced / never-hello'd connection has no voice
         self._print(f"claude: {text}\n")
+        if check is not None:
+            self._print(f"undertone: {check}\n")
         with _bounded(self._chunk_lock):
             self._chunker.reset()
             sentences = self._chunker.feed(text) + self._chunker.flush()
+            check_sentences: list[str] = []
+            if check is not None:
+                self._chunker.reset()
+                check_sentences = self._chunker.feed(check) + self._chunker.flush()
         with _bounded(self._lock):
             gen = self._gen
             if kind != "ack":
@@ -625,9 +644,11 @@ class VoiceBridge:
                 self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
             if self._spoken_gen != gen:
                 self._spoken_gen, self._spoken_text = gen, ""
-            self._spoken_text += " ".join(sentences) + " "
+            self._spoken_text += " ".join(sentences + check_sentences) + " "
             for sentence in sentences:
                 self._player.enqueue(sentence)
+            for sentence in check_sentences:
+                self._player.enqueue(sentence, own=True)
         if kind == "confirm":
             self._print('[confirmation needed: when I finish, say "hey jarvis" and the phrase]\n')
         self._speech_q.put((gen, kind))

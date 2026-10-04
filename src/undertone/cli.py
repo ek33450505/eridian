@@ -126,8 +126,26 @@ class AudioIO:
             self.engine.close()
 
 
+def _say_voices() -> tuple[str, str]:
+    """(reply voice, undertone's own voice) for `say`, with the same defaults build_say_argv uses."""
+    return (
+        os.environ.get("UNDERTONE_VOICE") or "Evan (Enhanced)",
+        os.environ.get("UNDERTONE_OWN_VOICE") or "Samantha",
+    )
+
+
 def _say_voice_label() -> str:
-    return f"say ({os.environ.get('UNDERTONE_VOICE') or 'Evan (Enhanced)'})"
+    reply, own = _say_voices()
+    return f"say ({reply}; undertone's own voice: {own})"
+
+
+def _warn_same_own_voice(name: str, err) -> None:
+    print(
+        f"undertone: undertone's own voice is the same as the reply voice ({name}); "
+        "its read-backs will sound like Claude",
+        file=err,
+        flush=True,
+    )
 
 
 def _load_kokoro_voice():
@@ -156,6 +174,9 @@ def make_audio_io(
     from .screen import SCREEN_CUTOFF, ScreenedSink
 
     if no_aec:
+        reply, own = _say_voices()
+        if reply == own:
+            _warn_same_own_voice(reply, err)
         return AudioIO(
             player_factory=lambda on_start=None: SpeechQueue(on_start),
             talk_over=False,
@@ -173,6 +194,14 @@ def make_audio_io(
             voice = (kokoro_factory or _load_kokoro_voice)()
         except KokoroUnavailable as exc:
             print(f"undertone: Kokoro voice unavailable ({exc}); using say", file=err, flush=True)
+
+    if voice is not None:
+        if voice.own_voice == voice.voice:
+            _warn_same_own_voice(voice.voice, err)
+    else:
+        reply, own = _say_voices()
+        if reply == own:
+            _warn_same_own_voice(reply, err)
 
     if engine_factory is None:
         from .duplex import DuplexAudio as engine_factory
@@ -200,7 +229,11 @@ def make_audio_io(
         ),
         talk_over=True,
         engine=engine,
-        voice_label=f"Kokoro ({voice.voice})" if voice else _say_voice_label(),
+        voice_label=(
+            f"Kokoro ({voice.voice}; undertone's own voice: {voice.own_voice})"
+            if voice
+            else _say_voice_label()
+        ),
     )
 
 
