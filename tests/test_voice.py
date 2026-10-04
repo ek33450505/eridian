@@ -19,6 +19,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
 from undertone.spoken import sanitize_terminal
@@ -26,10 +27,12 @@ from undertone.voice import (
     ANNOUNCE_LEVELS,
     ANNOUNCE_REPEAT_S,
     ANNOUNCE_TEMPLATES,
+    MAX_CHECK_CHARS,
     MAX_CONNECTIONS,
     MAX_LINE_BYTES,
     NO_SESSION_SPEECH,
     VoiceBridge,
+    _Conn,
     self_wake_guard_from_env,
 )
 
@@ -58,6 +61,7 @@ class _FakePlayer:
 
     def __init__(self) -> None:
         self.enqueued: list[str] = []
+        self.own_flags: list[bool] = []
         self.stops = 0
         self.busy = False
         self.closed = False
@@ -66,8 +70,9 @@ class _FakePlayer:
         self.idle_returns = 0
         self.stop_sets_idle = True
 
-    def enqueue(self, text: str) -> None:
+    def enqueue(self, text: str, own: bool = False) -> None:
         self.enqueued.append(text)
+        self.own_flags.append(own)
 
     def stop(self) -> None:
         self.stops += 1
@@ -1277,6 +1282,58 @@ class RobustnessTest(VoiceTestCase):
         channel.hello(pid=9)  # the connection is still usable afterwards
         self.assertTrue(_wait_for(lambda: "[attached: session pid 9" in self.out.getvalue()))
         self.assertEqual(self.out.getvalue().count("[attached:"), 1)
+
+
+class ReadBackReplyTest(VoiceTestCase):
+    """Socket-free: the bridge is never started; lines go straight to the handler."""
+
+    CHECK = "This will run: the shell command git reset."
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.conn = _Conn(mock.Mock())
+        self.bridge._conn = self.conn
+
+    def reply(self, **fields) -> None:
+        line = json.dumps({"type": "reply", "text": "Say confirm walnut lantern.", **fields})
+        self.bridge._handle_line(self.conn, line.encode("utf-8"))
+
+    def test_confirm_check_is_spoken_in_own_voice_after_claude(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.assertEqual(self.player.enqueued[-1], self.CHECK)
+        self.assertEqual(self.player.own_flags[-1], True)
+        self.assertEqual(self.player.own_flags[:-1], [False] * (len(self.player.own_flags) - 1))
+        self.assertGreaterEqual(len(self.player.enqueued), 2)
+
+    def test_check_on_answer_or_ack_is_ignored(self) -> None:
+        for kind in ("answer", "ack"):
+            with self.subTest(kind=kind):
+                self.player.enqueued.clear()
+                self.player.own_flags.clear()
+                self.reply(kind=kind, check=self.CHECK)
+                self.assertNotIn(self.CHECK, self.player.enqueued)
+                self.assertNotIn(True, self.player.own_flags)
+                self.assertNotIn("undertone:", self.out.getvalue())
+
+    def test_oversized_or_non_str_check_is_ignored(self) -> None:
+        for bad in ("x" * (MAX_CHECK_CHARS + 1), "", 7, ["a"], None):
+            with self.subTest(check=bad):
+                self.player.own_flags.clear()
+                self.reply(kind="confirm", check=bad)
+                self.assertNotIn(True, self.player.own_flags)
+        self.assertNotIn("undertone:", self.out.getvalue())
+
+    def test_check_is_printed_between_claude_and_confirmation_notice(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        printed = self.out.getvalue()
+        a = printed.index("claude: ")
+        b = printed.index(f"undertone: {self.CHECK}\n")
+        c = printed.index("[confirmation needed")
+        self.assertTrue(a < b < c)
+
+    def test_check_lands_in_echo_filter(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.assertIn(self.CHECK, self.bridge._spoken_text)
 
 
 if __name__ == "__main__":

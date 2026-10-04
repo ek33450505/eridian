@@ -1,5 +1,6 @@
 """Tests for undertone.mcp_channel: JSON-RPC handling and the voice-socket bridge."""
 
+import io
 import json
 import os
 import secrets
@@ -483,6 +484,70 @@ class LogTest(ChannelTestCase):
             time.sleep(0.02)
         self.assertTrue(log.exists())
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+
+class ReadBackTest(unittest.TestCase):
+    """Socket-free: _handle_tool_call is driven directly with a capturing send stub."""
+
+    BLOCKED = "the shell command git reset"
+    CONFIRM = "To reset, say the wake word, then 'confirm walnut lantern'."
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="ut")
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.token = secrets.token_hex(16)
+        voice_guard.record_armed(self.home, self.token)
+        self.stdout = io.StringIO()
+        self.server = mcp_channel.ChannelServer(
+            stdin=io.StringIO(),
+            stdout=self.stdout,
+            socket_path=self.home / "none.sock",
+            session_token=self.token,
+            undertone_home=self.home,
+        )
+        self.sent: list[dict] = []
+        self.server._send_voice = lambda obj: self.sent.append(obj) or True
+
+    def call(self, **arguments) -> dict:
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.server._handle_tool_call(1, {"name": "reply", "arguments": arguments})
+        return json.loads(self.stdout.getvalue())["result"]
+
+    def test_confirm_carries_read_back(self) -> None:
+        voice_guard.record_blocked(self.home, self.token, self.BLOCKED)
+        result = self.call(text=self.CONFIRM, kind="confirm")
+        expected = voice_guard.read_back(self.home, self.token)
+        self.assertIn("git reset", expected)
+        self.assertEqual(self.sent[0]["check"], expected)
+        self.assertEqual(self.sent[0]["kind"], "confirm")
+        text = result["content"][0]["text"]
+        self.assertIn(expected, text)
+        self.assertIn("confirm walnut lantern", text)
+
+    def test_nothing_blocked(self) -> None:
+        self.call(text=self.CONFIRM, kind="confirm")
+        self.assertEqual(self.sent[0]["check"], voice_guard.NOTHING_BLOCKED)
+
+    def test_unreadable_state_falls_back(self) -> None:
+        with mock.patch.object(voice_guard, "read_back", side_effect=voice_guard.GuardError("x")):
+            result = self.call(text=self.CONFIRM, kind="confirm")
+        self.assertEqual(self.sent[0]["check"], mcp_channel.READ_BACK_UNAVAILABLE)
+        self.assertIn(mcp_channel.READ_BACK_UNAVAILABLE, result["content"][0]["text"])
+
+    def test_ack_and_answer_carry_no_check(self) -> None:
+        voice_guard.record_blocked(self.home, self.token, self.BLOCKED)
+        for kind in ("ack", "answer"):
+            self.call(text="Fine.", kind=kind)
+        self.assertEqual(len(self.sent), 2)
+        for obj in self.sent:
+            self.assertNotIn("check", obj)
+
+    def test_bad_confirm_phrase_sends_nothing(self) -> None:
+        result = self.call(text="Shall I reset?", kind="confirm")
+        self.assertTrue(result["isError"])
+        self.assertEqual(self.sent, [])
 
 
 if __name__ == "__main__":
