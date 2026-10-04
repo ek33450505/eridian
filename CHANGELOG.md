@@ -6,7 +6,7 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ### 2026-10-02 — Phase 6: Jarvis speaks first
 
-**Live test: pending.**
+**Live test: passed (Ed, 2026-10-03).**
 
 **Added**
 - `undertone attach` now tells you when Claude finishes or needs you, using fixed spoken templates: "Claude finished." (a turn ended: `Stop`), "Claude needs your permission." (a permission dialog), "Claude has a question for you." (`AskUserQuestion`), "Claude's plan is ready." (`ExitPlanMode`) and "Claude stopped with an error." (a turn ended on an API error: `StopFailure`).

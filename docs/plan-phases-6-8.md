@@ -76,7 +76,7 @@ Design changes from the spike and review: `PermissionRequest` (→ permission / 
 - ✓ 6.1 (`5f0ff15`): announce handling in `voice.py`, `session` in the channel's `hello`, `attach --announce`, tests.
 - ✓ 6.2 (`3a7a6eb`): the `undertone.announce` hook and its wiring in `voice_guard_settings`, tests.
 - 6.3: docs (README, CHANGELOG, SECURITY, architecture, this plan).
-- Live test by Ed: pending.
+- ✓ Live test by Ed: passed 2026-10-03.
 
 ## Phase 7 — menu-bar helper (S2–S3)
 
