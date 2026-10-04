@@ -21,7 +21,13 @@ destructive, but that is a soft control. This module is the hard one:
     it inherited. Only SubagentStart records agents; an agent_id PreToolUse
     cannot find (missed start, eviction, early stop, invalid id) is tainted;
   - while the latest turn was spoken, any tool call outside a read-only
-    allowlist is denied until the user speaks the exact confirm phrase.
+    allowlist is denied until the user speaks the confirm phrase. The confirm is
+    either the user's own fixed safe phrase (if configured; stored only as a
+    salted SHA-256 in <home>/safe_phrase.json, 0600, and never shown to Claude)
+    or, when none is configured, the per-action "confirm <word1> <word2>" Claude
+    picks. A 1-3 word phrase is cheap to brute-force from its hash, so the
+    protection is the 0600 permissions plus the fact that a voice turn cannot
+    run the gated tools it would take to read the file.
 
 Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
   - pretooluse turns every error into exit 2 (block, stderr goes to Claude);
@@ -46,11 +52,14 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import hmac
 import ipaddress
 import json
 import math
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -71,6 +80,13 @@ MAX_BLOCKED = 3
 MAX_WHAT_CHARS = 160
 MAX_BLOCKED_MORE = 1_000_000
 NOTHING_BLOCKED = "undertone has not blocked anything yet."
+SAFE_PHRASE_FILE = "safe_phrase.json"
+SAFE_PHRASE_MARKER = "<safe phrase>"  # challenge phrase in safe-phrase mode; normalize() can never produce it
+REDACTED_PHRASE = "[safe phrase]"
+MAX_SAFE_PHRASE_BYTES = 1024
+SAFE_PHRASE_RESERVED = frozenset({"hey", "jarvis", "confirm"})
+_HEX32_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _NO_AGENT: Any = object()  # payload had no agent_id key: the main thread
 
 STOPWORDS = frozenset({
@@ -363,6 +379,136 @@ def _update(home: Any, token: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
         os.close(lock_fd)
 
 
+# -- safe phrase ----------------------------------------------------------
+
+
+def validate_safe_phrase(phrase: str) -> str:
+    """Return the normalized safe phrase, or raise ValueError with a user-facing message."""
+    norm = normalize(phrase)
+    words = norm.split()
+    if not 1 <= len(words) <= 3:
+        raise ValueError("The safe phrase must be one to three words.")
+    if not all(w.isalpha() for w in words):
+        raise ValueError("The safe phrase must be letters only, no digits.")
+    if not 4 <= len(norm) <= 40:
+        raise ValueError("The safe phrase must be 4 to 40 characters long.")
+    if any(w in SAFE_PHRASE_RESERVED for w in words):
+        raise ValueError("The safe phrase cannot use the words hey, jarvis or confirm.")
+    if all(w in STOPWORDS for w in words):
+        raise ValueError("The safe phrase is too common; use at least one uncommon word.")
+    return norm
+
+
+def _phrase_hash(salt: str, norm: str) -> str:
+    return hashlib.sha256(bytes.fromhex(salt) + norm.encode()).hexdigest()
+
+
+def _safe_phrase_path(home: Any) -> Path:
+    return Path(home) / SAFE_PHRASE_FILE
+
+
+def set_safe_phrase(home: Any, phrase: str) -> None:
+    """Store the salted hash of the safe phrase atomically, 0600, in a 0700 home."""
+    norm = validate_safe_phrase(phrase)
+    salt = secrets.token_hex(16)
+    rec = {"v": 1, "salt": salt, "words": len(norm.split()), "sha256": _phrase_hash(salt, norm)}
+    home_path = Path(home)
+    path = _safe_phrase_path(home)
+    try:
+        if home_path.is_symlink():
+            raise GuardError("home dir is a symlink")
+        home_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(home_path, 0o700)
+        if path.is_symlink():
+            raise GuardError("safe phrase file is a symlink")
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=home_path, prefix=".safe_phrase.", suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, separators=(",", ":"))
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise GuardError(f"cannot write safe phrase: {exc.strerror}") from exc
+
+
+def clear_safe_phrase(home: Any) -> bool:
+    """Remove the safe phrase; True when there was one."""
+    path = _safe_phrase_path(home)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise GuardError(f"cannot remove safe phrase: {exc.strerror}") from exc
+    return True
+
+
+def safe_phrase_configured(home: Any) -> bool:
+    path = _safe_phrase_path(home)
+    return path.is_file() and not path.is_symlink()
+
+
+def _load_safe_phrase(home: Any) -> dict[str, Any] | None:
+    """The validated safe-phrase record, or None for no/malformed config (fail closed)."""
+    try:
+        fd = os.open(_safe_phrase_path(home), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if (st.st_mode & 0o170000) != 0o100000 or st.st_size > MAX_SAFE_PHRASE_BYTES:
+                return None
+            raw = json.loads(fh.read(MAX_SAFE_PHRASE_BYTES + 1))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict) or raw.get("v") != 1:
+        return None
+    salt, words, digest = raw.get("salt"), raw.get("words"), raw.get("sha256")
+    if not (isinstance(salt, str) and _HEX32_RE.fullmatch(salt)
+            and isinstance(digest, str) and _HEX64_RE.fullmatch(digest)
+            and isinstance(words, int) and not isinstance(words, bool) and 1 <= words <= 3):
+        return None
+    return {"salt": salt, "words": words, "sha256": digest}
+
+
+def _phrase_in(norm_words: list[str], rec: dict[str, Any]) -> bool:
+    n = rec["words"]
+    for i in range(len(norm_words) - n + 1):
+        cand = _phrase_hash(rec["salt"], " ".join(norm_words[i:i + n]))
+        if hmac.compare_digest(cand, rec["sha256"]):
+            return True
+    return False
+
+
+def redact_safe_phrase(home: Any, text: str) -> str:
+    """Replace each safe-phrase occurrence in text with [safe phrase]. Never raises; not a gate."""
+    try:
+        rec = _load_safe_phrase(home)
+        if rec is None:
+            return text
+        n = rec["words"]
+        toks = list(re.finditer(r"[A-Za-z0-9]+", text))
+        out: list[str] = []
+        pos = 0
+        i = 0
+        while i < len(toks):
+            if i + n <= len(toks) and _phrase_in([t.group().lower() for t in toks[i:i + n]], rec):
+                out.append(text[pos:toks[i].start()])
+                out.append(REDACTED_PHRASE)
+                pos = toks[i + n - 1].end()
+                i += n
+            else:
+                i += 1
+        out.append(text[pos:])
+        return "".join(out)
+    except Exception:  # noqa: BLE001 - redaction must never break the caller
+        return text
+
+
 # -- transitions ----------------------------------------------------------
 
 
@@ -399,24 +545,42 @@ def record_voice(
     def fn(state: dict[str, Any]) -> bool:
         state["voice_at"] = stamp
         challenge = state["challenge"]
-        granted = bool(
-            can_grant
-            and challenge
-            and stamp - challenge["at"] <= CHALLENGE_TTL_S
-            and f" confirm {challenge['phrase']} " in f" {norm} "
-        )
+        if challenge and challenge["phrase"] == SAFE_PHRASE_MARKER:
+            rec = _load_safe_phrase(home) if can_grant and stamp - challenge["at"] <= CHALLENGE_TTL_S else None
+            words = norm.split()
+            granted = bool(rec and len(words) <= rec["words"] + 2 and _phrase_in(words, rec))
+        else:
+            granted = bool(
+                can_grant
+                and challenge
+                and stamp - challenge["at"] <= CHALLENGE_TTL_S
+                and f" confirm {challenge['phrase']} " in f" {norm} "
+            )
         state["grant"] = {"at": stamp} if granted else None
         state["challenge"] = None  # one attempt per challenge
-        state["blocked"] = []  # a new utterance starts fresh
-        state["blocked_more"] = 0
+        if granted:  # a failed confirm keeps the blocked list so Claude can re-ask meaningfully
+            state["blocked"] = []
+            state["blocked_more"] = 0
         return granted
 
     return _update(home, token, fn)
 
 
-def record_confirm_request(home: Any, token: str, reply_text: str, *, now: float | None = None) -> str:
-    """Arm a challenge from Claude's confirm reply and return its phrase."""
+def record_confirm_request(
+    home: Any, token: str, reply_text: str, *, safe_phrase: bool = False, now: float | None = None
+) -> str:
+    """Arm a challenge from Claude's confirm reply and return its phrase.
+
+    With `safe_phrase` the user's own configured phrase is the challenge: nothing
+    is taken from the reply text and SAFE_PHRASE_MARKER is returned.
+    """
     stamp = _now(now)
+    if safe_phrase:
+        def arm(state: dict[str, Any]) -> str:
+            state["challenge"] = {"phrase": SAFE_PHRASE_MARKER, "at": stamp}
+            return SAFE_PHRASE_MARKER
+
+        return _update(home, token, arm)
     candidates = _CONFIRM_RE.findall(normalize(reply_text))
 
     def fn(state: dict[str, Any]) -> str:

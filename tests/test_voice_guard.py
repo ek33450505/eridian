@@ -1110,11 +1110,19 @@ class BlockedStateTests(GuardTestCase):
         self.assertEqual([e["what"] for e in self.blocked()], ["a", "c", "d"])
 
     def test_cleared_by_voice_and_typed(self):
-        for clear in (lambda: vg.record_voice(self.home, TOKEN, "hello", now=T0 + 1),
-                      lambda: vg.record_typed(self.home, TOKEN, now=T0 + 1)):
+        def granted_voice():
+            vg.record_confirm_request(self.home, TOKEN, "confirm purple walrus", now=T0)
+            vg.record_voice(self.home, TOKEN, "confirm purple walrus", can_grant=True, now=T0 + 1)
+
+        for clear in (granted_voice, lambda: vg.record_typed(self.home, TOKEN, now=T0 + 1)):
             vg.record_blocked(self.home, TOKEN, "a", now=T0)
             clear()
             self.assertEqual(self.blocked(), [])
+
+    def test_kept_by_non_granting_voice(self):
+        vg.record_blocked(self.home, TOKEN, "a", now=T0)
+        vg.record_voice(self.home, TOKEN, "hello", now=T0 + 1)
+        self.assertEqual([e["what"] for e in self.blocked()], ["a"])
 
     def test_survives_stop_and_confirm_request(self):
         vg.record_blocked(self.home, TOKEN, "a", now=T0)
@@ -1146,8 +1154,11 @@ class BlockedStateTests(GuardTestCase):
         self.assertNotIn("more blocked", vg.read_back(self.home, TOKEN, now=T0 + 6))
 
     def test_blocked_more_reset_by_voice_and_typed(self):
-        for clear in (lambda: vg.record_voice(self.home, TOKEN, "hello", now=T0 + 9),
-                      lambda: vg.record_typed(self.home, TOKEN, now=T0 + 9)):
+        def granted_voice():
+            vg.record_confirm_request(self.home, TOKEN, "confirm quartz meadow", now=T0 + 8)
+            vg.record_voice(self.home, TOKEN, "confirm quartz meadow", can_grant=True, now=T0 + 9)
+
+        for clear in (granted_voice, lambda: vg.record_typed(self.home, TOKEN, now=T0 + 9)):
             for i, what in enumerate("abcd"):
                 vg.record_blocked(self.home, TOKEN, what, now=T0 + i)
             clear()
@@ -1206,6 +1217,157 @@ class PretoolBlockedTests(GuardTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn("record_blocked", (Path(self.home) / "logs" / "guard.log").read_text())
+
+
+class SafePhraseTests(GuardTestCase):
+    PHRASE = "Copper Maple"
+
+    def arm_safe(self, now=T0):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertEqual(vg.record_confirm_request(self.home, TOKEN, "ignored", safe_phrase=True, now=now),
+                         vg.SAFE_PHRASE_MARKER)
+
+    def say(self, text, *, can_grant=True, now=T0 + 5):
+        return vg.record_voice(self.home, TOKEN, text, can_grant=can_grant, now=now)
+
+    def test_validate_accepts(self):
+        for phrase, want in (("Copper Maple", "copper maple"), ("walnut", "walnut"),
+                             ("Copper-maple, Pi!", "copper maple pi")):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(vg.validate_safe_phrase(phrase), want)
+
+    def test_validate_rejects(self):
+        for bad in ("", "   ", "a b c d", "abc", "copper maple 42", "x" * 41, "hey copper",
+                    "my jarvis", "confirm maple", "the please", "ok"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                vg.validate_safe_phrase(bad)
+
+    def test_set_load_round_trip_and_perms(self):
+        self.assertFalse(vg.safe_phrase_configured(self.home))
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertTrue(vg.safe_phrase_configured(self.home))
+        path = Path(self.home) / vg.SAFE_PHRASE_FILE
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(Path(self.home).stat().st_mode), 0o700)
+        self.assertNotIn("copper", path.read_text().lower())
+        rec = vg._load_safe_phrase(self.home)
+        self.assertEqual(rec["words"], 2)
+        self.assertTrue(vg._phrase_in(["copper", "maple"], rec))
+        self.assertFalse(vg._phrase_in(["copper", "mapel"], rec))
+        self.assertTrue(vg.clear_safe_phrase(self.home))
+        self.assertFalse(vg.clear_safe_phrase(self.home))
+        self.assertIsNone(vg._load_safe_phrase(self.home))
+
+    def test_set_refuses_symlink(self):
+        target = Path(self.home) / "elsewhere"
+        target.write_text("x")
+        (Path(self.home) / vg.SAFE_PHRASE_FILE).symlink_to(target)
+        self.assertFalse(vg.safe_phrase_configured(self.home))
+        with self.assertRaises(vg.GuardError):
+            vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertEqual(target.read_text(), "x")
+        self.assertIsNone(vg._load_safe_phrase(self.home))
+
+    def test_set_refuses_symlinked_home(self):
+        real = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, real, ignore_errors=True)
+        link = Path(self.home) / "link"
+        link.symlink_to(real)
+        with self.assertRaises(vg.GuardError):
+            vg.set_safe_phrase(link, self.PHRASE)
+
+    def test_malformed_files_load_none(self):
+        path = Path(self.home) / vg.SAFE_PHRASE_FILE
+        good = {"v": 1, "salt": "ab" * 16, "words": 2, "sha256": "cd" * 32}
+        path.write_text(json.dumps(good))
+        self.assertIsNotNone(vg._load_safe_phrase(self.home))
+        bads = ["not json", "[]", json.dumps({**good, "v": 2}), json.dumps({**good, "salt": "zz" * 16}),
+                json.dumps({**good, "sha256": "cd" * 31}), json.dumps({**good, "words": 4}),
+                json.dumps({**good, "words": 0}), json.dumps({**good, "words": True}),
+                json.dumps({**good, "pad": "x" * 2000})]
+        for bad in bads:
+            path.write_text(bad)
+            with self.subTest(bad=bad[:40]):
+                self.assertIsNone(vg._load_safe_phrase(self.home))
+
+    def test_grants(self):
+        for text in ("copper maple", "Confirm, copper maple.", "uh copper maple"):
+            with self.subTest(text=text):
+                self.arm_safe()
+                self.assertTrue(self.say(text))
+                self.assertIsNotNone(vg.load_state(self.home, TOKEN)["grant"])
+
+    def test_no_grant(self):
+        cases = {
+            "too many words": dict(text="the copper maple is open today please now"),
+            "wrong phrase": dict(text="confirm walnut lantern"),
+            "no can_grant": dict(text="copper maple", can_grant=False),
+            "expired": dict(text="copper maple", now=T0 + vg.CHALLENGE_TTL_S + 1),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                self.arm_safe()
+                self.assertFalse(self.say(**kw))
+                state = vg.load_state(self.home, TOKEN)
+                self.assertIsNone(state["grant"])
+                self.assertIsNone(state["challenge"])
+
+    def test_corrupt_file_never_grants(self):
+        self.arm_safe()
+        (Path(self.home) / vg.SAFE_PHRASE_FILE).write_text("garbage")
+        self.assertFalse(self.say("copper maple"))
+
+    def test_safe_arming_skips_used_phrases(self):
+        self.arm_safe()
+        self.assertEqual(vg.load_state(self.home, TOKEN)["used_phrases"], [])
+
+    def test_two_word_mode_unaffected(self):
+        vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+        self.assertTrue(self.say("confirm walnut lantern"))
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        vg.record_confirm_request(self.home, TOKEN, "confirm quartz meadow", now=T0)
+        self.assertFalse(self.say("copper maple"))
+        vg.record_confirm_request(self.home, TOKEN, "confirm copper falcon", now=T0 + 10)
+        self.assertTrue(self.say("confirm copper falcon", now=T0 + 11))
+
+    def test_redaction(self):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        red = lambda t: vg.redact_safe_phrase(self.home, t)  # noqa: E731
+        self.assertEqual(red("Say Copper Maple."), "Say [safe phrase].")
+        self.assertEqual(red("copper, maple and COPPER  MAPLE"), "[safe phrase] and [safe phrase]")
+        self.assertEqual(red("copper mapleleaf"), "copper mapleleaf")
+        self.assertEqual(red("maple copper"), "maple copper")
+        self.assertEqual(red(""), "")
+
+    def test_redaction_no_config_or_error(self):
+        self.assertEqual(vg.redact_safe_phrase(self.home, "Copper Maple"), "Copper Maple")
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        with mock.patch.object(vg, "_phrase_in", side_effect=RuntimeError("boom")):
+            self.assertEqual(vg.redact_safe_phrase(self.home, "Copper Maple"), "Copper Maple")
+        with mock.patch.object(vg, "_load_safe_phrase", side_effect=RuntimeError("boom")):
+            self.assertEqual(vg.redact_safe_phrase(self.home, "Copper Maple"), "Copper Maple")
+
+    def blocked_state(self):
+        vg.record_blocked(self.home, TOKEN, "a shell command", now=T0)
+        return vg.load_state(self.home, TOKEN)["blocked"]
+
+    def test_blocked_kept_on_failed_voice_turn(self):
+        self.arm_safe()
+        self.blocked_state()
+        self.assertFalse(self.say("what was that"))
+        self.assertEqual(len(vg.load_state(self.home, TOKEN)["blocked"]), 1)
+
+    def test_blocked_cleared_on_grant(self):
+        self.arm_safe()
+        self.blocked_state()
+        self.assertTrue(self.say("copper maple"))
+        state = vg.load_state(self.home, TOKEN)
+        self.assertEqual((state["blocked"], state["blocked_more"]), ([], 0))
+
+    def test_blocked_cleared_on_typed(self):
+        self.blocked_state()
+        vg.record_typed(self.home, TOKEN, now=T0 + 1)
+        self.assertEqual(vg.load_state(self.home, TOKEN)["blocked"], [])
 
 
 if __name__ == "__main__":
