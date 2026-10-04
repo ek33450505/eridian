@@ -47,8 +47,75 @@ class RetiredCommandsTest(CliTestCase):
     def test_help_lists_exactly_the_remaining_commands(self) -> None:
         sub = next(a for a in cli.build_parser()._actions if a.dest == "command")
         self.assertEqual(
-            sorted(sub.choices), ["attach", "channel", "chat", "listen", "models", "session"]
+            sorted(sub.choices),
+            ["attach", "channel", "chat", "listen", "models", "safe-phrase", "session"],
         )
+
+
+class SafePhraseCommandTest(CliTestCase):
+    def _safe(self, *argv: str, entries=("copper maple", "copper maple")):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("getpass.getpass", side_effect=list(entries)), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["safe-phrase", *argv])
+        return rc, out.getvalue(), err.getvalue()
+
+    def _file(self) -> Path:
+        return voice_guard._safe_phrase_path(self._tmp.name)
+
+    def test_set_succeeds_without_leaking_phrase(self) -> None:
+        rc, out, err = self._safe()
+        self.assertEqual(rc, 0)
+        self.assertIn("Safe phrase set.", out)
+        self.assertEqual(self._file().stat().st_mode & 0o777, 0o600)
+        self.assertTrue(voice_guard.safe_phrase_configured(self._tmp.name))
+        for word in ("copper", "maple"):
+            self.assertNotIn(word, out + err)
+
+    def test_mismatch_exits_1_and_writes_nothing(self) -> None:
+        rc, _, err = self._safe(entries=("copper maple", "copper birch"))
+        self.assertEqual(rc, 1)
+        self.assertIn("didn't match", err)
+        self.assertFalse(self._file().exists())
+
+    def test_invalid_phrase_exits_2_and_writes_nothing(self) -> None:
+        rc, _, err = self._safe(entries=("hey jarvis",))
+        self.assertEqual(rc, 2)
+        self.assertTrue(err.strip())
+        self.assertFalse(self._file().exists())
+
+    def test_eof_exits_1_and_writes_nothing(self) -> None:
+        for effect in (EOFError, KeyboardInterrupt):
+            with self.subTest(effect=effect.__name__):
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch("getpass.getpass", side_effect=effect), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = cli.main(["safe-phrase"])
+                self.assertEqual(rc, 1)
+                self.assertFalse(self._file().exists())
+
+    def test_clear_with_and_without_phrase(self) -> None:
+        rc, out, _ = self._safe("--clear")
+        self.assertEqual((rc, out.strip()), (0, "No safe phrase was set."))
+        self._safe()
+        rc, out, _ = self._safe("--clear")
+        self.assertEqual(rc, 0)
+        self.assertIn("Safe phrase removed", out)
+        self.assertFalse(self._file().exists())
+
+    def test_status_both_ways(self) -> None:
+        rc, out, _ = self._safe("--status")
+        self.assertEqual(rc, 0)
+        self.assertIn("No safe phrase is set", out)
+        self._safe()
+        rc, out, _ = self._safe("--status")
+        self.assertEqual((rc, out.strip()), (0, "A safe phrase is set."))
+
+    def test_help_lists_subcommand(self) -> None:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            cli.main(["--help"])
+        self.assertIn("safe-phrase", buf.getvalue())
 
 
 class ChatParserTest(unittest.TestCase):
