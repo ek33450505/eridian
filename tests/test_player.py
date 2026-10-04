@@ -108,6 +108,19 @@ class SpeechQueueTest(unittest.TestCase):
         time.sleep(0.2)
         self.assertEqual(self._lines(), ["-- first"])
 
+    def test_own_voice_reaches_build_say_argv_in_order(self) -> None:
+        os.environ["UNDERTONE_VOICE"] = "Evan"
+        os.environ["UNDERTONE_OWN_VOICE"] = "Fred"
+        q = self._queue()
+        q.enqueue("plain")
+        q.enqueue("mine", own=True)
+        q.enqueue("plain again")
+        self.assertTrue(q.wait_idle(5.0))
+        self.assertEqual(
+            self._lines(),
+            ["-v Evan -- plain", "-v Fred -- mine", "-v Evan -- plain again"],
+        )
+
     def test_enqueue_after_stop_plays(self) -> None:
         self._use_sleepy()
         q = self._queue()
@@ -289,6 +302,18 @@ class RenderedSpeechQueueTest(unittest.TestCase):
             time.sleep(0.02)
         return False
 
+    def test_say_renderer_passes_own_voice_to_say(self) -> None:
+        os.environ["UNDERTONE_VOICE"] = "Evan"
+        os.environ["UNDERTONE_OWN_VOICE"] = "Fred"
+        q = self._queue()
+        q.enqueue("plain")
+        q.enqueue("mine", own=True)
+        self.assertTrue(q.wait_idle(5.0))
+        lines = self._log.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("-v Evan "), lines[0])
+        self.assertTrue(lines[1].startswith("-v Fred "), lines[1])
+
     def test_pcm_delivered_in_order_and_equals_fixture(self) -> None:
         other = self._path / "other.wav"
         _write_wav(other, b"\x01\x00" * 50)
@@ -461,19 +486,31 @@ class FakeVoice:
         self._pieces = pieces
         self._pcms = pcms
         self.rendered: list[str] = []
+        self.own_flags: list[bool] = []
 
     def pieces(self, phonemes: str) -> list[str]:
         return list(self._pieces)
 
-    def render(self, piece: str) -> bytes | None:
+    def render(self, piece: str, *, own: bool = False) -> bytes | None:
         self.rendered.append(piece)
+        self.own_flags.append(own)
         return self._pcms[piece]
 
 
 class KokoroRendererTest(unittest.TestCase):
-    def _render(self, voice, wanted=lambda: True, phonemes="ph") -> list[bytes]:
+    def _render(self, voice, wanted=lambda: True, phonemes="ph", **kw) -> list[bytes]:
         with mock.patch.object(speaker, "espeak_phonemes", return_value=phonemes):
-            return list(KokoroRenderer(voice).render("hello", wanted))
+            return list(KokoroRenderer(voice).render("hello", wanted, **kw))
+
+    def test_own_reaches_every_piece_render(self) -> None:
+        voice = FakeVoice(["a", "b"], {"a": b"\x01\x00", "b": b"\x02\x00"})
+        self._render(voice, own=True)
+        self.assertEqual(voice.own_flags, [True, True])
+
+    def test_own_defaults_to_false(self) -> None:
+        voice = FakeVoice(["a", "b"], {"a": b"\x01\x00", "b": b"\x02\x00"})
+        self._render(voice)
+        self.assertEqual(voice.own_flags, [False, False])
 
     def test_yields_per_piece_in_order(self) -> None:
         voice = FakeVoice(["a", "b", "c"], {"a": b"\x01\x00", "b": b"\x02\x00", "c": b"\x03\x00"})
@@ -504,8 +541,10 @@ class StubRenderer:
         self.before_each = before_each
         self.cancels = 0
         self.closed = 0
+        self.calls: list[tuple[str, bool]] = []
 
-    def render(self, text, wanted):
+    def render(self, text, wanted, *, own=False):
+        self.calls.append((text, own))
         for i, pcm in enumerate(self.pieces):
             if self.before_each is not None:
                 self.before_each(i)
@@ -548,6 +587,20 @@ class RenderedSpeechQueueRendererTest(unittest.TestCase):
         q = RenderedSpeechQueue(on_start, sink=sink, renderer=renderer)
         self.queues.append(q)
         return q
+
+    def test_own_reaches_the_renderer_in_order_and_defaults_false(self) -> None:
+        renderer = StubRenderer([b"\x01\x00"])
+        sink = FakeSink()
+        sink.auto_drain = True
+        q = self._queue(sink, renderer)
+        q.enqueue("one")
+        q.enqueue("two", own=True)
+        q.enqueue("three")
+        q.enqueue("four", own=True)
+        self.assertTrue(q.wait_idle(3.0))
+        self.assertEqual(
+            renderer.calls, [("one", False), ("two", True), ("three", False), ("four", True)]
+        )
 
     def test_rejected_piece_is_skipped_and_on_start_fires_once(self) -> None:
         sink = PickySink({1})

@@ -11,6 +11,8 @@ KokoroRenderer synthesizes with a resident Kokoro voice. on_start fires once per
 item, after the first piece the sink accepts (a sink returning False screened
 it out). stop() is there for barge-in.
 
+enqueue(text, own=True) marks undertone's own words; they get its second voice.
+
 Test seams: UNDERTONE_SAY_CMD / UNDERTONE_VOICE (via build_say_argv); tests
 must point UNDERTONE_SAY_CMD at a stub (see tests/test_player.py).
 RenderedSpeechQueue takes its sink and renderer as constructor arguments, so
@@ -55,7 +57,7 @@ class SpeechQueue:
     def __init__(self, on_start: Callable[[str], None] | None = None) -> None:
         self._on_start = on_start
         self._cond = threading.Condition()
-        self._items: collections.deque[str] = collections.deque()
+        self._items: collections.deque[tuple[str, bool]] = collections.deque()
         # stop() bumps the generation; the worker re-checks it under the lock
         # right before spawning, so a stop() landing between dequeue and Popen
         # still prevents that item from playing.
@@ -66,12 +68,12 @@ class SpeechQueue:
         self._thread = threading.Thread(target=self._run, name="undertone-speech", daemon=True)
         self._thread.start()
 
-    def enqueue(self, text: str) -> None:
+    def enqueue(self, text: str, *, own: bool = False) -> None:
         """Play `text` after everything already queued."""
         with self._cond:
             if self._closed:
                 return
-            self._items.append(text)
+            self._items.append((text, own))
             self._cond.notify_all()
 
     def stop(self) -> None:
@@ -114,11 +116,11 @@ class SpeechQueue:
                     self._cond.wait()
                 if self._closed:
                     return
-                text = self._items.popleft()
+                text, own = self._items.popleft()
                 generation = self._generation
                 self._playing = True  # set under the same lock as the pop: no false idle
 
-            proc = self._spawn(text, generation)
+            proc = self._spawn(text, generation, own)
             if proc is not None:
                 if self._on_start is not None:
                     try:
@@ -131,8 +133,8 @@ class SpeechQueue:
                 self._playing = False
                 self._cond.notify_all()
 
-    def _spawn(self, text: str, generation: int) -> subprocess.Popen | None:
-        argv = speaker.build_say_argv(text)
+    def _spawn(self, text: str, generation: int, own: bool = False) -> subprocess.Popen | None:
+        argv = speaker.build_say_argv(text, own=own)
         if argv is None:
             return None
         with self._cond:
@@ -147,7 +149,9 @@ class SpeechQueue:
 
 
 class Renderer(Protocol):
-    def render(self, text: str, wanted: Callable[[], bool]) -> Iterator[bytes]:
+    def render(
+        self, text: str, wanted: Callable[[], bool], *, own: bool = False
+    ) -> Iterator[bytes]:
         """Yield 16 kHz mono int16 PCM pieces for `text`; stop early once not wanted()."""
 
     def cancel(self) -> None:
@@ -167,11 +171,13 @@ class SayRenderer:
         # Private (0700) dir for render files; names are ours, never model text.
         self._dir = tempfile.mkdtemp(prefix="undertone-tts-")
 
-    def render(self, text: str, wanted: Callable[[], bool]) -> Iterator[bytes]:
+    def render(
+        self, text: str, wanted: Callable[[], bool], *, own: bool = False
+    ) -> Iterator[bytes]:
         self._counter += 1  # only the queue's worker thread renders
         path = Path(self._dir) / f"{self._counter}.wav"
         try:
-            argv = speaker.build_say_argv(text, out_path=str(path))
+            argv = speaker.build_say_argv(text, out_path=str(path), own=own)
             if argv is None:
                 return
             with self._lock:
@@ -225,14 +231,16 @@ class KokoroRenderer:
     def __init__(self, voice) -> None:
         self._voice = voice
 
-    def render(self, text: str, wanted: Callable[[], bool]) -> Iterator[bytes]:
+    def render(
+        self, text: str, wanted: Callable[[], bool], *, own: bool = False
+    ) -> Iterator[bytes]:
         phonemes = speaker.espeak_phonemes(text)
         if phonemes is None:
             return
         for piece in self._voice.pieces(phonemes):
             if not wanted():
                 return
-            pcm = self._voice.render(piece)
+            pcm = self._voice.render(piece, own=own)
             if pcm:
                 yield pcm
 
@@ -255,7 +263,7 @@ class RenderedSpeechQueue:
         self._sink = sink
         self._renderer = renderer if renderer is not None else SayRenderer()
         self._cond = threading.Condition()
-        self._items: collections.deque[str] = collections.deque()
+        self._items: collections.deque[tuple[str, bool]] = collections.deque()
         # Same generation scheme as SpeechQueue: stop() bumps it, the renderer
         # checks it (via wanted()) before starting work, and the worker re-checks
         # it under the lock right before handing each PCM to the sink, so a
@@ -266,12 +274,12 @@ class RenderedSpeechQueue:
         self._thread = threading.Thread(target=self._run, name="undertone-render", daemon=True)
         self._thread.start()
 
-    def enqueue(self, text: str) -> None:
+    def enqueue(self, text: str, *, own: bool = False) -> None:
         """Render and play `text` after everything already queued."""
         with self._cond:
             if self._closed:
                 return
-            self._items.append(text)
+            self._items.append((text, own))
             self._cond.notify_all()
 
     def stop(self) -> None:
@@ -315,24 +323,24 @@ class RenderedSpeechQueue:
                     self._cond.wait()
                 if self._closed:
                     return
-                text = self._items.popleft()
+                text, own = self._items.popleft()
                 generation = self._generation
                 self._rendering = True  # set under the same lock as the pop: no false idle
 
             try:
-                self._play_item(text, generation)
+                self._play_item(text, generation, own)
             finally:
                 with self._cond:
                     self._rendering = False
                     self._cond.notify_all()
 
-    def _play_item(self, text: str, generation: int) -> None:
+    def _play_item(self, text: str, generation: int, own: bool = False) -> None:
         def wanted() -> bool:
             return generation == self._generation and not self._closed
 
         started = False
         try:
-            with contextlib.closing(self._renderer.render(text, wanted)) as pieces:
+            with contextlib.closing(self._renderer.render(text, wanted, own=own)) as pieces:
                 for pcm in pieces:
                     with self._cond:
                         if not wanted():
