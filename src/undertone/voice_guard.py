@@ -23,11 +23,14 @@ destructive, but that is a soft control. This module is the hard one:
   - while the latest turn was spoken, any tool call outside a read-only
     allowlist is denied until the user speaks the confirm phrase. The confirm is
     either the user's own fixed safe phrase (if configured; stored only as a
-    salted SHA-256 in <home>/safe_phrase.json, 0600, and never shown to Claude)
+    salted scrypt hash in <home>/safe_phrase.json, 0600, and never shown to Claude)
     or, when none is configured, the per-action "confirm <word1> <word2>" Claude
-    picks. A 1-3 word phrase is cheap to brute-force from its hash, so the
-    protection is the 0600 permissions plus the fact that a voice turn cannot
-    run the gated tools it would take to read the file.
+    picks. The stored hash is scrypt (salted), but a 1-3 word phrase is still
+    guessable offline by anyone holding the file, so the protection is 0600
+    plus keeping the file unreadable: on a voice turn the guard refuses any
+    Read/Grep/Glob/LS/Bash that could touch undertone's home, even after a
+    confirm, and `undertone session` also adds a Claude Code deny rule for
+    Reading the file.
 
 Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
   - pretooluse turns every error into exit 2 (block, stderr goes to Claude);
@@ -84,6 +87,8 @@ SAFE_PHRASE_FILE = "safe_phrase.json"
 SAFE_PHRASE_MARKER = "<safe phrase>"  # challenge phrase in safe-phrase mode; normalize() can never produce it
 REDACTED_PHRASE = "[safe phrase]"
 MAX_SAFE_PHRASE_BYTES = 1024
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
+MAX_REDACT_HASHES = 16  # scrypt calls per redact_safe_phrase; length matches beyond it are redacted unhashed
 SAFE_PHRASE_RESERVED = frozenset({"hey", "jarvis", "confirm"})
 _HEX32_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -100,6 +105,11 @@ DENY_REASON = (
     "\"confirm <word1> <word2>\", and retry only after that exact phrase arrives. "
     "Do not try a different tool or command to get around this. "
     "If the user is at the keyboard, they can type the request once the current voice turn has finished."
+)
+
+HOME_DENY_REASON = (
+    "undertone voice guard: undertone's own state folder can't be read or searched on a voice turn, "
+    "even after a confirm. Tell the user; they can do it by typing."
 )
 
 UNGATED_TOOLS = frozenset({
@@ -396,11 +406,14 @@ def validate_safe_phrase(phrase: str) -> str:
         raise ValueError("The safe phrase cannot use the words hey, jarvis or confirm.")
     if all(w in STOPWORDS for w in words):
         raise ValueError("The safe phrase is too common; use at least one uncommon word.")
+    if len(words) < 2 and len(norm) < 8:
+        raise ValueError("A one-word safe phrase must be at least 8 letters; use two words or a longer one.")
     return norm
 
 
 def _phrase_hash(salt: str, norm: str) -> str:
-    return hashlib.sha256(bytes.fromhex(salt) + norm.encode()).hexdigest()
+    return hashlib.scrypt(
+        norm.encode(), salt=bytes.fromhex(salt), n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32).hex()
 
 
 def _safe_phrase_path(home: Any) -> Path:
@@ -411,7 +424,8 @@ def set_safe_phrase(home: Any, phrase: str) -> None:
     """Store the salted hash of the safe phrase atomically, 0600, in a 0700 home."""
     norm = validate_safe_phrase(phrase)
     salt = secrets.token_hex(16)
-    rec = {"v": 1, "salt": salt, "words": len(norm.split()), "sha256": _phrase_hash(salt, norm)}
+    rec = {"v": 2, "salt": salt, "words": len(norm.split()), "chars": len(norm),
+           "n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P, "hash": _phrase_hash(salt, norm)}
     home_path = Path(home)
     path = _safe_phrase_path(home)
     try:
@@ -455,37 +469,59 @@ def safe_phrase_configured(home: Any) -> bool:
 
 
 def _load_safe_phrase(home: Any) -> dict[str, Any] | None:
-    """The validated safe-phrase record, or None for no/malformed config (fail closed)."""
+    """The validated safe-phrase record, or None for no/malformed/unsafe config (fail closed)."""
     try:
         fd = os.open(_safe_phrase_path(home), os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as fh:
             st = os.fstat(fh.fileno())
             if (st.st_mode & 0o170000) != 0o100000 or st.st_size > MAX_SAFE_PHRASE_BYTES:
                 return None
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                return None
             raw = json.loads(fh.read(MAX_SAFE_PHRASE_BYTES + 1))
     except (OSError, ValueError, RecursionError):
         return None
-    if not isinstance(raw, dict) or raw.get("v") != 1:
+    if not isinstance(raw, dict) or raw.get("v") != 2:
         return None
-    salt, words, digest = raw.get("salt"), raw.get("words"), raw.get("sha256")
+    if not all(_is_int(raw.get(k)) and raw[k] == v for k, v in (("n", SCRYPT_N), ("r", SCRYPT_R), ("p", SCRYPT_P))):
+        return None
+    salt, words, chars, digest = raw.get("salt"), raw.get("words"), raw.get("chars"), raw.get("hash")
     if not (isinstance(salt, str) and _HEX32_RE.fullmatch(salt)
             and isinstance(digest, str) and _HEX64_RE.fullmatch(digest)
-            and isinstance(words, int) and not isinstance(words, bool) and 1 <= words <= 3):
+            and _is_int(words) and 1 <= words <= 3
+            and _is_int(chars) and 4 <= chars <= 40):
         return None
-    return {"salt": salt, "words": words, "sha256": digest}
+    return {"salt": salt, "words": words, "chars": chars, "hash": digest}
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _window_fits(window: list[str], rec: dict[str, Any]) -> bool:
+    """Cheap prefilter: only a window of the right joined length can be the phrase."""
+    return sum(len(w) for w in window) + len(window) - 1 == rec["chars"]
+
+
+def _window_matches(window: list[str], rec: dict[str, Any]) -> bool:
+    return hmac.compare_digest(_phrase_hash(rec["salt"], " ".join(window)), rec["hash"])
 
 
 def _phrase_in(norm_words: list[str], rec: dict[str, Any]) -> bool:
     n = rec["words"]
     for i in range(len(norm_words) - n + 1):
-        cand = _phrase_hash(rec["salt"], " ".join(norm_words[i:i + n]))
-        if hmac.compare_digest(cand, rec["sha256"]):
+        window = norm_words[i:i + n]
+        if _window_fits(window, rec) and _window_matches(window, rec):
             return True
     return False
 
 
 def redact_safe_phrase(home: Any, text: str) -> str:
-    """Replace each safe-phrase occurrence in text with [safe phrase]. Never raises; not a gate."""
+    """Replace each safe-phrase occurrence in text with [safe phrase]. Never raises; not a gate.
+
+    At most MAX_REDACT_HASHES windows are hashed per call; a length match beyond
+    that is redacted unhashed, which over-redacts (the safe direction).
+    """
     try:
         rec = _load_safe_phrase(home)
         if rec is None:
@@ -495,8 +531,17 @@ def redact_safe_phrase(home: Any, text: str) -> str:
         out: list[str] = []
         pos = 0
         i = 0
+        hashed = 0
         while i < len(toks):
-            if i + n <= len(toks) and _phrase_in([t.group().lower() for t in toks[i:i + n]], rec):
+            window = [t.group().lower() for t in toks[i:i + n]]
+            hit = False
+            if len(window) == n and _window_fits(window, rec):
+                if hashed < MAX_REDACT_HASHES:
+                    hashed += 1
+                    hit = _window_matches(window, rec)
+                else:
+                    hit = True
+            if hit:
                 out.append(text[pos:toks[i].start()])
                 out.append(REDACTED_PHRASE)
                 pos = toks[i + n - 1].end()
@@ -1271,20 +1316,77 @@ def _agent_tainted(state: dict[str, Any], agent_id: Any) -> bool:
     return rec is None or rec["voice"]
 
 
+def _abs_path(raw: str, cwd: str | None) -> str | None:
+    """Normalized absolute form of a path string, or None for a relative path with no cwd."""
+    p = os.path.expanduser(raw)
+    if not os.path.isabs(p):
+        if cwd is None:
+            return None
+        p = os.path.join(cwd, p)
+    return os.path.normpath(p)
+
+
+def _path_hits(raw: Any, home: str, cwd: str | None) -> bool:
+    """True when the path is the home, inside it, or an ancestor of it (fail closed on junk)."""
+    if not isinstance(raw, str) or not raw:
+        return True
+    p = _abs_path(raw, cwd)
+    if p is None:
+        return True
+    return p == home or p == "/" or p.startswith(home + "/") or home.startswith(p.rstrip("/") + "/")
+
+
+def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -> bool:
+    """True when the call could read or search undertone's home. String logic only."""
+    home = os.path.normpath(home)
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name in ("Read", "NotebookRead"):
+        return _path_hits(inp.get("file_path" if tool_name == "Read" else "notebook_path"), home, cwd)
+    if tool_name in ("Grep", "Glob", "LS"):
+        path = inp.get("path")
+        if path is None:
+            return cwd is None or _path_hits(cwd, home, cwd)
+        return _path_hits(path, home, cwd)
+    if tool_name != "Bash":
+        return False
+    command = inp.get("command")
+    if not isinstance(command, str):
+        return True
+    if ".undertone" in command or "safe_phrase" in command or home in command:
+        return True
+    if cwd is not None and _path_hits(cwd, home, cwd):
+        return True
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True
+    for tok in tokens:
+        for part in (tok, tok.partition("=")[2]):
+            if part and ("/" in part or part[0] in "~.") and _path_hits(part, home, cwd):
+                return True
+    return False
+
+
 def decide(
     state: dict[str, Any] | None, tool_name: str, tool_input: Any, now: float,
-    agent_id: Any = _NO_AGENT,
+    agent_id: Any = _NO_AGENT, *, home: str | None = None, cwd: str | None = None,
 ) -> str | None:
     """Return a deny reason, or None to allow.
 
     A subagent call is ungated only if the agent was recorded as typed-origin;
     an unknown or invalid agent_id is voice-tainted with no inherited grant.
+    With `home`, a voice-gated call that could read that folder is denied no
+    matter what grant is held.
     """
     if state is None:
         return None
     tainted = _agent_tainted(state, agent_id)
     if not tainted and not voice_active(state):
         return None
+    if home is not None and _touches_home(tool_name, tool_input, home, cwd):
+        return HOME_DENY_REASON
     if gate_reason(tool_name, tool_input) is None:
         return None
     if tainted and _valid_agent_id(agent_id):
@@ -1405,7 +1507,9 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         tag = " a:invalid"
     state = load_state(home, token)
     now = time.time()
-    reason = decide(state, tool_name, tool_input, now, agent_id)
+    raw_cwd = payload.get("cwd")
+    cwd = raw_cwd if isinstance(raw_cwd, str) and os.path.isabs(raw_cwd) else None
+    reason = decide(state, tool_name, tool_input, now, agent_id, home=os.path.abspath(home), cwd=cwd)
     if reason is None:
         gated = (
             state is not None
@@ -1414,7 +1518,8 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         )
         _log(home, "pretooluse", "granted" if gated else "allow", tool_name, f"-{tag}")
         return
-    _log(home, "pretooluse", "deny", tool_name, f"{gate_reason(tool_name, tool_input) or '-'}{tag}")
+    why = "home" if reason == HOME_DENY_REASON else (gate_reason(tool_name, tool_input) or "-")
+    _log(home, "pretooluse", "deny", tool_name, f"{why}{tag}")
     stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -1424,9 +1529,7 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
     }))
     stdout.flush()
     try:
-        cwd = payload.get("cwd")
-        record_blocked(home, token, describe_call(
-            tool_name, tool_input, cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
+        record_blocked(home, token, describe_call(tool_name, tool_input, cwd))
     except Exception:
         _log(home, "pretooluse", "error", tool_name, "record_blocked")
 
