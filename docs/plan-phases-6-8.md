@@ -104,6 +104,23 @@ Today `voice_guard.UNGATED_TOOLS` lets only built-in read tools and `mcp__undert
 - **Undertone-written confirm prompts.** Today Claude writes the spoken confirm prompt, so content injected from a document or message could make a harmful action sound harmless. When `voice_guard` denies a call, it records the pending tool and a short, sanitized summary (tool name, the first arguments or file path) in session state; when the confirm prompt is spoken, undertone appends "This will run: <summary>." from that state, through `prepare_speech` and the screen.
 - **Spike.** List the exact tool names `cast-record` and the 8b candidates expose; classify each read-only vs side-effect.
 
+**Built and reviewed 2026-10-03 (without Ed, who asked for a phase with no voice testing that evening). Live test: pending.**
+
+Decisions (Ed, 2026-10-03):
+- The confirm grant stays turn-wide (up to 300 s); he declined binding it to the calls read back.
+- The read-back is spoken in a distinct voice, chosen over a spoken prefix or a chime: Claude can imitate words, not a voice.
+
+Design changes from the security review: the read-back says "undertone blocked: …", not "This will run: …" (with a turn-wide grant that overclaimed), plus ", and N more blocked calls" when entries were evicted. It speaks only fixed words, names of at most 2 words and 20 chars, location classes and host names, never argument values. The spike covered `cast-record` only (all 5 tools read-only); the 8b candidates move to 8b.
+
+Units:
+- ✓ 8a.2 (`c0d6b6b`): undertone's own voice, Kokoro `af_heart` / `say` `Samantha` (`UNDERTONE_KOKORO_OWN_VOICE`, `UNDERTONE_OWN_VOICE`).
+- ✓ 8a.1 (`f7fa8ee`): `READ_ONLY_MCP_TOOLS` (the 5 `cast-record` tools), the blocked-call record and `read_back()`.
+- ✓ 8a.3 (`18db0a0`): the channel attaches the read-back as `check` on a confirm reply; attach speaks it in the own voice; the instructions now say to try the call first and confirm after the refusal.
+- ✓ 8a.1b (`0a83c94`): wrappers and redirects in the shell read-back.
+- ✓ 8a.5 (`3c2ad1c`): the structural read-back above, after two security review rounds (H1, M1–M3, N1, L1, L3 fixed; residuals in SECURITY.md §7a).
+- ✓ 8a.4: docs.
+- Ed: full suite (`uv run python -m unittest discover -s tests`), then a live test: a voice question that uses a `cast-record` tool runs with no confirm; a voice request for a gated action gets Claude's confirm prompt, then the read-back in the own voice; the two voices are easy to tell apart.
+
 ### 8b — first integrations (S5)
 
 Starter set from the research (low risk, most value):
@@ -125,6 +142,7 @@ Note: Automation and Full Disk Access grants land on the process hosting Claude 
 | Transcript history | Local, 0600, opt-in. |
 | Headphones / AirPods mode | Bluetooth latency vs `SELF_WAKE_GUARD_S`; HFP mic quality. Needs hardware testing. |
 | Follow-up window after a confirm | An `answer` reply sent while a confirm is pending still opens the follow-up window (pre-Phase 6 behaviour); anything heard there uses up the challenge. It can't grant. Fix: gate that window on the confirm-pending flag. Found in the Phase 6 security review. |
+| Post-grant audit | Speak "undertone allowed: …" in the own voice when a gated call runs under a confirm grant, so a turn-wide grant can't be used silently. Option (c) from the Phase 8a security review; Ed to decide. |
 | cast-desktop voice status panel | Read-only, over the Phase 7 control socket. |
 
 ## Open decisions for Ed
