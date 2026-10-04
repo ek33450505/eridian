@@ -379,6 +379,7 @@ def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
 
 def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
     """Inline `--settings` JSON that installs the voice guard's hooks and the announce hooks for one session."""
+    from . import voice_guard
 
     def _hook_cmd(event: str) -> str:
         parts = [
@@ -400,7 +401,11 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
             "timeout": 10,
         }
 
+    # Claude never needs the safe-phrase hash; deny its Read tool on every turn, typed
+    # included. `//path` is gitignore-style for an absolute path from the filesystem root.
+    abs_home = os.path.abspath(home)
     return {
+        "permissions": {"deny": [f"Read(/{abs_home}/{voice_guard.SAFE_PHRASE_FILE})"]},
         # --settings outranks project/local/user settings, so this forces hooks on.
         "disableAllHooks": False,
         "hooks": {
@@ -574,6 +579,13 @@ def _cmd_safe_phrase(args: argparse.Namespace) -> int:
             else:
                 print("No safe phrase was set.")
             return 0
+        if not sys.stdin.isatty():
+            # getpass falls back to an echoed prompt without a TTY, which would print the phrase.
+            print(
+                "undertone safe-phrase needs an interactive terminal so your phrase stays hidden.",
+                file=sys.stderr,
+            )
+            return 2
         try:
             first = voice_guard.validate_safe_phrase(
                 getpass.getpass("Safe phrase (1-3 words; hidden): ")
@@ -597,7 +609,8 @@ def _cmd_safe_phrase(args: argparse.Namespace) -> int:
         return 1
     print(
         "Safe phrase set. Restart `undertone attach` and `undertone session` to use it. "
-        "Voice confirms are now: the wake word, then your safe phrase."
+        "Voice confirms are now: the wake word, then your safe phrase.\n"
+        "Keep it private: anyone who hears it can use it to confirm."
     )
     return 0
 

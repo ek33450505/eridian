@@ -53,9 +53,10 @@ class RetiredCommandsTest(CliTestCase):
 
 
 class SafePhraseCommandTest(CliTestCase):
-    def _safe(self, *argv: str, entries=("copper maple", "copper maple")):
+    def _safe(self, *argv: str, entries=("copper maple", "copper maple"), tty=True):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("getpass.getpass", side_effect=list(entries)), \
+                mock.patch("sys.stdin.isatty", return_value=tty), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(["safe-phrase", *argv])
         return rc, out.getvalue(), err.getvalue()
@@ -67,10 +68,31 @@ class SafePhraseCommandTest(CliTestCase):
         rc, out, err = self._safe()
         self.assertEqual(rc, 0)
         self.assertIn("Safe phrase set.", out)
+        self.assertIn("Keep it private: anyone who hears it can use it to confirm.", out)
         self.assertEqual(self._file().stat().st_mode & 0o777, 0o600)
         self.assertTrue(voice_guard.safe_phrase_configured(self._tmp.name))
         for word in ("copper", "maple"):
             self.assertNotIn(word, out + err)
+
+    def test_set_without_tty_exits_2_and_never_prompts(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("getpass.getpass") as gp, \
+                mock.patch("sys.stdin.isatty", return_value=False), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["safe-phrase"])
+        self.assertEqual(rc, 2)
+        gp.assert_not_called()
+        self.assertIn("needs an interactive terminal", err.getvalue())
+        self.assertFalse(self._file().exists())
+
+    def test_status_and_clear_work_without_tty(self) -> None:
+        self._safe()
+        rc, out, _ = self._safe("--status", tty=False)
+        self.assertEqual((rc, out.strip()), (0, "A safe phrase is set."))
+        rc, out, _ = self._safe("--clear", tty=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("Safe phrase removed", out)
+        self.assertFalse(self._file().exists())
 
     def test_mismatch_exits_1_and_writes_nothing(self) -> None:
         rc, _, err = self._safe(entries=("copper maple", "copper birch"))
@@ -89,6 +111,7 @@ class SafePhraseCommandTest(CliTestCase):
             with self.subTest(effect=effect.__name__):
                 out, err = io.StringIO(), io.StringIO()
                 with mock.patch("getpass.getpass", side_effect=effect), \
+                        mock.patch("sys.stdin.isatty", return_value=True), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     rc = cli.main(["safe-phrase"])
                 self.assertEqual(rc, 1)
@@ -259,6 +282,10 @@ class SessionHelpersTest(CliTestCase):
                 }
             },
         )
+
+    def test_voice_guard_settings_denies_reading_the_safe_phrase_file(self) -> None:
+        st = cli.voice_guard_settings("/py", Path("/tmp/x"), self.TOK)
+        self.assertEqual(st["permissions"], {"deny": ["Read(//tmp/x/safe_phrase.json)"]})
 
     def test_voice_guard_settings_shape(self) -> None:
         st = cli.voice_guard_settings("/py", Path("/h o/me"), self.TOK)

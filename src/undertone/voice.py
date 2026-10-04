@@ -238,6 +238,7 @@ class VoiceBridge:
         self._followed_gen = -1  # main thread only: dedupes reply_done per generation
         self._answered = False  # session lock: a non-ack reply was spoken since the last "finished"
         self._confirm_pending = False  # session lock: confirm/unknown reply, no utterance sent since
+        self._confirm_pending_at = 0.0  # session lock: self._clock() when _confirm_pending was set
         self._announce_last: dict[str, float] = {}  # main thread only: event -> last spoken
         self._clock = clock
         self._self_wake_guard_s = self_wake_guard_s
@@ -388,12 +389,18 @@ class VoiceBridge:
                 self._followed_gen = gen
                 self._listener.listen_now(self._follow_up_s)
 
+    def _confirm_is_pending(self) -> bool:
+        """Session lock held. Pending only while the guard's challenge could still be alive."""
+        return self._confirm_pending and (
+            self._clock() - self._confirm_pending_at <= voice_guard.CHALLENGE_TTL_S
+        )
+
     def _on_announce(self, event: str) -> None:
         """Main thread. `event` is already validated against the enabled templates."""
         if event == "finished":
             with _bounded(self._lock):
                 answered, self._answered = self._answered, False
-                confirm_pending = self._confirm_pending
+                confirm_pending = self._confirm_is_pending()
             if confirm_pending:
                 self._print("[announce skipped: finished (confirm pending)]\n")
                 return
@@ -453,7 +460,7 @@ class VoiceBridge:
                     text = kept
             if self._turn_via == "wake_barge_in":
                 with _bounded(self._lock):
-                    held = self._confirm_pending
+                    held = self._confirm_is_pending()
                 if held:
                     # Could be our own voice, so it can never grant; sending it
                     # would only use up the challenge. Say why instead.
@@ -665,6 +672,7 @@ class VoiceBridge:
                 self._answered = True
             if kind not in ("answer", "ack"):
                 self._confirm_pending = True
+                self._confirm_pending_at = self._clock()
                 self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
             if self._spoken_gen != gen:
                 self._spoken_gen, self._spoken_text = gen, ""

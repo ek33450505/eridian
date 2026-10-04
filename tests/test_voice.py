@@ -943,6 +943,18 @@ class AnnounceTest(_AnnounceBase):
             self.clock.now += ANNOUNCE_REPEAT_S + 1
         self.assertEqual(self.spoken(), [])
 
+    def test_finished_skip_for_confirm_expires_with_the_challenge(self) -> None:
+        self.reply("confirm")
+        self.player.enqueued.clear()
+        self.clock.now = voice_guard.CHALLENGE_TTL_S - 1
+        self.announce()
+        self.assertIn("(confirm pending)", self.out.getvalue())
+        self.clock.now = voice_guard.CHALLENGE_TTL_S + 1
+        self.announce()
+        self.assertEqual(self.out.getvalue().count("(confirm pending)"), 1)
+        self.assertIn("[announce: finished]", self.out.getvalue())
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
     def test_confirm_pending_does_not_block_other_events(self) -> None:
         self.reply("confirm")
         self.player.enqueued.clear()
@@ -1392,6 +1404,19 @@ class TooSoonAndRedactionTest(VoiceTestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0]["via"], "wake")
         self.assertFalse(self.bridge._confirm_pending)
+
+    def test_early_wake_turn_hold_expires_with_the_challenge(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.player.enqueued.clear()
+        self.clock.now = voice_guard.CHALLENGE_TTL_S - 1
+        self.say("wake_barge_in", "confirm walnut lantern")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.player.enqueued, [TOO_SOON_SPEECH])
+
+        self.clock.now = voice_guard.CHALLENGE_TTL_S + 1
+        self.say("wake_barge_in", "confirm walnut lantern")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["via"], "wake_barge_in")
 
     def test_early_wake_turn_sent_when_no_confirm_pending(self) -> None:
         self.say("wake_barge_in", "what time is it")
