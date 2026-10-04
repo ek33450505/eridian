@@ -11,7 +11,9 @@ stdout carries ONLY JSON-RPC -- anything else would corrupt the transport --
 so all diagnostics go to <UNDERTONE_HOME>/logs/channel.log.
 
 Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
-  channel -> voice  {"type":"hello","pid":N,"cwd":"..."}  (first line)
+  channel -> voice  {"type":"hello","pid":N,"cwd":"..."[,"session":"<32 hex>"]}  (first line;
+                    `session` is the UNDERTONE_SESSION token, omitted when unset --
+                    a hook's `announce` line must present it to be spoken)
   voice -> channel  {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                     (only a "wake" turn can satisfy a confirm challenge; a missing
                     or unknown `via` cannot -- fail closed. "wake_barge_in" is a
@@ -224,6 +226,8 @@ class ChannelServer:
             self._sock = sock
         try:
             hello = {"type": "hello", "pid": os.getpid(), "cwd": os.getcwd()}
+            if self._token:
+                hello["session"] = self._token
             if not self._send_voice(hello):
                 return
             self._log("connected to voice process")

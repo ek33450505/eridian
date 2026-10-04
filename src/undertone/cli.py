@@ -344,7 +344,7 @@ def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
 
 
 def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
-    """Inline `--settings` JSON that installs the voice guard's hooks for one session."""
+    """Inline `--settings` JSON that installs the voice guard's hooks and the announce hooks for one session."""
 
     def _hook_cmd(event: str) -> str:
         parts = [
@@ -352,6 +352,19 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
             "--home", str(home), "--session", token,
         ]
         return " ".join(shlex.quote(x) for x in parts)
+
+    def _announce(event: str) -> dict:
+        parts = [
+            executable, "-P", "-m", "undertone.announce", event,
+            "--home", str(home), "--session", token,
+        ]
+        # Async and output-free: an announce hook can never block Claude or decide a permission.
+        return {
+            "type": "command",
+            "command": " ".join(shlex.quote(x) for x in parts),
+            "async": True,
+            "timeout": 10,
+        }
 
     return {
         # --settings outranks project/local/user settings, so this forces hooks on.
@@ -371,8 +384,15 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
                 {"hooks": [{"type": "command", "command": _hook_cmd("subagentstop"), "timeout": 30}]}
             ],
             "Stop": [
-                {"hooks": [{"type": "command", "command": _hook_cmd("stop"), "timeout": 30}]}
+                {
+                    "hooks": [
+                        {"type": "command", "command": _hook_cmd("stop"), "timeout": 30},
+                        _announce("stop"),
+                    ]
+                }
             ],
+            "StopFailure": [{"hooks": [_announce("stopfailure")]}],
+            "PermissionRequest": [{"matcher": "*", "hooks": [_announce("permissionrequest")]}],
             "PreToolUse": [
                 {
                     "matcher": "*",
@@ -473,7 +493,11 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     from . import voice
 
     return voice.run_attach(
-        no_beep=args.no_beep, follow_up_s=args.follow_up, no_aec=args.no_aec, tts=args.tts
+        no_beep=args.no_beep,
+        follow_up_s=args.follow_up,
+        no_aec=args.no_aec,
+        tts=args.tts,
+        announce=args.announce,
     )
 
 
@@ -574,6 +598,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="kokoro",
         help="voice engine: kokoro (default; needs `undertone models fetch` and "
         "espeak-ng) or the macOS say voice",
+    )
+    attach_parser.add_argument(
+        "--announce",
+        choices=["all", "permission", "off"],
+        default="all",
+        help="speak when Claude finishes or needs you (default all; "
+        "'permission' skips 'finished')",
     )
     attach_parser.set_defaults(func=_cmd_attach)
 

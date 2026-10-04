@@ -49,6 +49,7 @@ There are two brains:
 | `voice_guard.py` | SessionStart, UserPromptSubmit, Stop, SubagentStart, SubagentStop and PreToolUse hooks that gate tool calls during voice turns. Covers arming, voice/typed provenance, voice-started subagents, the Bash allowlist and the confirm-phrase grant. | Stdlib only. Injected via `--settings` and runs as `python -P -m undertone.voice_guard <event> --home <UNDERTONE_HOME> --session <token>`. Events: `sessionstart`, `userpromptsubmit`, `stop`, `subagentstart`, `subagentstop`, `pretooluse`. Session state at `~/.undertone/sessions/<token>.json` (0600, atomic). Log at `~/.undertone/logs/guard.log` (0600, decisions only). Fails closed: `pretooluse` errors exit 2 (plus `|| exit 2` on the command), and the channel refuses voice turns unless SessionStart armed this launch's state. |
 | `mcp_channel.py` | Stdlib MCP stdio **channel** server. Claude Code spawns it from the inline `--mcp-config` that `undertone session` passes (`python -P -m undertone.cli channel`). | Requires an armed session token (UNDERTONE_SESSION); refuses voice turns if SessionStart hook hasn't armed state. Connects as a client to `~/.undertone/voice.sock` and says `hello`. Each `utterance` becomes a `notifications/claude/channel` event. Exposes the `reply` tool (`kind` = ack/answer/confirm, ≤4000 chars) and forwards replies to `attach`. Registers confirm phrases (one-shot, 300 s challenge on each request). Rejects the 2026-07-28 `server/discover` probe so Claude Code falls back to `initialize` 2025-11-25. |
 | `voice.py` | `VoiceBridge`, the `undertone attach` process. It runs the mic loop (Listener on the main thread) and the unix-socket server at `~/.undertone/voice.sock` (0600). | Sends each utterance to the attached channel and speaks replies sentence by sentence through `RenderedSpeechQueue` (or `SpeechQueue` with `--no-aec`). Wake during speech = barge-in (stop speech); talk-over does the same during ack/answer speech, never during a confirm prompt. Tags each utterance with `via`. The follow-up window opens only after an `answer`. Socket rules: 64 KB lines, 16 connections, latest session wins. |
+| `announce.py` | Async Stop / StopFailure / PermissionRequest hook for `undertone session`: maps the payload to an announce event and sends one `announce` line to `voice.sock` (Phase 6). | Stdlib only, lazy `voice_guard` import; runs as `python -P -m undertone.announce <hook> --home <UNDERTONE_HOME> --session <token>`. Always exits 0 with no output; forwards no payload text; requires an absolute home and a socket owned by the same uid; 0.5 s connect timeout. |
 | `paths.py` | UNDERTONE_HOME layout (0700) | Default `~/.undertone`. Includes the voice.sock path and logs directory. (`voice_guard` keeps its state under `sessions/`.) |
 | `cli.py` | Commands: `listen`, `chat`, `session`, `attach`, `channel` (internal), `models fetch`. `chat_workdir()` picks the working directory. | `session` generates a token (`secrets.token_hex(16)`) and injects hooks via `--settings` inline JSON; refuses `--settings`, `--bare`, `--safe-mode`. Resolves the cwd (symlinks followed). If it is home or an ancestor of home, any dot-directory under home, `~/Library`, or exactly `~/Documents`/`~/Desktop`/`~/Downloads`, it switches to `~/.undertone/workspace` and refuses a symlinked workspace. |
 
@@ -160,3 +161,27 @@ Every utterance now carries `"via": "wake"|"follow_up"|"talk_over"` on the voice
 - **ERLE (Echo Return Loss Enhancement):** ≈ 35 dB
 - **VAD on residual chunks:** 0/217 chunks (vs. 189/217 raw)
 - **Processing time:** ~60 µs per 10 ms frame
+
+## Phase 6: Announcements (2026-10-02)
+
+`undertone attach` tells you when Claude finishes or needs you, with fixed spoken templates (`voice.ANNOUNCE_TEMPLATES`).
+
+### Path of an announcement
+```
+Claude Code hook (Stop / StopFailure / PermissionRequest, async)
+  └─ python -P -m undertone.announce <hook> --home H --session T
+       └─ one-shot connection to H/voice.sock, no hello:
+          {"type":"announce","session":T,"event":E}
+            └─ attach reader thread: E enabled by --announce? T == attached session (hmac.compare_digest)?
+                 └─ control queue ─► main thread: skip rules ─► SpeechQueue (behind current speech)
+```
+- **Hello.** The channel's `hello` now includes `"session"`, its `UNDERTONE_SESSION` token. A hello without a valid token still attaches, but no announcement can match it.
+- **Hook mapping.** `stop` → `finished`, except while `background_tasks` lists a `subagent` whose status is `running` (its completion produces a later `Stop`). `stopfailure` → `error`. `permissionrequest` → `question` for `AskUserQuestion`, `plan` for `ExitPlanMode`, `permission` otherwise. `cli.voice_guard_settings` adds the `Stop` handler to the existing `Stop` entry, after the voice guard's, and new `StopFailure` and `PermissionRequest` entries.
+- **Hook rules.** The hook always exits 0 and writes no output, because `PermissionRequest` stdout is a decision channel. It sends only the token and the event key, never payload text, and connects with a 0.5 s timeout. Cold start is ~0.03 s.
+- **Main-thread rules.** For `finished`, the "answered" flag is read and cleared first. `finished` is skipped if a non-ack reply was spoken since the last `finished`, and while a confirm is pending (set by a confirm or unknown-kind reply, cleared only when the next utterance is sent). Any announcement is dropped while the listener isn't idle, and the same event isn't repeated within `ANNOUNCE_REPEAT_S` (3.0 s). Otherwise the generation is bumped, talk-over is off for it, and the template is queued behind current speech; it never stops the player. Only `finished` opens the follow-up window. Both reply flags reset when a new session attaches.
+
+### Spike findings (Claude Code 2.1.288, captured live)
+- `Stop` fired 43–100 ms after the final message (7 samples). An Esc-interrupted turn fires no `Stop`. The payload also carries `background_tasks` and `session_crons`, which the hooks docs don't list.
+- `Notification` never fired: not for a forced permission prompt, inside cmux or with cmux's hook injection off (`CMUX_CLAUDE_HOOKS_DISABLED=1`), and not after 250 s idle inside cmux. `PermissionRequest` fired on every prompt, so it is the trigger, and there is no idle announcement.
+- In Ed's terminal `claude` is a cmux shim that merges its own `--settings` (including its own `PermissionRequest` hook) with ours; `undertone session` goes through it.
+- Projected `Stop` to first audio on an idle machine: about 0.4 s (≤ 0.1 s `Stop` lag + 0.03 s hook start + ~0.29 s Kokoro first audio). Not yet measured end to end.

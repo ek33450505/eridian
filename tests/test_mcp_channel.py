@@ -399,6 +399,14 @@ class VoiceBridgeTest(ChannelTestCase):
         self.assertEqual(self.hello["pid"], os.getpid())
         self.assertEqual(self.hello["cwd"], os.getcwd())
 
+    def test_hello_carries_session_token_when_set(self) -> None:
+        self.start(with_voice=True)
+        self.assertEqual(self.hello["session"], self.token)
+
+    def test_hello_omits_session_without_token(self) -> None:
+        self.start(with_voice=True, with_token=False)
+        self.assertNotIn("session", self.hello)
+
     def test_utterance_becomes_channel_notification(self) -> None:
         p = self.start(with_voice=True)
         self.voice.send({"type": "utterance", "text": "What is two plus two?"})

@@ -4,6 +4,25 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-02 — Phase 6: Jarvis speaks first
+
+**Live test: passed (Ed, 2026-10-03).**
+
+**Added**
+- `undertone attach` now tells you when Claude finishes or needs you, using fixed spoken templates: "Claude finished." (a turn ended: `Stop`), "Claude needs your permission." (a permission dialog), "Claude has a question for you." (`AskUserQuestion`), "Claude's plan is ready." (`ExitPlanMode`) and "Claude stopped with an error." (a turn ended on an API error: `StopFailure`).
+- `--announce {all,permission,off}` on `undertone attach` (default `all`). `permission` speaks everything except "finished"; `off` speaks nothing.
+- `python -P -m undertone.announce {stop,stopfailure,permissionrequest} --home … --session …`, the hook that sends them. `undertone session` installs it as async hooks: a second handler on the existing `Stop` entry (after the voice guard's), plus new `StopFailure` and `PermissionRequest` (matcher `*`) entries. It maps the hook payload to an event key and sends one line to `voice.sock`; nothing from the payload is forwarded. `Stop` sends nothing while `background_tasks` lists a `subagent` whose status is `running`; that agent's completion produces a later `Stop`, which announces. `PermissionRequest` replaced the planned `Notification` hook: in the Phase 6 spike (Claude Code 2.1.288), `Notification` never fired, while `PermissionRequest` fired on every permission prompt. There is no idle announcement.
+- Protocol: the channel's `hello` now carries `"session": "<token>"` (its `UNDERTONE_SESSION`), and a one-shot connection with no `hello` can send `{"type":"announce","session":"<token>","event":"<event>"}`. `attach` speaks it only if the token equals (`hmac.compare_digest`) the one the attached channel sent and `--announce` enables the event. Nothing from the message is spoken or printed except the validated event key.
+- Speaking rules (main thread): "finished" is skipped if a non-ack reply was spoken since the last "finished", and while a confirm is pending (set by a confirm reply, cleared when the next utterance is sent), so a "finished" follow-up window can never burn a pending confirm challenge. Any announcement is dropped while the listener is not idle, and the same event isn't repeated within 3.0 s (`ANNOUNCE_REPEAT_S`). Both reply flags reset when a new session attaches. Announcements queue behind current speech (never interrupt), play with talk-over off (the wake word still barges in), and go through the same speech path as replies (one scrub, plus the acoustic self-screen when Kokoro is used). Only "finished" opens the 6 s no-wake-word follow-up window, and a follow-up turn can never grant a voice confirmation. The window also opens after a typed turn's "finished", so you can walk away, hear that Claude finished, and ask a follow-up.
+- Terminal output: `[announce: <event>]`, or `[announce skipped: <event> (<reason>)]` with reason `already answered`, `confirm pending`, `listening` or `repeat`.
+
+**Fixed**
+- A line on `voice.sock` nested too deeply to parse (`RecursionError`) is now ignored instead of dropping the connection.
+
+**Security**
+- The announce token is a routing check, not a secret against the same user: it is on the hook command lines, visible via `ps`. Announcements speak fixed templates only, never Claude's text. A "finished" window can only produce a follow-up turn, which never grants a confirmation, and "finished" is suppressed while a confirm is pending. Each event is spoken at most once per 3.0 s.
+- `announce.py` always exits 0 and writes nothing to stdout or stderr, because `PermissionRequest` stdout is a decision channel. It drains stdin first, imports lazily, and needs an absolute `--home`, a 32-hex token and a `voice.sock` that is a socket owned by the same uid. It connects with a 0.5 s timeout and never reads from the socket. It logs at most one line per run to `<home>/logs/guard.log` (`announce <sent|skipped|error> <hook> <event or reason>`) and never logs the token or the payload.
+
 ### 2026-10-02 — Phase 4b: Kokoro voice
 
 **Live test (2026-10-02, Ed):** with both `undertone session` and `undertone attach` restarted, Ed ran the checklist: banner `Voice: Kokoro (am_adam).`, Kokoro replies, talk-over, a confirm answered after the prompt finished, no self-trigger, and `--tts say` / `--no-aec` — "nothing odd, works great" (reported by Ed; per-step output not captured). The full suite ran 499 tests OK and `scripts/verify-offline.sh` passed 10/10 with the network denied.

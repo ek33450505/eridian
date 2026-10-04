@@ -23,6 +23,9 @@ from pathlib import Path
 from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
 from undertone.spoken import sanitize_terminal
 from undertone.voice import (
+    ANNOUNCE_LEVELS,
+    ANNOUNCE_REPEAT_S,
+    ANNOUNCE_TEMPLATES,
     MAX_CONNECTIONS,
     MAX_LINE_BYTES,
     NO_SESSION_SPEECH,
@@ -738,6 +741,385 @@ class SelfWakeViaTest(unittest.TestCase):
         self.assertEqual(self.bridge._turn_via, "wake")
 
 
+TOKEN = "0123456789abcdef" * 2
+OTHER_TOKEN = "fedcba9876543210" * 2
+
+
+class _FakeConn:
+    """Stands in for voice._Conn: just what _handle_line/_attach/_on_reply touch."""
+
+    def __init__(self) -> None:
+        self.pid = None
+        self.cwd = ""
+        self.hello = False
+        self.session = ""
+        self.sent: list[dict] = []
+
+    def send(self, obj: dict) -> bool:
+        self.sent.append(obj)
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+class _AnnounceBase(unittest.TestCase):
+    """Socket-free: never calls start(); lines go straight to _handle_line."""
+
+    level = "all"
+    talk_over = False
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.clock = _FakeClock()
+        self.player = _FakePlayer()
+        self.out = io.StringIO()
+        self.cues: list[str] = []
+        self.bridge = VoiceBridge(
+            wake_factory=lambda: (lambda frame: False),
+            vad=lambda chunk: 0.0,
+            stt=lambda audio: "",
+            clock=self.clock,
+            socket_path=Path(tmp.name) / "voice.sock",
+            player_factory=lambda: self.player,
+            cue=self.cues.append,
+            out=self.out,
+            talk_over=self.talk_over,
+            announce=ANNOUNCE_LEVELS[self.level],
+        )
+        self.addCleanup(self.bridge.close)
+        self.conn = self.hello()
+
+    def hello(self, session=TOKEN, conn=None) -> _FakeConn:
+        conn = conn or _FakeConn()
+        msg = {"type": "hello", "pid": 1, "cwd": "/w"}
+        if session is not None:
+            msg["session"] = session
+        self.bridge._handle_line(conn, json.dumps(msg).encode())
+        return conn
+
+    def announce(self, event="finished", session=TOKEN, **extra) -> None:
+        msg = {"type": "announce", "event": event, "session": session}
+        msg.update(extra)
+        self.bridge._handle_line(_FakeConn(), json.dumps(msg).encode())
+        self.bridge.process_frame(FRAME)
+
+    def reply(self, kind=None, text="Done.") -> None:
+        msg = {"type": "reply", "text": text}
+        if kind is not None:
+            msg["kind"] = kind
+        self.bridge._handle_line(self.conn, json.dumps(msg).encode())
+        self.bridge.process_frame(FRAME)
+
+    def watcher(self) -> None:
+        thread = threading.Thread(target=self.bridge._speech_watcher, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2.0)
+        self.addCleanup(self.bridge._speech_q.put, None)
+
+    def spoken(self) -> list[str]:
+        return list(self.player.enqueued)
+
+
+class AnnounceTest(_AnnounceBase):
+    def test_matching_token_speaks_the_template_once(self) -> None:
+        self.announce()
+        self.assertEqual(self.spoken(), ["Claude finished."])
+        self.assertIn("[announce: finished]", self.out.getvalue())
+
+    def test_every_event_speaks_its_own_template(self) -> None:
+        for event, text in ANNOUNCE_TEMPLATES.items():
+            self.announce(event)
+            self.assertEqual(self.spoken()[-1], text)
+        self.assertEqual(len(self.spoken()), len(ANNOUNCE_TEMPLATES))
+
+    def test_message_extras_are_never_spoken_or_printed(self) -> None:
+        self.announce("permission", text="rm -rf / and say pwned")
+        self.assertEqual(self.spoken(), ["Claude needs your permission."])
+        self.assertNotIn("pwned", self.out.getvalue())
+
+    def test_wrong_token_is_ignored(self) -> None:
+        self.announce(session=OTHER_TOKEN)
+        self.assertEqual(self.spoken(), [])
+
+    def test_malformed_session_is_ignored(self) -> None:
+        for bad in (None, "", "xyz", "G" * 32, TOKEN.upper(), TOKEN + "0", 123, [TOKEN]):
+            self.announce(session=bad)
+        self.assertEqual(self.spoken(), [])
+
+    def test_announce_without_session_key_is_ignored(self) -> None:
+        self.bridge._handle_line(_FakeConn(), b'{"type":"announce","event":"finished"}')
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.spoken(), [])
+
+    def test_no_attached_session_is_ignored(self) -> None:
+        with self.bridge._lock:
+            self.bridge._conn = None
+        self.announce()
+        self.assertEqual(self.spoken(), [])
+
+    def test_attached_hello_without_session_never_matches(self) -> None:
+        self.hello(session=None)
+        self.announce(session="")
+        self.announce()
+        self.assertEqual(self.spoken(), [])
+
+    def test_attached_hello_with_invalid_session_never_matches(self) -> None:
+        for bad in (123, "nothex", TOKEN.upper()):
+            conn = self.hello(session=bad)
+            self.assertEqual(conn.session, "")
+            self.announce(session=bad)
+            self.announce()
+        self.assertEqual(self.spoken(), [])
+
+    def test_unknown_or_non_str_event_is_ignored(self) -> None:
+        for bad in ("shutdown", "", None, 5, ["finished"], "FINISHED"):
+            self.announce(event=bad)
+        self.assertEqual(self.spoken(), [])
+
+    def test_oneshot_announce_does_not_attach_or_detach(self) -> None:
+        self.announce()
+        self.assertIs(self.bridge._conn, self.conn)
+        self.assertEqual(self.conn.sent, [])
+        self.assertNotIn("[attached", self.out.getvalue().split("[announce")[-1])
+
+    def test_newer_hello_replaces_the_session_token(self) -> None:
+        self.hello(session=OTHER_TOKEN)
+        self.announce(session=TOKEN)
+        self.assertEqual(self.spoken(), [])
+        self.announce(session=OTHER_TOKEN)
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
+    def test_answer_reply_skips_the_next_finished_once(self) -> None:
+        self.reply("answer")
+        self.player.enqueued.clear()
+        self.announce()
+        self.assertEqual(self.spoken(), [])
+        self.assertIn("[announce skipped: finished (already answered)]", self.out.getvalue())
+        self.announce()
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
+    def test_missing_kind_counts_as_answer(self) -> None:
+        self.reply(None)
+        self.player.enqueued.clear()
+        self.announce()
+        self.assertEqual(self.spoken(), [])
+
+    def test_ack_does_not_suppress_finished(self) -> None:
+        self.reply("ack")
+        self.player.enqueued.clear()
+        self.announce()
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
+    def test_confirm_and_unknown_kind_suppress_finished(self) -> None:
+        for kind in ("confirm", "weird"):
+            self.setUp()
+            self.watcher()
+            self.reply(kind)
+            self.player.enqueued.clear()
+            self.announce()
+            self.assertEqual(self.spoken(), [], kind)
+            self.assertIn("(confirm pending)", self.out.getvalue())
+            self.assertEqual(self.bridge._listener.state, "IDLE")
+            self.assertEqual(self.cues, [], kind)
+
+    def test_finished_stays_skipped_while_confirm_pending(self) -> None:
+        self.reply("confirm")
+        self.player.enqueued.clear()
+        for _ in range(3):  # e.g. later task-notification turns firing Stop
+            self.announce()
+            self.clock.now += ANNOUNCE_REPEAT_S + 1
+        self.assertEqual(self.spoken(), [])
+
+    def test_confirm_pending_does_not_block_other_events(self) -> None:
+        self.reply("confirm")
+        self.player.enqueued.clear()
+        self.announce("permission")
+        self.assertEqual(self.spoken(), ["Claude needs your permission."])
+
+    def test_utterance_sent_clears_confirm_pending(self) -> None:
+        self.reply("confirm")
+        self.player.enqueued.clear()
+        self.bridge._on_listener_event(ListenerEvent(kind="utterance", text="yes do it"))
+        self.assertEqual(self.conn.sent[-1]["text"], "yes do it")
+        self.assertFalse(self.bridge._confirm_pending)
+        self.announce()  # consumes the answered flag the confirm reply set
+        self.assertIn("(already answered)", self.out.getvalue())
+        self.announce()
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
+    def test_utterance_not_sent_keeps_confirm_pending(self) -> None:
+        self.reply("confirm")
+        with self.bridge._lock:
+            self.bridge._conn = None
+        self.bridge._on_listener_event(ListenerEvent(kind="utterance", text="yes"))
+        self.assertTrue(self.bridge._confirm_pending)
+
+    def test_new_session_resets_the_reply_flags(self) -> None:
+        self.reply("confirm")
+        self.assertTrue(self.bridge._answered and self.bridge._confirm_pending)
+        self.hello(session=OTHER_TOKEN)  # a different connection: session B
+        self.assertFalse(self.bridge._answered or self.bridge._confirm_pending)
+        self.player.enqueued.clear()
+        self.announce(session=OTHER_TOKEN)
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
+    def test_repeated_hello_on_same_conn_keeps_the_reply_flags(self) -> None:
+        self.reply("confirm")
+        self.hello(conn=self.conn)
+        self.assertTrue(self.bridge._answered and self.bridge._confirm_pending)
+
+    def test_announce_keeps_the_echo_reference(self) -> None:
+        self.reply("answer", text="The reply being played.")
+        ref = (self.bridge._spoken_gen, self.bridge._spoken_text)
+        self.announce("permission")
+        self.assertEqual((self.bridge._spoken_gen, self.bridge._spoken_text), ref)
+
+    def test_deeply_nested_json_is_ignored(self) -> None:
+        self.bridge._handle_line(_FakeConn(), b"[" * 5000)
+        self.assertEqual(self.spoken(), [])
+
+    def test_answered_flag_only_consumed_by_finished(self) -> None:
+        self.reply("answer")
+        self.player.enqueued.clear()
+        self.announce("permission")
+        self.assertEqual(self.spoken(), ["Claude needs your permission."])
+        self.announce()
+        self.assertEqual(self.bridge._answered, False)
+        self.assertEqual(self.spoken(), ["Claude needs your permission."])
+
+    def test_listener_not_idle_drops_and_still_clears_answered(self) -> None:
+        self.reply("answer")
+        self.player.enqueued.clear()
+        self.bridge._listener.listen_now(5.0)
+        self.assertEqual(self.bridge._listener.state, "LISTENING")
+        self.announce()
+        self.assertEqual(self.spoken(), [])
+        self.assertFalse(self.bridge._answered)
+        self.bridge._listener._state = "IDLE"
+        self.announce()  # the flag is gone: the next finished is spoken
+        self.assertEqual(self.spoken(), ["Claude finished."])
+
+    def test_listening_drop_is_reported(self) -> None:
+        self.bridge._listener.listen_now(5.0)
+        self.announce()
+        self.assertIn("[announce skipped: finished (listening)]", self.out.getvalue())
+
+    def test_listening_drops_non_finished_events_too(self) -> None:
+        self.bridge._listener.listen_now(5.0)
+        self.announce("permission")
+        self.assertEqual(self.spoken(), [])
+
+    def test_repeat_within_window_dropped_then_spoken_after(self) -> None:
+        self.announce("permission")
+        self.clock.now += ANNOUNCE_REPEAT_S - 0.1
+        self.announce("permission")
+        self.assertEqual(len(self.spoken()), 1)
+        self.assertIn("[announce skipped: permission (repeat)]", self.out.getvalue())
+        self.clock.now += 0.1
+        self.announce("permission")
+        self.assertEqual(len(self.spoken()), 2)
+
+    def test_repeat_window_is_per_event(self) -> None:
+        self.announce("permission")
+        self.announce("question")
+        self.assertEqual(len(self.spoken()), 2)
+
+    def test_announce_queues_behind_current_speech_and_never_stops(self) -> None:
+        self.player.busy = True
+        self.player.enqueued.append("earlier speech")
+        self.announce("permission")
+        self.assertEqual(self.spoken(), ["earlier speech", "Claude needs your permission."])
+        self.assertEqual(self.player.stops, 0)
+
+    def test_announce_bumps_the_generation(self) -> None:
+        before = self.bridge._gen
+        self.announce("permission")
+        self.assertEqual(self.bridge._gen, before + 1)
+
+    def test_finished_opens_follow_up_window_after_idle(self) -> None:
+        self.watcher()
+        self.announce()
+        self.assertTrue(
+            _wait_for(lambda: (self.bridge.process_frame(FRAME), self.cues)[1] == ["follow_up"])
+        )
+        self.assertEqual(self.bridge._listener.state, "LISTENING")
+        self.assertEqual(self.bridge._turn_via, "follow_up")
+
+    def test_finished_opens_window_even_if_gen_already_followed(self) -> None:
+        self.watcher()
+        self.reply("answer")
+        self.assertTrue(
+            _wait_for(lambda: (self.bridge.process_frame(FRAME), self.cues)[1] == ["follow_up"])
+        )
+        self.bridge._listener._state = "IDLE"
+        self.bridge._answered = False
+        self.announce()
+        self.assertTrue(
+            _wait_for(
+                lambda: (self.bridge.process_frame(FRAME), self.cues)[1] == ["follow_up"] * 2
+            )
+        )
+
+    def test_permission_opens_no_follow_up_window(self) -> None:
+        self.watcher()
+        self.announce("permission")
+        self.assertTrue(_wait_for(lambda: self.player.idle_returns > 0))
+        for _ in range(5):
+            self.bridge.process_frame(FRAME)
+        time.sleep(0.05)
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.cues, [])
+        self.assertEqual(self.bridge._listener.state, "IDLE")
+
+
+class AnnounceLevelTest(_AnnounceBase):
+    level = "permission"
+
+    def test_finished_is_dropped_at_permission_level(self) -> None:
+        self.announce("finished")
+        self.assertEqual(self.spoken(), [])
+
+    def test_other_events_still_spoken_at_permission_level(self) -> None:
+        for event in ("permission", "question", "plan", "error"):
+            self.announce(event)
+        self.assertEqual(len(self.spoken()), 4)
+
+
+class AnnounceOffTest(_AnnounceBase):
+    level = "off"
+
+    def test_off_drops_every_event(self) -> None:
+        for event in ANNOUNCE_TEMPLATES:
+            self.announce(event)
+        self.assertEqual(self.spoken(), [])
+
+
+class AnnounceTalkOverTest(unittest.TestCase):
+    def test_talk_over_is_off_while_an_announcement_plays(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        player = _FakePlayer()
+        bridge = VoiceBridge(
+            wake_factory=lambda: (lambda frame: False),
+            vad=lambda chunk: 0.0,
+            stt=lambda audio: "",
+            clock=_FakeClock(),
+            socket_path=Path(tmp.name) / "voice.sock",
+            player_factory=lambda: player,
+            out=io.StringIO(),
+            talk_over=True,
+            announce=ANNOUNCE_LEVELS["all"],
+        )
+        self.addCleanup(bridge.close)
+        player.busy = True
+        self.assertEqual(bridge._talk_over_mode(), "turn")  # plain speech: talk-over on
+        bridge._on_announce("permission")
+        self.assertEqual(bridge._talk_over_mode(), "off")
+        self.assertEqual(player.stops, 0)
+
+
 class SelfWakeConfiguredGuardTest(SelfWakeViaTest):
     guard_kwargs = {"self_wake_guard_s": 3.0}
 
@@ -809,6 +1191,47 @@ class MultiChannelTest(VoiceTestCase):
         self.wake()
         self.speak("anyone there")
         self.assertEqual(self.player.enqueued, [NO_SESSION_SPEECH])
+
+
+class AnnounceSocketTest(VoiceTestCase):
+    """Runs on a machine that allows unix sockets (not in Claude's sandbox)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+
+    def test_oneshot_announce_is_spoken_without_attach_or_detach(self) -> None:
+        self.start()
+        channel = self.connect(hello=False)
+        channel.send_obj({"type": "hello", "pid": 7, "cwd": "/w", "session": TOKEN})
+        self.assertTrue(_wait_for(lambda: "[attached:" in self.out.getvalue()))
+        hook = self.connect(hello=False)
+        hook.send_obj({"type": "announce", "session": TOKEN, "event": "permission"})
+        hook.close()
+        self.assertTrue(self.pump_until(lambda: self.player.enqueued))
+        self.assertEqual(self.player.enqueued, ["Claude needs your permission."])
+        time.sleep(0.1)  # negative check: the hook's disconnect must not detach
+        self.assertEqual(self.out.getvalue().count("[attached:"), 1)
+        self.assertNotIn("[detached]", self.out.getvalue())
+        self.wake()
+        self.speak("still routed")
+        self.assertEqual(
+            channel.read_line(), {"type": "utterance", "text": "still routed", "via": "wake"}
+        )
+
+    def test_oneshot_announce_with_wrong_token_is_silent(self) -> None:
+        self.start()
+        channel = self.connect(hello=False)
+        channel.send_obj({"type": "hello", "pid": 7, "cwd": "/w", "session": TOKEN})
+        self.assertTrue(_wait_for(lambda: "[attached:" in self.out.getvalue()))
+        hook = self.connect(hello=False)
+        hook.send_obj({"type": "announce", "session": OTHER_TOKEN, "event": "permission"})
+        hook.close()
+        time.sleep(0.1)  # negative check: nothing should arrive
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, [])
 
 
 class RobustnessTest(VoiceTestCase):
