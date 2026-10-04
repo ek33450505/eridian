@@ -7,6 +7,7 @@ real claude are involved.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -275,7 +276,7 @@ class StateMachineTests(GuardTestCase):
         vg.record_voice(self.home, TOKEN, "make me a file")
         self.assertDenied("Write")
         self.assertDenied("Bash", {"command": "rm x"})
-        self.assertAllowed("Read")
+        self.assertAllowed("Read", {"file_path": "/nonexistent-x/a.py"})
         self.assertAllowed("Bash", {"command": "git status"})
 
     def test_marker_prompt_stays_voice(self):
@@ -1110,11 +1111,19 @@ class BlockedStateTests(GuardTestCase):
         self.assertEqual([e["what"] for e in self.blocked()], ["a", "c", "d"])
 
     def test_cleared_by_voice_and_typed(self):
-        for clear in (lambda: vg.record_voice(self.home, TOKEN, "hello", now=T0 + 1),
-                      lambda: vg.record_typed(self.home, TOKEN, now=T0 + 1)):
+        def granted_voice():
+            vg.record_confirm_request(self.home, TOKEN, "confirm purple walrus", now=T0)
+            vg.record_voice(self.home, TOKEN, "confirm purple walrus", can_grant=True, now=T0 + 1)
+
+        for clear in (granted_voice, lambda: vg.record_typed(self.home, TOKEN, now=T0 + 1)):
             vg.record_blocked(self.home, TOKEN, "a", now=T0)
             clear()
             self.assertEqual(self.blocked(), [])
+
+    def test_kept_by_non_granting_voice(self):
+        vg.record_blocked(self.home, TOKEN, "a", now=T0)
+        vg.record_voice(self.home, TOKEN, "hello", now=T0 + 1)
+        self.assertEqual([e["what"] for e in self.blocked()], ["a"])
 
     def test_survives_stop_and_confirm_request(self):
         vg.record_blocked(self.home, TOKEN, "a", now=T0)
@@ -1146,8 +1155,11 @@ class BlockedStateTests(GuardTestCase):
         self.assertNotIn("more blocked", vg.read_back(self.home, TOKEN, now=T0 + 6))
 
     def test_blocked_more_reset_by_voice_and_typed(self):
-        for clear in (lambda: vg.record_voice(self.home, TOKEN, "hello", now=T0 + 9),
-                      lambda: vg.record_typed(self.home, TOKEN, now=T0 + 9)):
+        def granted_voice():
+            vg.record_confirm_request(self.home, TOKEN, "confirm quartz meadow", now=T0 + 8)
+            vg.record_voice(self.home, TOKEN, "confirm quartz meadow", can_grant=True, now=T0 + 9)
+
+        for clear in (granted_voice, lambda: vg.record_typed(self.home, TOKEN, now=T0 + 9)):
             for i, what in enumerate("abcd"):
                 vg.record_blocked(self.home, TOKEN, what, now=T0 + i)
             clear()
@@ -1183,7 +1195,7 @@ class PretoolBlockedTests(GuardTestCase):
 
     def test_deny_records_allow_does_not(self):
         vg.record_voice(self.home, TOKEN, "do it")
-        self.assertAllowed("Read")
+        self.assertAllowed("Read", {"file_path": "/nonexistent-x/a.py"})
         self.assertEqual(self.blocked(), [])
         self.assertDenied("Bash", {"command": "rm -rf ~/Projects"})
         self.assertEqual([e["what"] for e in self.blocked()], ["the shell command rm rf on files in your home folder"])
@@ -1206,6 +1218,451 @@ class PretoolBlockedTests(GuardTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn("record_blocked", (Path(self.home) / "logs" / "guard.log").read_text())
+
+
+class SafePhraseTests(GuardTestCase):
+    PHRASE = "Copper Maple"
+
+    def arm_safe(self, now=T0):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertEqual(vg.record_confirm_request(self.home, TOKEN, "ignored", safe_phrase=True, now=now),
+                         vg.SAFE_PHRASE_MARKER)
+
+    def say(self, text, *, can_grant=True, now=T0 + 5):
+        return vg.record_voice(self.home, TOKEN, text, can_grant=can_grant, now=now)
+
+    def test_validate_accepts(self):
+        for phrase, want in (("Copper Maple", "copper maple"), ("marigold", "marigold"),
+                             ("Copper-maple, Pi!", "copper maple pi")):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(vg.validate_safe_phrase(phrase), want)
+
+    def test_validate_rejects(self):
+        for bad in ("", "   ", "a b c d", "abc", "copper maple 42", "x" * 41, "hey copper",
+                    "my jarvis", "confirm maple", "the please", "ok", "copper", "walnut"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                vg.validate_safe_phrase(bad)
+
+    def test_set_load_round_trip_and_perms(self):
+        self.assertFalse(vg.safe_phrase_configured(self.home))
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertTrue(vg.safe_phrase_configured(self.home))
+        path = Path(self.home) / vg.SAFE_PHRASE_FILE
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(Path(self.home).stat().st_mode), 0o700)
+        self.assertNotIn("copper", path.read_text().lower())
+        rec = vg._load_safe_phrase(self.home)
+        self.assertEqual((rec["words"], rec["chars"]), (2, len("copper maple")))
+        self.assertTrue(vg._phrase_in(["copper", "maple"], rec))
+        self.assertFalse(vg._phrase_in(["copper", "mapel"], rec))
+        self.assertTrue(vg.clear_safe_phrase(self.home))
+        self.assertFalse(vg.clear_safe_phrase(self.home))
+        self.assertIsNone(vg._load_safe_phrase(self.home))
+
+    def test_set_refuses_symlink(self):
+        target = Path(self.home) / "elsewhere"
+        target.write_text("x")
+        (Path(self.home) / vg.SAFE_PHRASE_FILE).symlink_to(target)
+        self.assertFalse(vg.safe_phrase_configured(self.home))
+        with self.assertRaises(vg.GuardError):
+            vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertEqual(target.read_text(), "x")
+        self.assertIsNone(vg._load_safe_phrase(self.home))
+
+    def test_set_refuses_symlinked_home(self):
+        real = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, real, ignore_errors=True)
+        link = Path(self.home) / "link"
+        link.symlink_to(real)
+        with self.assertRaises(vg.GuardError):
+            vg.set_safe_phrase(link, self.PHRASE)
+
+    GOOD = {"v": 2, "salt": "ab" * 16, "words": 2, "chars": 12, "n": 16384, "r": 8, "p": 1, "hash": "cd" * 32}
+
+    def put(self, text, mode=0o600):
+        path = Path(self.home) / vg.SAFE_PHRASE_FILE
+        path.write_text(text)
+        os.chmod(path, mode)
+
+    def test_file_format_is_v2_scrypt(self):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        raw = json.loads((Path(self.home) / vg.SAFE_PHRASE_FILE).read_text())
+        self.assertEqual(set(raw), {"v", "salt", "words", "chars", "n", "r", "p", "hash"})
+        self.assertEqual((raw["v"], raw["n"], raw["r"], raw["p"], raw["chars"]), (2, 16384, 8, 1, 12))
+        self.assertEqual(raw["hash"], hashlib.scrypt(b"copper maple", salt=bytes.fromhex(raw["salt"]),
+                                                     n=16384, r=8, p=1, dklen=32).hex())
+
+    def test_malformed_files_load_none(self):
+        good = self.GOOD
+        self.put(json.dumps(good))
+        self.assertIsNotNone(vg._load_safe_phrase(self.home))
+        bads = ["not json", "[]", json.dumps({**good, "v": 1}), json.dumps({**good, "salt": "zz" * 16}),
+                json.dumps({**good, "hash": "cd" * 31}), json.dumps({**good, "words": 4}),
+                json.dumps({**good, "words": 0}), json.dumps({**good, "words": True}),
+                json.dumps({**good, "chars": 3}), json.dumps({**good, "n": 1024}),
+                json.dumps({**good, "r": 1}), json.dumps({**good, "p": 2}),
+                json.dumps({**good, "pad": "x" * 2000})]
+        legacy = {"v": 1, "salt": "ab" * 16, "words": 2, "sha256": "cd" * 32}
+        bads.append(json.dumps(legacy))
+        for bad in bads:
+            self.put(bad)
+            with self.subTest(bad=bad[:40]):
+                self.assertIsNone(vg._load_safe_phrase(self.home))
+
+    def test_load_rejects_wrong_owner_and_loose_mode(self):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        self.assertIsNotNone(vg._load_safe_phrase(self.home))
+        with mock.patch.object(vg.os, "getuid", return_value=os.getuid() + 1):
+            self.assertIsNone(vg._load_safe_phrase(self.home))
+            self.arm_safe_noset()
+            self.assertFalse(self.say("copper maple"))
+        for mode in (0o644, 0o640, 0o602):
+            os.chmod(Path(self.home) / vg.SAFE_PHRASE_FILE, mode)
+            with self.subTest(mode=oct(mode)):
+                self.assertIsNone(vg._load_safe_phrase(self.home))
+        os.chmod(Path(self.home) / vg.SAFE_PHRASE_FILE, 0o600)
+        self.assertIsNotNone(vg._load_safe_phrase(self.home))
+
+    def arm_safe_noset(self, now=T0):
+        vg.record_confirm_request(self.home, TOKEN, "ignored", safe_phrase=True, now=now)
+
+    def test_min_strength(self):
+        for bad in ("copper", "walnut"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                vg.validate_safe_phrase(bad)
+        for ok in ("coppermaple", "copper maple", "ab cd"):
+            with self.subTest(ok=ok):
+                self.assertEqual(vg.validate_safe_phrase(ok), ok)
+
+    def test_length_prefilter_skips_scrypt(self):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        rec = vg._load_safe_phrase(self.home)
+        with mock.patch.object(vg.hashlib, "scrypt", wraps=hashlib.scrypt) as sc:
+            self.assertFalse(vg._phrase_in(["a", "b", "walnut", "lantern", "quartz", "meadow"], rec))
+            self.assertEqual(sc.call_count, 0)
+            self.assertTrue(vg._phrase_in(["x", "copper", "maple", "y"], rec))
+            self.assertEqual(sc.call_count, 1)
+
+    def test_grant_path_one_scrypt(self):
+        self.arm_safe()
+        with mock.patch.object(vg.hashlib, "scrypt", wraps=hashlib.scrypt) as sc:
+            self.assertTrue(self.say("confirm copper maple"))
+        self.assertEqual(sc.call_count, 1)
+
+    def test_redaction_cap_over_redacts(self):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        decoy = "walnut lamps"  # 12 chars like the phrase, so it passes the prefilter
+        n = vg.MAX_REDACT_HASHES
+        # the long filler word keeps the straddling windows ("lamps filler...") off the 12-char length
+        text = " fillerislongword ".join([decoy] * (n + 3) + ["copper maple"])
+        with mock.patch.object(vg.hashlib, "scrypt", wraps=hashlib.scrypt) as sc:
+            out = vg.redact_safe_phrase(self.home, text)
+        self.assertEqual(sc.call_count, n)
+        self.assertEqual(out.count(vg.REDACTED_PHRASE), 3 + 1)  # decoys beyond the cap, plus the real one
+        self.assertEqual(out.count("walnut"), n)
+        self.assertNotIn("copper", out)
+
+    def test_grants(self):
+        for text in ("copper maple", "Confirm, copper maple.", "uh copper maple"):
+            with self.subTest(text=text):
+                self.arm_safe()
+                self.assertTrue(self.say(text))
+                self.assertIsNotNone(vg.load_state(self.home, TOKEN)["grant"])
+
+    def test_no_grant(self):
+        cases = {
+            "too many words": dict(text="the copper maple is open today please now"),
+            "wrong phrase": dict(text="confirm walnut lantern"),
+            "no can_grant": dict(text="copper maple", can_grant=False),
+            "expired": dict(text="copper maple", now=T0 + vg.CHALLENGE_TTL_S + 1),
+        }
+        for name, kw in cases.items():
+            with self.subTest(name):
+                self.arm_safe()
+                self.assertFalse(self.say(**kw))
+                state = vg.load_state(self.home, TOKEN)
+                self.assertIsNone(state["grant"])
+                self.assertIsNone(state["challenge"])
+
+    def test_corrupt_file_never_grants(self):
+        self.arm_safe()
+        (Path(self.home) / vg.SAFE_PHRASE_FILE).write_text("garbage")
+        self.assertFalse(self.say("copper maple"))
+
+    def test_safe_arming_skips_used_phrases(self):
+        self.arm_safe()
+        self.assertEqual(vg.load_state(self.home, TOKEN)["used_phrases"], [])
+
+    def test_two_word_mode_unaffected(self):
+        vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+        self.assertTrue(self.say("confirm walnut lantern"))
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        vg.record_confirm_request(self.home, TOKEN, "confirm quartz meadow", now=T0)
+        self.assertFalse(self.say("copper maple"))
+        vg.record_confirm_request(self.home, TOKEN, "confirm copper falcon", now=T0 + 10)
+        self.assertTrue(self.say("confirm copper falcon", now=T0 + 11))
+
+    def test_redaction(self):
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        red = lambda t: vg.redact_safe_phrase(self.home, t)  # noqa: E731
+        self.assertEqual(red("Say Copper Maple."), "Say [safe phrase].")
+        self.assertEqual(red("copper, maple and COPPER  MAPLE"), "[safe phrase] and [safe phrase]")
+        self.assertEqual(red("copper mapleleaf"), "copper mapleleaf")
+        self.assertEqual(red("maple copper"), "maple copper")
+        self.assertEqual(red(""), "")
+
+    def test_redaction_no_config_or_error(self):
+        self.assertEqual(vg.redact_safe_phrase(self.home, "Copper Maple"), "Copper Maple")
+        vg.set_safe_phrase(self.home, self.PHRASE)
+        with mock.patch.object(vg, "_window_matches", side_effect=RuntimeError("boom")):
+            self.assertEqual(vg.redact_safe_phrase(self.home, "Copper Maple"), "Copper Maple")
+        with mock.patch.object(vg, "_load_safe_phrase", side_effect=RuntimeError("boom")):
+            self.assertEqual(vg.redact_safe_phrase(self.home, "Copper Maple"), "Copper Maple")
+
+    def blocked_state(self):
+        vg.record_blocked(self.home, TOKEN, "a shell command", now=T0)
+        return vg.load_state(self.home, TOKEN)["blocked"]
+
+    def test_blocked_kept_on_failed_voice_turn(self):
+        self.arm_safe()
+        self.blocked_state()
+        self.assertFalse(self.say("what was that"))
+        self.assertEqual(len(vg.load_state(self.home, TOKEN)["blocked"]), 1)
+
+    def test_blocked_cleared_on_grant(self):
+        self.arm_safe()
+        self.blocked_state()
+        self.assertTrue(self.say("copper maple"))
+        state = vg.load_state(self.home, TOKEN)
+        self.assertEqual((state["blocked"], state["blocked_more"]), ([], 0))
+
+    def test_blocked_cleared_on_typed(self):
+        self.blocked_state()
+        vg.record_typed(self.home, TOKEN, now=T0 + 1)
+        self.assertEqual(vg.load_state(self.home, TOKEN)["blocked"], [])
+
+
+class TouchesHomeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        base = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        self.parent = str(base)
+        self.h = str(base / ".state")
+        self.project = str(base / "proj")
+
+    def hits(self, tool, inp, cwd=None):
+        return vg._touches_home(tool, inp, self.h, cwd)
+
+    def test_hits(self):
+        h = self.h
+        cases = [
+            ("Read inside", "Read", {"file_path": f"{h}/sessions/x.json"}, self.project),
+            ("Read file", "Read", {"file_path": f"{h}/safe_phrase.json"}, None),
+            ("Read home", "Read", {"file_path": h}, None),
+            ("Read relative", "Read", {"file_path": "safe/x"}, h),
+            ("Read missing", "Read", {}, self.project),
+            ("Notebook", "NotebookRead", {"notebook_path": f"{h}/a.ipynb"}, None),
+            ("Grep parent", "Grep", {"path": self.parent}, self.project),
+            ("Grep no path cwd parent", "Grep", {"pattern": "x"}, self.parent),
+            ("Grep no path no cwd", "Grep", {"pattern": "x"}, None),
+            ("Glob root", "Glob", {"path": "/"}, self.project),
+            ("LS home", "LS", {"path": h}, None),
+            ("cat file", "Bash", {"command": f"cat {h}/safe_phrase.json"}, self.project),
+            ("safe_phrase word", "Bash", {"command": "cat safe_phrase.json"}, self.project),
+            ("cat tilde", "Bash", {"command": "cat ~/.undertone/x"}, self.project),
+            ("grep -r in parent", "Bash", {"command": "grep -r foo ."}, self.parent),
+            ("grep -r no path in parent", "Bash", {"command": "grep -rn foo"}, self.parent),
+            ("dotdot token", "Bash", {"command": "cat ../.state/x"}, self.project),
+            ("redirect glued", "Bash", {"command": f"echo hi;cat {h}/../.state/f"}, self.project),
+            ("flag value", "Bash", {"command": f"tool --dir={self.parent}"}, self.project),
+            ("bad quoting", "Bash", {"command": "cat 'oops"}, self.project),
+            ("bash relative path no cwd", "Bash", {"command": "cat ./x"}, None),
+        ]
+        for name, tool, inp, cwd in cases:
+            with self.subTest(name):
+                self.assertTrue(self.hits(tool, inp, cwd))
+
+    def test_non_hits(self):
+        cases = [
+            ("Read project", "Read", {"file_path": f"{self.project}/a.py"}, self.project),
+            ("Read relative", "Read", {"file_path": "a.py"}, self.project),
+            ("Grep project", "Grep", {"path": self.project}, self.project),
+            ("Grep no path", "Grep", {"pattern": "x"}, self.project),
+            ("cat README", "Bash", {"command": "cat README.md"}, self.project),
+            ("ls src", "Bash", {"command": "ls src && git status"}, self.project),
+            ("other tool", "Write", {"file_path": f"{self.h}/x"}, self.project),
+            ("mcp", "mcp__undertone__reply", {}, self.project),
+        ]
+        for name, tool, inp, cwd in cases:
+            with self.subTest(name):
+                self.assertFalse(self.hits(tool, inp, cwd))
+
+
+class IdentityHomeTests(unittest.TestCase):
+    """Home gate compares file identity, on a real filesystem."""
+
+    def setUp(self) -> None:
+        self.home = tempfile.mkdtemp()
+        self.proj_parent = tempfile.mkdtemp()
+        for d in (self.home, self.proj_parent):
+            self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.project = os.path.join(self.proj_parent, "proj")
+        os.mkdir(self.project)
+        vg.set_safe_phrase(self.home, "copper maple")
+        self.phrase = os.path.join(self.home, "safe_phrase.json")
+        self.link = os.path.join(self.project, "lnk")
+        os.symlink(self.home, self.link)
+        self.sibling = self.home + "2"
+        os.mkdir(self.sibling)
+        self.addCleanup(shutil.rmtree, self.sibling, ignore_errors=True)
+        vg.record_voice(self.home, TOKEN, "do it", now=T0)
+
+    def decide(self, tool, inp, cwd=None):
+        state = vg.load_state(self.home, TOKEN)
+        return vg.decide(state, tool, inp, T0 + 2, home=self.home, cwd=cwd or self.project)
+
+    def assertDenied(self, tool, inp, cwd=None):
+        self.assertEqual(self.decide(tool, inp, cwd), vg.HOME_DENY_REASON)
+
+    def case_variant(self):
+        up = os.path.realpath(self.home).upper()
+        if not os.path.exists(up):
+            self.skipTest("case-sensitive filesystem")
+        return up
+
+    def test_leading_double_slash(self):
+        self.assertDenied("Read", {"file_path": "/" + self.phrase})
+        self.assertDenied("Read", {"file_path": "/" + self.home + "/other.json"})
+
+    def test_case_variant(self):
+        up = self.case_variant()
+        self.assertDenied("Read", {"file_path": up + "/safe_phrase.json"})
+        self.assertDenied("Bash", {"command": f"ls {up}"})
+
+    def test_firmlink_prefix(self):
+        path = "/System/Volumes/Data" + os.path.realpath(self.home) + "/safe_phrase.json"
+        if not os.path.exists(path):
+            self.skipTest("no /System/Volumes/Data firmlink")
+        self.assertDenied("Read", {"file_path": path})
+        self.assertDenied("Read", {"file_path": path.replace("safe_phrase", "other")})
+
+    def test_symlink_into_home(self):
+        self.assertDenied("Read", {"file_path": self.link + "/safe_phrase.json"})
+        self.assertDenied("Grep", {"pattern": "x", "path": self.link})
+        self.assertDenied("Bash", {"command": f"cat {self.link}/safe_phrase.json"})
+
+    def test_basename_anywhere(self):
+        self.assertDenied("Read", {"file_path": os.path.join(self.project, "Safe_Phrase.JSON")})
+
+    def test_ancestor_of_home(self):
+        self.assertDenied("Grep", {"pattern": "x", "path": os.path.dirname(os.path.realpath(self.home))})
+
+    def test_non_hits(self):
+        proj_file = os.path.join(self.project, "a.py")
+        Path(proj_file).write_text("x")
+        self.assertIsNone(self.decide("Read", {"file_path": self.sibling + "/f"}))
+        self.assertIsNone(self.decide("Read", {"file_path": proj_file}))
+        self.assertIsNone(self.decide("Bash", {"command": "grep -n safe_phrase src/undertone/cli.py"}))
+        self.assertIsNone(self.decide("Bash", {"command": "ls .."}))
+
+    def test_renamed_file_aliases(self):
+        filelink = os.path.join(self.project, "filelink")
+        os.symlink(self.phrase, filelink)
+        hl = os.path.join(self.project, "hl.txt")
+        os.link(self.phrase, hl)
+        self.assertDenied("Read", {"file_path": filelink})
+        self.assertDenied("Read", {"file_path": hl})
+        self.assertDenied("Bash", {"command": "cat hl.txt"})
+        self.assertDenied("Bash", {"command": "cat filelink"})
+
+    def test_relative_tokens_and_dotdot_through_symlink(self):
+        os.mkdir(os.path.join(self.home, "sub"))
+        os.symlink(self.home, os.path.join(self.project, "dirlink"))
+        os.symlink(os.path.dirname(self.home), os.path.join(self.project, "parentlink"))
+        os.symlink(os.path.join(self.home, "sub"), os.path.join(self.project, "sublink"))
+        for cmd in ("grep -r . dirlink", "grep -r . parentlink", "grep -r . sublink/.."):
+            with self.subTest(cmd):
+                self.assertDenied("Bash", {"command": cmd})
+        self.assertDenied("Grep", {"pattern": "x", "path": os.path.join(self.project, "sublink", "..")})
+
+    def test_glob_pattern(self):
+        self.assertDenied("Glob", {"pattern": self.home + "/*"})
+        self.assertDenied("Glob", {"pattern": "lnk/../*"})
+
+    def test_relative_non_hits(self):
+        Path(self.project, "README.md").write_text("x")
+        os.mkdir(os.path.join(self.project, "src"))
+        for cmd in ("grep -r foo src", "cat README.md", "ls", "git log --oneline",
+                    "python -m unittest tests"):
+            with self.subTest(cmd):
+                self.assertIsNone(self.decide("Bash", {"command": cmd}))
+
+    def test_unexpected_error_fails_closed(self):
+        with mock.patch.object(vg, "_identity", side_effect=RuntimeError("boom")):
+            self.assertTrue(vg._path_hits(self.project, self.home, None))
+
+
+class HomeGateTests(GuardTestCase):
+    def go_voice(self, now=T0):
+        vg.record_voice(self.home, TOKEN, "do it", now=now)
+
+    def grant(self):
+        vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+        self.assertTrue(vg.record_voice(self.home, TOKEN, "hey jarvis confirm walnut lantern",
+                                        can_grant=True, now=T0 + 1))
+
+    def decide(self, tool, inp, cwd, **kw):
+        state = vg.load_state(self.home, TOKEN)
+        return vg.decide(state, tool, inp, T0 + 2, home=os.path.abspath(self.home), cwd=cwd, **kw)
+
+    def test_voice_home_touch_denied(self):
+        self.go_voice()
+        inp = {"file_path": f"{self.home}/safe_phrase.json"}
+        self.assertEqual(self.decide("Read", inp, "/"), vg.HOME_DENY_REASON)
+
+    def test_grant_does_not_override(self):
+        self.go_voice()
+        self.grant()
+        self.assertIsNone(self.decide("Bash", {"command": "make test"}, "/nonexistent-x/proj"))
+        self.assertEqual(self.decide("Read", {"file_path": f"{self.home}/safe_phrase.json"}, "/"),
+                         vg.HOME_DENY_REASON)
+        self.assertEqual(self.decide("Bash", {"command": f"cat {self.home}/a"}, "/nonexistent-x/proj"),
+                         vg.HOME_DENY_REASON)
+
+    def test_typed_turn_unaffected(self):
+        vg.record_typed(self.home, TOKEN, now=T0)
+        self.assertIsNone(self.decide("Read", {"file_path": f"{self.home}/safe_phrase.json"}, "/"))
+
+    def test_voice_project_read_allowed(self):
+        self.go_voice()
+        self.assertIsNone(self.decide("Read", {"file_path": "/nonexistent-x/proj/a.py"}, "/nonexistent-x/proj"))
+        self.assertIsNone(self.decide("Grep", {"pattern": "x"}, "/nonexistent-x/proj"))
+
+    def test_decide_without_home_unchanged(self):
+        self.go_voice()
+        state = vg.load_state(self.home, TOKEN)
+        self.assertIsNone(vg.decide(state, "Read", {"file_path": f"{self.home}/x"}, T0 + 2))
+
+    def test_main_denies_voice_read_of_phrase_file(self):
+        self.go_voice()
+        payload = {"tool_name": "Read", "tool_input": {"file_path": f"{self.home}/safe_phrase.json"},
+                   "cwd": "/nonexistent-x/proj"}
+        rc, out, _ = self.hook("pretooluse", payload)
+        self.assertEqual(rc, 0)
+        dec = json.loads(out)["hookSpecificOutput"]
+        self.assertEqual(dec["permissionDecision"], "deny")
+        self.assertEqual(dec["permissionDecisionReason"], vg.HOME_DENY_REASON)
+        self.assertIn(" home", (Path(self.home) / "logs" / "guard.log").read_text())
+
+    def test_main_allows_voice_project_read_and_typed_read(self):
+        self.go_voice()
+        payload = {"tool_name": "Read", "tool_input": {"file_path": "/nonexistent-x/proj/a.py"},
+                   "cwd": "/nonexistent-x/proj"}
+        self.assertEqual(self.hook("pretooluse", payload)[:2], (0, ""))
+        self.stop()
+        vg.record_typed(self.home, TOKEN, now=T0 + 3)
+        payload["tool_input"]["file_path"] = f"{self.home}/safe_phrase.json"
+        self.assertEqual(self.hook("pretooluse", payload)[:2], (0, ""))
 
 
 if __name__ == "__main__":

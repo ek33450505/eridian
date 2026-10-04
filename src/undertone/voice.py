@@ -15,7 +15,7 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"[,"check":"..."]}
                                                                     (any number; `check` is
                         honoured on a confirm only: what the voice guard blocked,
-                        spoken in undertone's own voice after Claude's words)
+                        spoken in undertone's own voice before Claude's words)
     voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                        (`via` = what opened the turn; the channel lets only "wake"
                         satisfy a confirm phrase)
@@ -67,6 +67,9 @@ SELF_WAKE_GUARD_S after we stopped, may be our own voice tripping the detector
 (a reply containing "hey jarvice"). It still interrupts and opens a turn, but
 that turn is tagged `wake_barge_in` and can never grant a confirmation; only a
 wake word heard after a full second of silence can.
+While a confirmation is pending, a `wake_barge_in` turn is held, not sent (it
+could not grant, and sending it would use up the challenge): undertone says so
+and the user repeats the wake word after a moment.
 
 Unknown types and malformed lines are ignored; a failure in one connection never
 takes the process down.
@@ -109,10 +112,12 @@ from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
 from .spoken import sanitize_terminal, strip_echo
+from . import voice_guard
 from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
+TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
 
 ANNOUNCE_TEMPLATES = {
     "finished": "Claude finished.",
@@ -208,7 +213,9 @@ class VoiceBridge:
         talk_over: bool = False,
         self_wake_guard_s: float = SELF_WAKE_GUARD_S,
         announce: frozenset[str] = frozenset(),
+        home: Path | None = None,
     ) -> None:
+        self._home = Path(home) if home is not None else None  # resolved lazily: no mkdir at construction
         self._socket_path = Path(socket_path)
         self._follow_up_s = follow_up_s
         self._talk_over = talk_over
@@ -231,6 +238,7 @@ class VoiceBridge:
         self._followed_gen = -1  # main thread only: dedupes reply_done per generation
         self._answered = False  # session lock: a non-ack reply was spoken since the last "finished"
         self._confirm_pending = False  # session lock: confirm/unknown reply, no utterance sent since
+        self._confirm_pending_at = 0.0  # session lock: self._clock() when _confirm_pending was set
         self._announce_last: dict[str, float] = {}  # main thread only: event -> last spoken
         self._clock = clock
         self._self_wake_guard_s = self_wake_guard_s
@@ -381,12 +389,18 @@ class VoiceBridge:
                 self._followed_gen = gen
                 self._listener.listen_now(self._follow_up_s)
 
+    def _confirm_is_pending(self) -> bool:
+        """Session lock held. Pending only while the guard's challenge could still be alive."""
+        return self._confirm_pending and (
+            self._clock() - self._confirm_pending_at <= voice_guard.CHALLENGE_TTL_S
+        )
+
     def _on_announce(self, event: str) -> None:
         """Main thread. `event` is already validated against the enabled templates."""
         if event == "finished":
             with _bounded(self._lock):
                 answered, self._answered = self._answered, False
-                confirm_pending = self._confirm_pending
+                confirm_pending = self._confirm_is_pending()
             if confirm_pending:
                 self._print("[announce skipped: finished (confirm pending)]\n")
                 return
@@ -437,12 +451,26 @@ class VoiceBridge:
             if self._turn_via == "talk_over" and self._echo_ref:
                 kept = strip_echo(text, self._echo_ref)
                 if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
-                    self._print(f'[ignored as my own reply: "{text}"]\n')
+                    self._print(f'[ignored as my own reply: "{self._redact(text)}"]\n')
                     return
                 if kept != text:
-                    self._print(f'[removed my own words: "{text}" -> "{kept}"]\n')
+                    self._print(
+                        f'[removed my own words: "{self._redact(text)}" -> "{self._redact(kept)}"]\n'
+                    )
                     text = kept
-            self._print(f"you: {text}\n")
+            if self._turn_via == "wake_barge_in":
+                with _bounded(self._lock):
+                    held = self._confirm_is_pending()
+                if held:
+                    # Could be our own voice, so it can never grant; sending it
+                    # would only use up the challenge. Say why instead.
+                    self._print(
+                        "[too soon after I spoke, so not sent: wait a moment, "
+                        "then say the wake word again]\n"
+                    )
+                    self._player.enqueue(TOO_SOON_SPEECH, own=True)
+                    return
+            self._print(f"you: {self._redact(text)}\n")
             with _bounded(self._lock):
                 self._gen += 1
                 conn = self._conn
@@ -476,6 +504,9 @@ class VoiceBridge:
     def _is_current(self, gen: int) -> bool:
         with _bounded(self._lock):
             return gen == self._gen
+
+    def _redact(self, text: str) -> str:
+        return voice_guard.redact_safe_phrase(self._home or paths.home_dir(), text)
 
     def _print(self, text: str) -> None:
         with _bounded(self._print_lock):
@@ -625,9 +656,9 @@ class VoiceBridge:
         with _bounded(self._lock):
             if conn is not self._conn:
                 return  # a replaced / never-hello'd connection has no voice
-        self._print(f"claude: {text}\n")
         if check is not None:
             self._print(f"undertone: {check}\n")
+        self._print(f"claude: {text}\n")
         with _bounded(self._chunk_lock):
             self._chunker.reset()
             sentences = self._chunker.feed(text) + self._chunker.flush()
@@ -641,14 +672,15 @@ class VoiceBridge:
                 self._answered = True
             if kind not in ("answer", "ack"):
                 self._confirm_pending = True
+                self._confirm_pending_at = self._clock()
                 self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
             if self._spoken_gen != gen:
                 self._spoken_gen, self._spoken_text = gen, ""
-            self._spoken_text += " ".join(sentences + check_sentences) + " "
-            for sentence in sentences:
-                self._player.enqueue(sentence)
+            self._spoken_text += " ".join(check_sentences + sentences) + " "
             for sentence in check_sentences:
                 self._player.enqueue(sentence, own=True)
+            for sentence in sentences:
+                self._player.enqueue(sentence)
         if kind == "confirm":
             self._print('[confirmation needed: when I finish, say "hey jarvis" and the phrase]\n')
         self._speech_q.put((gen, kind))

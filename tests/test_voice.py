@@ -21,6 +21,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from undertone import voice_guard
 from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
 from undertone.spoken import sanitize_terminal
 from undertone.voice import (
@@ -31,6 +32,7 @@ from undertone.voice import (
     MAX_CONNECTIONS,
     MAX_LINE_BYTES,
     NO_SESSION_SPEECH,
+    TOO_SOON_SPEECH,
     VoiceBridge,
     _Conn,
     self_wake_guard_from_env,
@@ -127,13 +129,14 @@ class _Channel:
 
 class VoiceTestCase(unittest.TestCase):
     follow_up_s = 6.0
+    socket_free = False  # True: no AF_UNIX path, so no /tmp and no length limit
 
     def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory(prefix="ut", dir="/tmp")
+        tmp = tempfile.TemporaryDirectory(prefix="ut", dir=None if self.socket_free else "/tmp")
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
         self.sock_path = self.home / "voice.sock"
-        if len(str(self.sock_path)) >= 100:
+        if not self.socket_free and len(str(self.sock_path)) >= 100:
             self.skipTest(f"socket path too long for AF_UNIX: {self.sock_path}")
 
         self.clock = _FakeClock()
@@ -164,6 +167,7 @@ class VoiceTestCase(unittest.TestCase):
             follow_up_s=self.follow_up_s,
             cue=self.cues.append,
             out=self.out,
+            home=self.home,
         )
         kwargs.update(overrides)
         return VoiceBridge(**kwargs)
@@ -674,6 +678,7 @@ class SelfWakeViaTest(unittest.TestCase):
             stt=lambda audio: "",
             clock=self.clock,
             socket_path=Path(tmp.name) / "voice.sock",
+            home=Path(tmp.name),
             player_factory=lambda: self.player,
             out=io.StringIO(),
         )
@@ -787,6 +792,7 @@ class _AnnounceBase(unittest.TestCase):
             stt=lambda audio: "",
             clock=self.clock,
             socket_path=Path(tmp.name) / "voice.sock",
+            home=Path(tmp.name),
             player_factory=lambda: self.player,
             cue=self.cues.append,
             out=self.out,
@@ -936,6 +942,18 @@ class AnnounceTest(_AnnounceBase):
             self.announce()
             self.clock.now += ANNOUNCE_REPEAT_S + 1
         self.assertEqual(self.spoken(), [])
+
+    def test_finished_skip_for_confirm_expires_with_the_challenge(self) -> None:
+        self.reply("confirm")
+        self.player.enqueued.clear()
+        self.clock.now = voice_guard.CHALLENGE_TTL_S - 1
+        self.announce()
+        self.assertIn("(confirm pending)", self.out.getvalue())
+        self.clock.now = voice_guard.CHALLENGE_TTL_S + 1
+        self.announce()
+        self.assertEqual(self.out.getvalue().count("(confirm pending)"), 1)
+        self.assertIn("[announce: finished]", self.out.getvalue())
+        self.assertEqual(self.spoken(), ["Claude finished."])
 
     def test_confirm_pending_does_not_block_other_events(self) -> None:
         self.reply("confirm")
@@ -1112,6 +1130,7 @@ class AnnounceTalkOverTest(unittest.TestCase):
             stt=lambda audio: "",
             clock=_FakeClock(),
             socket_path=Path(tmp.name) / "voice.sock",
+            home=Path(tmp.name),
             player_factory=lambda: player,
             out=io.StringIO(),
             talk_over=True,
@@ -1287,6 +1306,8 @@ class RobustnessTest(VoiceTestCase):
 class ReadBackReplyTest(VoiceTestCase):
     """Socket-free: the bridge is never started; lines go straight to the handler."""
 
+    socket_free = True
+
     CHECK = "This will run: the shell command git reset."
 
     def setUp(self) -> None:
@@ -1298,11 +1319,11 @@ class ReadBackReplyTest(VoiceTestCase):
         line = json.dumps({"type": "reply", "text": "Say confirm walnut lantern.", **fields})
         self.bridge._handle_line(self.conn, line.encode("utf-8"))
 
-    def test_confirm_check_is_spoken_in_own_voice_after_claude(self) -> None:
+    def test_confirm_check_is_spoken_in_own_voice_before_claude(self) -> None:
         self.reply(kind="confirm", check=self.CHECK)
-        self.assertEqual(self.player.enqueued[-1], self.CHECK)
-        self.assertEqual(self.player.own_flags[-1], True)
-        self.assertEqual(self.player.own_flags[:-1], [False] * (len(self.player.own_flags) - 1))
+        self.assertEqual(self.player.enqueued[0], self.CHECK)
+        self.assertEqual(self.player.own_flags[0], True)
+        self.assertEqual(self.player.own_flags[1:], [False] * (len(self.player.own_flags) - 1))
         self.assertGreaterEqual(len(self.player.enqueued), 2)
 
     def test_check_on_answer_or_ack_is_ignored(self) -> None:
@@ -1323,17 +1344,126 @@ class ReadBackReplyTest(VoiceTestCase):
                 self.assertNotIn(True, self.player.own_flags)
         self.assertNotIn("undertone:", self.out.getvalue())
 
-    def test_check_is_printed_between_claude_and_confirmation_notice(self) -> None:
+    def test_check_is_printed_before_claude_and_confirmation_notice(self) -> None:
         self.reply(kind="confirm", check=self.CHECK)
         printed = self.out.getvalue()
-        a = printed.index("claude: ")
-        b = printed.index(f"undertone: {self.CHECK}\n")
+        a = printed.index(f"undertone: {self.CHECK}\n")
+        b = printed.index("claude: ")
         c = printed.index("[confirmation needed")
         self.assertTrue(a < b < c)
 
     def test_check_lands_in_echo_filter(self) -> None:
         self.reply(kind="confirm", check=self.CHECK)
         self.assertIn(self.CHECK, self.bridge._spoken_text)
+
+
+class TooSoonAndRedactionTest(VoiceTestCase):
+    """Socket-free: events and lines go straight to the handlers."""
+
+    socket_free = True
+    CHECK = "This will run: the shell command git reset."
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sent: list[dict] = []
+        conn = _Conn(mock.Mock())
+        conn.send = lambda obj: self.sent.append(obj) or True
+        self.conn = conn
+        self.bridge._conn = conn
+
+    def reply(self, **fields) -> None:
+        line = json.dumps({"type": "reply", "text": "Say confirm walnut lantern.", **fields})
+        self.bridge._handle_line(self.conn, line.encode("utf-8"))
+
+    def say(self, via: str, text: str) -> None:
+        self.bridge._turn_via = via
+        self.bridge._on_listener_event(ListenerEvent("utterance", text=text))
+
+    def test_check_enqueued_own_before_claude_sentences(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.assertEqual(self.player.enqueued[0], self.CHECK)
+        self.assertEqual(self.player.own_flags[0], True)
+        self.assertNotIn(True, self.player.own_flags[1:])
+        printed = self.out.getvalue()
+        self.assertLess(printed.index("undertone: "), printed.index("claude: "))
+
+    def test_early_wake_turn_held_while_confirm_pending(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.player.enqueued.clear()
+        self.player.own_flags.clear()
+        self.say("wake_barge_in", "confirm walnut lantern")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.player.enqueued, [TOO_SOON_SPEECH])
+        self.assertEqual(self.player.own_flags, [True])
+        self.assertTrue(self.bridge._confirm_pending)
+        printed = self.out.getvalue()
+        self.assertIn("[too soon after I spoke, so not sent", printed)
+        self.assertNotIn("you: ", printed)
+
+        self.say("wake", "confirm walnut lantern")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["via"], "wake")
+        self.assertFalse(self.bridge._confirm_pending)
+
+    def test_early_wake_turn_hold_expires_with_the_challenge(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.player.enqueued.clear()
+        self.clock.now = voice_guard.CHALLENGE_TTL_S - 1
+        self.say("wake_barge_in", "confirm walnut lantern")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.player.enqueued, [TOO_SOON_SPEECH])
+
+        self.clock.now = voice_guard.CHALLENGE_TTL_S + 1
+        self.say("wake_barge_in", "confirm walnut lantern")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["via"], "wake_barge_in")
+
+    def test_early_wake_turn_sent_when_no_confirm_pending(self) -> None:
+        self.say("wake_barge_in", "what time is it")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["via"], "wake_barge_in")
+        self.assertNotIn(TOO_SOON_SPEECH, self.player.enqueued)
+        self.assertIn("you: what time is it", self.out.getvalue())
+
+    def test_safe_phrase_redacted_in_print_but_raw_on_socket(self) -> None:
+        voice_guard.set_safe_phrase(self.home, "copper maple")
+        self.say("wake", "confirm copper maple please")
+        self.assertEqual(self.sent[0]["text"], "confirm copper maple please")
+        printed = self.out.getvalue()
+        self.assertIn("you: confirm [safe phrase] please", printed)
+        self.assertNotIn("copper", printed)
+
+    def test_safe_phrase_redacted_in_echo_filter_prints(self) -> None:
+        voice_guard.set_safe_phrase(self.home, "copper maple")
+        self.bridge._turn_via = "talk_over"
+        self.bridge._echo_ref = "copper maple"
+        self.bridge._on_listener_event(ListenerEvent("utterance", text="copper maple"))
+        printed = self.out.getvalue()
+        self.assertIn("[ignored as my own reply:", printed)
+        self.assertNotIn("copper", printed)
+
+    def test_prints_unchanged_without_phrase(self) -> None:
+        self.say("wake", "copper maple")
+        self.assertIn("you: copper maple\n", self.out.getvalue())
+
+
+class HomeDefaultIsLazyTest(unittest.TestCase):
+    def test_construction_without_home_does_not_create_it(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = Path(tmp.name) / "no-such-home"
+        with mock.patch.dict(os.environ, {"UNDERTONE_HOME": str(target)}):
+            bridge = VoiceBridge(
+                wake_factory=lambda: (lambda frame: False),
+                vad=lambda chunk: 0.0,
+                stt=lambda audio: "",
+                clock=_FakeClock(),
+                socket_path=Path(tmp.name) / "voice.sock",
+                player_factory=_FakePlayer,
+                out=io.StringIO(),
+            )
+            self.addCleanup(bridge.close)
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

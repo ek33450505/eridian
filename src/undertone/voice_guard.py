@@ -21,7 +21,16 @@ destructive, but that is a soft control. This module is the hard one:
     it inherited. Only SubagentStart records agents; an agent_id PreToolUse
     cannot find (missed start, eviction, early stop, invalid id) is tainted;
   - while the latest turn was spoken, any tool call outside a read-only
-    allowlist is denied until the user speaks the exact confirm phrase.
+    allowlist is denied until the user speaks the confirm phrase. The confirm is
+    either the user's own fixed safe phrase (if configured; stored only as a
+    salted scrypt hash in <home>/safe_phrase.json, 0600, and never shown to Claude)
+    or, when none is configured, the per-action "confirm <word1> <word2>" Claude
+    picks. The stored hash is scrypt (salted), but a 1-3 word phrase is still
+    guessable offline by anyone holding the file, so the protection is 0600
+    plus keeping the file unreadable: on a voice turn the guard refuses any
+    Read/Grep/Glob/LS/Bash that could touch undertone's home, even after a
+    confirm, and `undertone session` also adds a Claude Code deny rule for
+    Reading the file.
 
 Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
   - pretooluse turns every error into exit 2 (block, stderr goes to Claude);
@@ -46,11 +55,14 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
+import hmac
 import ipaddress
 import json
 import math
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -71,6 +83,16 @@ MAX_BLOCKED = 3
 MAX_WHAT_CHARS = 160
 MAX_BLOCKED_MORE = 1_000_000
 NOTHING_BLOCKED = "undertone has not blocked anything yet."
+SAFE_PHRASE_FILE = "safe_phrase.json"
+_MAX_WALK = 64  # ancestor steps when comparing path identity
+SAFE_PHRASE_MARKER = "<safe phrase>"  # challenge phrase in safe-phrase mode; normalize() can never produce it
+REDACTED_PHRASE = "[safe phrase]"
+MAX_SAFE_PHRASE_BYTES = 1024
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
+MAX_REDACT_HASHES = 16  # scrypt calls per redact_safe_phrase; length matches beyond it are redacted unhashed
+SAFE_PHRASE_RESERVED = frozenset({"hey", "jarvis", "confirm"})
+_HEX32_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_HEX64_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _NO_AGENT: Any = object()  # payload had no agent_id key: the main thread
 
 STOPWORDS = frozenset({
@@ -84,6 +106,11 @@ DENY_REASON = (
     "\"confirm <word1> <word2>\", and retry only after that exact phrase arrives. "
     "Do not try a different tool or command to get around this. "
     "If the user is at the keyboard, they can type the request once the current voice turn has finished."
+)
+
+HOME_DENY_REASON = (
+    "undertone voice guard: undertone's own state folder can't be read or searched on a voice turn, "
+    "even after a confirm. Tell the user; they can do it by typing."
 )
 
 UNGATED_TOOLS = frozenset({
@@ -363,6 +390,171 @@ def _update(home: Any, token: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
         os.close(lock_fd)
 
 
+# -- safe phrase ----------------------------------------------------------
+
+
+def validate_safe_phrase(phrase: str) -> str:
+    """Return the normalized safe phrase, or raise ValueError with a user-facing message."""
+    norm = normalize(phrase)
+    words = norm.split()
+    if not 1 <= len(words) <= 3:
+        raise ValueError("The safe phrase must be one to three words.")
+    if not all(w.isalpha() for w in words):
+        raise ValueError("The safe phrase must be letters only, no digits.")
+    if not 4 <= len(norm) <= 40:
+        raise ValueError("The safe phrase must be 4 to 40 characters long.")
+    if any(w in SAFE_PHRASE_RESERVED for w in words):
+        raise ValueError("The safe phrase cannot use the words hey, jarvis or confirm.")
+    if all(w in STOPWORDS for w in words):
+        raise ValueError("The safe phrase is too common; use at least one uncommon word.")
+    if len(words) < 2 and len(norm) < 8:
+        raise ValueError("A one-word safe phrase must be at least 8 letters; use two words or a longer one.")
+    return norm
+
+
+def _phrase_hash(salt: str, norm: str) -> str:
+    return hashlib.scrypt(
+        norm.encode(), salt=bytes.fromhex(salt), n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32).hex()
+
+
+def _safe_phrase_path(home: Any) -> Path:
+    return Path(home) / SAFE_PHRASE_FILE
+
+
+def set_safe_phrase(home: Any, phrase: str) -> None:
+    """Store the salted hash of the safe phrase atomically, 0600, in a 0700 home."""
+    norm = validate_safe_phrase(phrase)
+    salt = secrets.token_hex(16)
+    rec = {"v": 2, "salt": salt, "words": len(norm.split()), "chars": len(norm),
+           "n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P, "hash": _phrase_hash(salt, norm)}
+    home_path = Path(home)
+    path = _safe_phrase_path(home)
+    try:
+        if home_path.is_symlink():
+            raise GuardError("home dir is a symlink")
+        home_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(home_path, 0o700)
+        if path.is_symlink():
+            raise GuardError("safe phrase file is a symlink")
+        tmp_fd, tmp_name = tempfile.mkstemp(dir=home_path, prefix=".safe_phrase.", suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, separators=(",", ":"))
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise GuardError(f"cannot write safe phrase: {exc.strerror}") from exc
+
+
+def clear_safe_phrase(home: Any) -> bool:
+    """Remove the safe phrase; True when there was one."""
+    path = _safe_phrase_path(home)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise GuardError(f"cannot remove safe phrase: {exc.strerror}") from exc
+    return True
+
+
+def safe_phrase_configured(home: Any) -> bool:
+    path = _safe_phrase_path(home)
+    return path.is_file() and not path.is_symlink()
+
+
+def _load_safe_phrase(home: Any) -> dict[str, Any] | None:
+    """The validated safe-phrase record, or None for no/malformed/unsafe config (fail closed)."""
+    try:
+        fd = os.open(_safe_phrase_path(home), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if (st.st_mode & 0o170000) != 0o100000 or st.st_size > MAX_SAFE_PHRASE_BYTES:
+                return None
+            if st.st_uid != os.getuid() or st.st_mode & 0o077:
+                return None
+            raw = json.loads(fh.read(MAX_SAFE_PHRASE_BYTES + 1))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict) or raw.get("v") != 2:
+        return None
+    if not all(_is_int(raw.get(k)) and raw[k] == v for k, v in (("n", SCRYPT_N), ("r", SCRYPT_R), ("p", SCRYPT_P))):
+        return None
+    salt, words, chars, digest = raw.get("salt"), raw.get("words"), raw.get("chars"), raw.get("hash")
+    if not (isinstance(salt, str) and _HEX32_RE.fullmatch(salt)
+            and isinstance(digest, str) and _HEX64_RE.fullmatch(digest)
+            and _is_int(words) and 1 <= words <= 3
+            and _is_int(chars) and 4 <= chars <= 40):
+        return None
+    return {"salt": salt, "words": words, "chars": chars, "hash": digest}
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _window_fits(window: list[str], rec: dict[str, Any]) -> bool:
+    """Cheap prefilter: only a window of the right joined length can be the phrase."""
+    return sum(len(w) for w in window) + len(window) - 1 == rec["chars"]
+
+
+def _window_matches(window: list[str], rec: dict[str, Any]) -> bool:
+    return hmac.compare_digest(_phrase_hash(rec["salt"], " ".join(window)), rec["hash"])
+
+
+def _phrase_in(norm_words: list[str], rec: dict[str, Any]) -> bool:
+    n = rec["words"]
+    for i in range(len(norm_words) - n + 1):
+        window = norm_words[i:i + n]
+        if _window_fits(window, rec) and _window_matches(window, rec):
+            return True
+    return False
+
+
+def redact_safe_phrase(home: Any, text: str) -> str:
+    """Replace each safe-phrase occurrence in text with [safe phrase]. Never raises; not a gate.
+
+    At most MAX_REDACT_HASHES windows are hashed per call; a length match beyond
+    that is redacted unhashed, which over-redacts (the safe direction).
+    """
+    try:
+        rec = _load_safe_phrase(home)
+        if rec is None:
+            return text
+        n = rec["words"]
+        toks = list(re.finditer(r"[A-Za-z0-9]+", text))
+        out: list[str] = []
+        pos = 0
+        i = 0
+        hashed = 0
+        while i < len(toks):
+            window = [t.group().lower() for t in toks[i:i + n]]
+            hit = False
+            if len(window) == n and _window_fits(window, rec):
+                if hashed < MAX_REDACT_HASHES:
+                    hashed += 1
+                    hit = _window_matches(window, rec)
+                else:
+                    hit = True
+            if hit:
+                out.append(text[pos:toks[i].start()])
+                out.append(REDACTED_PHRASE)
+                pos = toks[i + n - 1].end()
+                i += n
+            else:
+                i += 1
+        out.append(text[pos:])
+        return "".join(out)
+    except Exception:  # noqa: BLE001 - redaction must never break the caller
+        return text
+
+
 # -- transitions ----------------------------------------------------------
 
 
@@ -399,24 +591,42 @@ def record_voice(
     def fn(state: dict[str, Any]) -> bool:
         state["voice_at"] = stamp
         challenge = state["challenge"]
-        granted = bool(
-            can_grant
-            and challenge
-            and stamp - challenge["at"] <= CHALLENGE_TTL_S
-            and f" confirm {challenge['phrase']} " in f" {norm} "
-        )
+        if challenge and challenge["phrase"] == SAFE_PHRASE_MARKER:
+            rec = _load_safe_phrase(home) if can_grant and stamp - challenge["at"] <= CHALLENGE_TTL_S else None
+            words = norm.split()
+            granted = bool(rec and len(words) <= rec["words"] + 2 and _phrase_in(words, rec))
+        else:
+            granted = bool(
+                can_grant
+                and challenge
+                and stamp - challenge["at"] <= CHALLENGE_TTL_S
+                and f" confirm {challenge['phrase']} " in f" {norm} "
+            )
         state["grant"] = {"at": stamp} if granted else None
         state["challenge"] = None  # one attempt per challenge
-        state["blocked"] = []  # a new utterance starts fresh
-        state["blocked_more"] = 0
+        if granted:  # a failed confirm keeps the blocked list so Claude can re-ask meaningfully
+            state["blocked"] = []
+            state["blocked_more"] = 0
         return granted
 
     return _update(home, token, fn)
 
 
-def record_confirm_request(home: Any, token: str, reply_text: str, *, now: float | None = None) -> str:
-    """Arm a challenge from Claude's confirm reply and return its phrase."""
+def record_confirm_request(
+    home: Any, token: str, reply_text: str, *, safe_phrase: bool = False, now: float | None = None
+) -> str:
+    """Arm a challenge from Claude's confirm reply and return its phrase.
+
+    With `safe_phrase` the user's own configured phrase is the challenge: nothing
+    is taken from the reply text and SAFE_PHRASE_MARKER is returned.
+    """
     stamp = _now(now)
+    if safe_phrase:
+        def arm(state: dict[str, Any]) -> str:
+            state["challenge"] = {"phrase": SAFE_PHRASE_MARKER, "at": stamp}
+            return SAFE_PHRASE_MARKER
+
+        return _update(home, token, arm)
     candidates = _CONFIRM_RE.findall(normalize(reply_text))
 
     def fn(state: dict[str, Any]) -> str:
@@ -1107,20 +1317,195 @@ def _agent_tainted(state: dict[str, Any], agent_id: Any) -> bool:
     return rec is None or rec["voice"]
 
 
+def _abs_path(raw: str, cwd: str | None) -> str | None:
+    """Normalized absolute form of a path string, or None for a relative path with no cwd."""
+    p = os.path.expanduser(raw)
+    if not os.path.isabs(p):
+        if cwd is None:
+            return None
+        p = os.path.join(cwd, p)
+    return os.path.normpath(p)
+
+
+def _identity(path: str) -> tuple[int, int] | None:
+    """(st_dev, st_ino) of the file a path resolves to (symlinks followed), or None."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+_MAX_ENTRIES = 256  # directory entries whose identity is collected per listed dir
+
+
+def _entry_ids(directory: str) -> set[tuple[int, int]]:
+    """Identities of up to _MAX_ENTRIES entries directly in a directory (symlinks followed)."""
+    out: set[tuple[int, int]] = set()
+    try:
+        with os.scandir(directory) as it:
+            for i, entry in enumerate(it):
+                if i >= _MAX_ENTRIES:
+                    break
+                ident = _identity(entry.path)
+                if ident is not None:
+                    out.add(ident)
+    except OSError:
+        pass
+    return out
+
+
+def _home_ids(
+    home: str,
+) -> tuple[tuple[int, int] | None, frozenset[tuple[int, int]], frozenset[tuple[int, int]]]:
+    """Identity of the home, identities of its ancestors up to "/", and identities of the
+    files directly in the home and its sessions/ dir (so a renamed symlink or hard link to
+    safe_phrase.json is recognised by inode)."""
+    ancestors: set[tuple[int, int]] = set()
+    cur = os.path.dirname(home)
+    for _ in range(_MAX_WALK):
+        ident = _identity(cur)
+        if ident is not None:
+            ancestors.add(ident)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    files = _entry_ids(home) | _entry_ids(os.path.join(home, "sessions"))
+    phrase = _identity(os.path.join(home, SAFE_PHRASE_FILE))
+    if phrase is not None:
+        files.add(phrase)
+    return _identity(home), frozenset(ancestors), frozenset(files)
+
+
+def _identity_hits(start: str, ids: Any) -> bool:
+    """Identity test on one path as the kernel sees it: the path is the home, inside it, an
+    ancestor of it, or one of the home's files (by inode)."""
+    home_id, ancestors, files = ids
+    first = _identity(start)
+    if first is not None and (first in ancestors or first in files):
+        return True
+    cur = start
+    for _ in range(_MAX_WALK):
+        ident = _identity(cur)
+        if ident is not None and ident == home_id:
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return False
+
+
+def _path_hits(raw: Any, home: str, cwd: str | None, ids: Any = None) -> bool:
+    """True when the path is the home, inside it, or an ancestor of it (fail closed on junk).
+
+    Compared by file identity as well as by string, so `//`, case variants, firmlinks,
+    symlinks (including `..` taken after a symlink) and renamed links to the home's files
+    cannot slip past."""
+    if not isinstance(raw, str) or not raw:
+        return True
+    try:
+        p = _abs_path(raw, cwd)
+        if p is None:
+            return True
+        rawj = os.path.expanduser(raw)
+        if not os.path.isabs(rawj):
+            rawj = os.path.join(cwd or "", rawj)
+        p = re.sub(r"^/+", "/", p)
+        h = re.sub(r"^/+", "/", home)
+        pc, hc = p.casefold(), h.casefold()
+        if pc == hc or pc == "/" or pc.startswith(hc + "/") or hc.startswith(pc.rstrip("/") + "/"):
+            return True
+        if os.path.basename(p).casefold() == SAFE_PHRASE_FILE.casefold():
+            return True
+        ids = ids if ids is not None else _home_ids(h)
+        if ids[0] is None:
+            return False
+        return any(_identity_hits(c, ids) for c in (p, rawj, os.path.realpath(rawj)))
+    except Exception:  # noqa: BLE001 - fail closed; decide must never raise
+        return True
+
+
+_GLOB_CHARS = re.compile(r"[*?\[{]")
+
+
+def _glob_pattern_hits(pattern: Any, home: str, cwd: str | None, ids: Any) -> bool:
+    """A Glob pattern that is absolute or climbs with `..` is judged by its literal directory part."""
+    if not isinstance(pattern, str) or not pattern:
+        return False
+    if not (pattern.startswith(("/", "~")) or ".." in pattern.split("/")):
+        return False
+    m = _GLOB_CHARS.search(pattern)
+    prefix = pattern[: m.start()] if m else pattern
+    directory = prefix[: prefix.rfind("/") + 1] or "."
+    return _path_hits(directory, home, cwd, ids)
+
+
+def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -> bool:
+    """True when the call could read or search undertone's home.
+
+    Paths are compared by file identity (device+inode, symlinks followed) as well as by
+    string, so `//`, case variants, firmlinks and symlinks into the home are caught. After
+    a confirm, Bash access is best-effort: `$` expansion, globs and `python -c` can still
+    reach files; before a grant, those are already gated by the plain-argument rules."""
+    home = os.path.normpath(home)
+    ids = _home_ids(re.sub(r"^/+", "/", home))
+    inp = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name in ("Read", "NotebookRead"):
+        return _path_hits(inp.get("file_path" if tool_name == "Read" else "notebook_path"), home, cwd, ids)
+    if tool_name in ("Grep", "Glob", "LS"):
+        if tool_name == "Glob" and _glob_pattern_hits(inp.get("pattern"), home, cwd, ids):
+            return True
+        path = inp.get("path")
+        if path is None:
+            return cwd is None or _path_hits(cwd, home, cwd, ids)
+        return _path_hits(path, home, cwd, ids)
+    if tool_name != "Bash":
+        return False
+    command = inp.get("command")
+    if not isinstance(command, str):
+        return True
+    folded = command.casefold()
+    if ".undertone" in folded or home.casefold() in folded:
+        return True
+    if cwd is not None and _path_hits(cwd, home, cwd, ids):
+        return True
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True
+    for tok in tokens:
+        for part in (tok, tok.partition("=")[2]):
+            if not part or part.startswith("-"):
+                continue
+            if cwd is None and not ("/" in part or part[0] in "~."):
+                continue  # a bare word can't be resolved without a cwd
+            if _path_hits(part, home, cwd, ids):
+                return True
+    return False
+
+
 def decide(
     state: dict[str, Any] | None, tool_name: str, tool_input: Any, now: float,
-    agent_id: Any = _NO_AGENT,
+    agent_id: Any = _NO_AGENT, *, home: str | None = None, cwd: str | None = None,
 ) -> str | None:
     """Return a deny reason, or None to allow.
 
     A subagent call is ungated only if the agent was recorded as typed-origin;
     an unknown or invalid agent_id is voice-tainted with no inherited grant.
+    With `home`, a voice-gated call that could read that folder is denied no
+    matter what grant is held.
     """
     if state is None:
         return None
     tainted = _agent_tainted(state, agent_id)
     if not tainted and not voice_active(state):
         return None
+    if home is not None and _touches_home(tool_name, tool_input, home, cwd):
+        return HOME_DENY_REASON
     if gate_reason(tool_name, tool_input) is None:
         return None
     if tainted and _valid_agent_id(agent_id):
@@ -1241,7 +1626,9 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         tag = " a:invalid"
     state = load_state(home, token)
     now = time.time()
-    reason = decide(state, tool_name, tool_input, now, agent_id)
+    raw_cwd = payload.get("cwd")
+    cwd = raw_cwd if isinstance(raw_cwd, str) and os.path.isabs(raw_cwd) else None
+    reason = decide(state, tool_name, tool_input, now, agent_id, home=os.path.abspath(home), cwd=cwd)
     if reason is None:
         gated = (
             state is not None
@@ -1250,7 +1637,8 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         )
         _log(home, "pretooluse", "granted" if gated else "allow", tool_name, f"-{tag}")
         return
-    _log(home, "pretooluse", "deny", tool_name, f"{gate_reason(tool_name, tool_input) or '-'}{tag}")
+    why = "home" if reason == HOME_DENY_REASON else (gate_reason(tool_name, tool_input) or "-")
+    _log(home, "pretooluse", "deny", tool_name, f"{why}{tag}")
     stdout.write(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -1260,9 +1648,7 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
     }))
     stdout.flush()
     try:
-        cwd = payload.get("cwd")
-        record_blocked(home, token, describe_call(
-            tool_name, tool_input, cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None))
+        record_blocked(home, token, describe_call(tool_name, tool_input, cwd))
     except Exception:
         _log(home, "pretooluse", "error", tool_name, "record_blocked")
 

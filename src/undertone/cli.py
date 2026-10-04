@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import getpass
 import json
 import os
 import secrets
@@ -378,6 +379,7 @@ def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
 
 def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
     """Inline `--settings` JSON that installs the voice guard's hooks and the announce hooks for one session."""
+    from . import voice_guard
 
     def _hook_cmd(event: str) -> str:
         parts = [
@@ -399,7 +401,11 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
             "timeout": 10,
         }
 
+    # Claude never needs the safe-phrase hash; deny its Read tool on every turn, typed
+    # included. `//path` is gitignore-style for an absolute path from the filesystem root.
+    abs_home = os.path.abspath(home)
     return {
+        "permissions": {"deny": [f"Read(/{abs_home}/{voice_guard.SAFE_PHRASE_FILE})"]},
         # --settings outranks project/local/user settings, so this forces hooks on.
         "disableAllHooks": False,
         "hooks": {
@@ -551,6 +557,64 @@ def _cmd_models_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_safe_phrase(args: argparse.Namespace) -> int:
+    from . import voice_guard
+
+    home = paths.home_dir()
+    try:
+        if args.status:
+            if voice_guard.safe_phrase_configured(home):
+                print("A safe phrase is set.")
+            else:
+                print(
+                    "No safe phrase is set (voice confirms use a fresh two-word phrase)."
+                )
+            return 0
+        if args.clear:
+            if voice_guard.clear_safe_phrase(home):
+                print(
+                    "Safe phrase removed; voice confirms use a fresh two-word phrase "
+                    "again. Restart attach and session."
+                )
+            else:
+                print("No safe phrase was set.")
+            return 0
+        if not sys.stdin.isatty():
+            # getpass falls back to an echoed prompt without a TTY, which would print the phrase.
+            print(
+                "undertone safe-phrase needs an interactive terminal so your phrase stays hidden.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            first = voice_guard.validate_safe_phrase(
+                getpass.getpass("Safe phrase (1-3 words; hidden): ")
+            )
+            again = getpass.getpass("Say it again (hidden): ")
+        except (EOFError, KeyboardInterrupt):
+            return 1
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        try:
+            matches = voice_guard.validate_safe_phrase(again) == first
+        except ValueError:
+            matches = False
+        if not matches:
+            print("The two entries didn't match; nothing changed.", file=sys.stderr)
+            return 1
+        voice_guard.set_safe_phrase(home, first)
+    except voice_guard.GuardError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(
+        "Safe phrase set. Restart `undertone attach` and `undertone session` to use it. "
+        "Voice confirms are now: the wake word, then your safe phrase.\n"
+        "Keep it private: anyone who hears it can use it to confirm."
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="undertone")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -640,6 +704,18 @@ def build_parser() -> argparse.ArgumentParser:
         "'permission' skips 'finished')",
     )
     attach_parser.set_defaults(func=_cmd_attach)
+
+    safe_parser = sub.add_parser(
+        "safe-phrase", help="set, clear or check the safe phrase that confirms voice approvals"
+    )
+    safe_group = safe_parser.add_mutually_exclusive_group()
+    safe_group.add_argument(
+        "--clear", action="store_true", help="remove the safe phrase"
+    )
+    safe_group.add_argument(
+        "--status", action="store_true", help="say whether a safe phrase is set"
+    )
+    safe_parser.set_defaults(func=_cmd_safe_phrase)
 
     models_parser = sub.add_parser("models", help="manage local speech models")
     models_sub = models_parser.add_subparsers(dest="models_command", required=True)
