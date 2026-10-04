@@ -711,28 +711,124 @@ _SUBCOMMAND_PROGRAMS = frozenset({
 _SINGLE_PHRASE_CHARS = 100
 
 
-def _bash_segments(command: str) -> list[list[str]]:
-    """Split into [program, *args] segments, env assignments dropped. Raises ValueError."""
+_WRAPPER_VALUE_FLAGS = {
+    "sudo": frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-R", "-r", "-t", "-T", "-U"}),
+    "env": frozenset({"-u", "-C", "-S"}),
+    "xargs": frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"}),
+    "nohup": frozenset(),
+    "time": frozenset({"-f", "-o"}),
+    "nice": frozenset({"-n"}),
+    "exec": frozenset({"-a"}),
+    "command": frozenset(),
+    "builtin": frozenset(),
+    "timeout": frozenset({"-s", "-k"}),
+    "watch": frozenset({"-n", "-d"}),
+    "caffeinate": frozenset({"-t", "-w"}),
+}
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
+_SHELL_C_FLAG_RE = re.compile(r"-[A-Za-z]*c[A-Za-z]*", re.ASCII)
+_FIND_EXEC = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_REDIRECT_OUT = frozenset({">", ">>", "&>", "&>>", ">|", "<>"})
+_FD_DUP_RE = re.compile(r"[0-9]+-?|-", re.ASCII)
+_REDIRECT_TARGET_CHARS = 24
+_Segment = tuple[list[str], list[str]]  # (program and args, output redirect targets)
+
+
+def _bash_segments(command: str) -> list[_Segment]:
+    """Split into (program + args, output redirect targets) segments. Raises ValueError."""
     lex = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""  # bash treats `a#` as a word, not a comment
-    segments: list[list[str]] = [[]]
-    for tok in lex:
+    tokens = list(lex)
+    segments: list[_Segment] = [([], [])]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+        nxt_is_word = nxt is not None and not set(nxt) <= _OPERATOR_CHARS
         if set(tok) <= _SEPARATOR_CHARS:
-            segments.append([])
-        elif not set(tok) <= _OPERATOR_CHARS:
-            segments[-1].append(tok)
+            segments.append(([], []))
+        elif tok.isdigit() and nxt is not None and set(nxt) <= _OPERATOR_CHARS and set(nxt) & set("<>"):
+            pass  # an fd number in front of a redirect, such as the 2 in 2>&1
+        elif tok in _REDIRECT_OUT or (tok == ">&" and nxt_is_word and not _FD_DUP_RE.fullmatch(nxt)):
+            if nxt_is_word:
+                if nxt != "/dev/null":
+                    segments[-1][1].append(nxt)
+                i += 1
+        elif set(tok) <= _OPERATOR_CHARS:
+            if tok in ("<", "<&", ">&") and nxt_is_word:
+                i += 1  # an input file or fd dup: not shown
+        else:
+            segments[-1][0].append(tok)
+        i += 1
     out = []
-    for seg in segments:
-        while seg and _ENV_ASSIGN_RE.match(seg[0]):
-            seg = seg[1:]
-        if seg:
-            out.append(seg)
+    for words, redirects in segments:
+        while words and _ENV_ASSIGN_RE.match(words[0]):
+            words = words[1:]
+        if not words and redirects:
+            words = ["redirect"]
+        if words:
+            out.append((words, redirects))
     return out
 
 
 def _program_words(tok: str, limit: int) -> str:
     return _speakable(os.path.basename(tok), limit) or "unknown"
+
+
+def _wrapped_command(prog: str, args: list[str]) -> list[str]:
+    """The words after a wrapper's own flags (and env assignments, timeout duration)."""
+    value_flags = _WRAPPER_VALUE_FLAGS[prog]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-") and len(arg) > 1:
+            i += 2 if arg in value_flags else 1
+        elif prog == "env" and _ENV_ASSIGN_RE.match(arg):
+            i += 1
+        else:
+            break
+    rest = args[i:]
+    if prog == "timeout" and rest:
+        rest = rest[1:]  # the duration
+    return rest
+
+
+def _segment_name(words: list[str], with_sub: bool, limit: int = 20, depth: int = 0) -> str:
+    """What a segment runs, in a few words: the program, a subcommand or the wrapped program."""
+    prog = os.path.basename(words[0])
+    args = words[1:]
+    name = _program_words(words[0], limit)
+    if prog in _WRAPPER_VALUE_FLAGS and depth < 3:
+        inner = _wrapped_command(prog, args)
+        if inner:
+            return f"{name} {_segment_name(inner, with_sub, 16, depth + 1)}"
+        return name
+    if prog in _SHELLS:
+        for j, arg in enumerate(args):
+            if not arg.startswith("-"):
+                break
+            if _SHELL_C_FLAG_RE.fullmatch(arg):
+                script = args[j + 1] if j + 1 < len(args) else ""
+                if any(ch in script for ch in ";&|\n`") or "$(" in script:
+                    return f"{name} running a script"
+                first = script.split()[0] if script.split() else ""
+                return f"{name} running {_program_words(first, 16)}"
+        return name
+    if prog == "find":
+        for j, arg in enumerate(args):
+            if arg == "-delete":
+                return f"{name} delete"
+            if arg in _FIND_EXEC:
+                return f"{name} exec {_program_words(args[j + 1], 16)}" if j + 1 < len(args) else f"{name} exec"
+    if with_sub and prog in _SUBCOMMAND_PROGRAMS:
+        sub = next((a for a in args if not a.startswith("-")), "")
+        return f"{name} {_speakable(sub, 16)}".strip()
+    return name
+
+
+def _into(redirects: list[str], limit: int = _REDIRECT_TARGET_CHARS) -> str:
+    return "".join(f" into {_arg_words(t)[:limit].rstrip() or 'a file'}" for t in redirects[:2])
 
 
 def _bash_words(command: str) -> str:
@@ -744,36 +840,43 @@ def _bash_words(command: str) -> str:
     if not segments:
         return _UNREADABLE_BASH
     if any(marker in command for marker in _COMPLEX_MARKERS):
-        first = _speakable(os.path.basename(segments[0][0]), 40)
+        first = _speakable(os.path.basename(segments[0][0][0]), 40)
         return f"a complex shell command starting with {first}" if first else _UNREADABLE_BASH
     if len(segments) == 1:
-        seg = segments[0]
-        phrase = f"the shell command {_program_words(seg[0], 60)}"
-        for i, arg in enumerate(seg[1:]):
+        seg, redirects = segments[0]
+        phrase = f"the shell command {_program_words(seg[0], 30)}"
+        redirect_text = _into(redirects)
+        omitted = len(redirects) > 2
+        for arg in seg[1:]:
             words = _arg_words(arg)
             if not words:
-                if arg.strip():
-                    return phrase + " and more"
+                omitted = omitted or bool(arg.strip())
+                if omitted:
+                    break
                 continue
-            if len(phrase) + 1 + len(words) > _SINGLE_PHRASE_CHARS:
-                return phrase + " and more"
+            if len(phrase) + 1 + len(words) + len(redirect_text) > _SINGLE_PHRASE_CHARS:
+                omitted = True
+                break
             phrase += " " + words
-        return phrase
+        return phrase + (" and more" if omitted else "") + redirect_text
     total = len(segments)
     shown = segments[:3]
-    more = f", and {total - 3} more commands" if total > 3 else ""
-    for with_sub in (True, False):
+    n_more = total - 3
+    more = f", and {n_more} more command{'s' if n_more > 1 else ''}" if n_more > 0 else ""
+    for with_sub, with_target in ((True, True), (True, False), (False, False)):
         names = []
-        for seg in shown:
-            name = _program_words(seg[0], 20)
-            if with_sub and name in _SUBCOMMAND_PROGRAMS:
-                sub = next((a for a in seg[1:] if not a.startswith("-")), "")
-                name = f"{name} {_speakable(sub, 16)}".strip()
+        for words, redirects in shown:
+            name = _segment_name(words, with_sub)
+            if redirects:
+                name += _into(redirects[:1]) if with_target else " with a redirect"
             names.append(name)
         text = "the shell commands " + ", then ".join(names) + more
         if len(text) <= MAX_WHAT_CHARS:
             return text
-    return f"the shell commands {_program_words(segments[0][0], 20)} and {total - 1} more commands"
+    n_rest = total - 1
+    text = (f"the shell commands {_program_words(segments[0][0][0], 20)} and {n_rest} more "
+            f"command{'s' if n_rest > 1 else ''}")
+    return text + (" with a redirect" if any(r for _, r in segments) else "")
 
 
 def _file_words(path: Any) -> str:

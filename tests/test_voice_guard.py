@@ -918,13 +918,66 @@ class DescribeCallTests(unittest.TestCase):
                     for prog in progs:
                         self.assertIn(prog, got)
                 else:
-                    self.assertIn(f"and {total - 3} more commands", got)
+                    self.assertIn(f"and {total - 3} more command" + ("s" if total > 4 else ""), got)
                     for prog in progs[:3]:
                         self.assertIn(prog, got)
 
+    def bash(self, command):
+        got = vg.describe_call("Bash", {"command": command})
+        self.check(got)
+        return got
+
+    def test_bash_wrappers_name_the_inner_program(self):
+        self.assertEqual(self.bash("ls | xargs rm"), "the shell commands ls, then xargs rm")
+        self.assertEqual(self.bash("ls; sudo rm -rf /"), "the shell commands ls, then sudo rm")
+        self.assertEqual(self.bash("ls; sudo -u root rm x"), "the shell commands ls, then sudo rm")
+        self.assertEqual(self.bash("ls; env FOO=1 -i python x"), "the shell commands ls, then env python")
+        self.assertEqual(self.bash("ls; timeout 5 rm x"), "the shell commands ls, then timeout rm")
+        self.assertEqual(self.bash("ls; sudo env rm x"), "the shell commands ls, then sudo env rm")
+        self.assertEqual(self.bash('ls; bash -c "rm -rf ~"'), "the shell commands ls, then bash running rm")
+        self.assertEqual(self.bash("ls; zsh -lc 'rm x'"), "the shell commands ls, then zsh running rm")
+        self.assertEqual(self.bash('ls; sh -c "a; b"'), "the shell commands ls, then sh running a script")
+        self.assertEqual(self.bash("ls; sh script.sh"), "the shell commands ls, then sh")
+        self.assertEqual(self.bash("ls; find . -delete"), "the shell commands ls, then find delete")
+        self.assertEqual(self.bash("ls; find . -name x -exec rm {} +"),
+                         "the shell commands ls, then find exec rm")
+        got = self.bash("find . -name x -exec rm {} ;")
+        self.assertTrue("rm" in got or "complex shell command" in got)
+
+    def test_bash_redirects(self):
+        self.assertIn("into home zshrc", self.bash("echo hi > ~/.zshrc"))
+        self.assertIn("into home zshrc", self.bash("echo hi >> ~/.zshrc"))
+        self.assertIn("into home zshrc", self.bash("echo hi &> ~/.zshrc"))
+        self.assertIn("into x", self.bash("echo hi 2>x"))
+        self.assertEqual(self.bash("cat a 2>&1"), "the shell command cat a")
+        self.assertEqual(self.bash("cat a >/dev/null 2>&1"), "the shell command cat a")
+        self.assertEqual(self.bash("cat < in.txt"), "the shell command cat")
+        self.assertIn("into x", self.bash("cat a >&x"))
+        self.assertEqual(self.bash("ls; echo hi > ~/.zshrc"),
+                         "the shell commands ls, then echo into home zshrc")
+        self.assertIn("redirect into x", self.bash("> x"))
+
+    def test_bash_redirect_kept_when_args_dropped(self):
+        got = self.bash("echo " + " ".join(f"word{i}" for i in range(40)) + " > ~/.zshrc")
+        self.assertTrue(got.endswith("into home zshrc"))
+        self.assertIn("and more", got)
+
+    def test_bash_long_multi_segment_redirect(self):
+        cmd = "ls -la " + " ".join(["averyverylongargument"] * 20) + " ; echo x > /etc/hosts"
+        got = self.bash(cmd)
+        self.assertTrue("into" in got or "with a redirect" in got)
+        long_names = "; ".join(["git " + "s" * 30 + " > /etc/hosts"] * 3)
+        got = self.bash(long_names)
+        self.assertIn("redirect", got)
+
+    def test_bash_one_more_command_is_singular(self):
+        self.assertEqual(self.bash("true;true;true;rm x"),
+                         "the shell commands true, then true, then true, and 1 more command")
+        self.assertIn("and 2 more commands", self.bash("true;true;true;rm x;ls"))
+
     def test_bash_subcommand_programs_and_fallback(self):
         got = vg.describe_call("Bash", {"command": "git push; npm publish; docker rm x; ls"})
-        self.assertEqual(got, "the shell commands git push, then npm publish, then docker rm, and 1 more commands")
+        self.assertEqual(got, "the shell commands git push, then npm publish, then docker rm, and 1 more command")
         long_prog = "p" * 30
         cmd = "; ".join([f"git {'s' * 30}", f"{long_prog} x", f"{long_prog} y", "ls"] + ["z"] * 10)
         got = vg.describe_call("Bash", {"command": cmd})
