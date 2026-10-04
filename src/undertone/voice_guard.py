@@ -33,7 +33,9 @@ Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
     normal permission prompts still apply.
 
 State lives in <home>/sessions/<token>.json (0600, dir 0700), updated under an
-flock. The log, <home>/logs/guard.log, never holds command or prompt text.
+flock. The log, <home>/logs/guard.log, never holds command or prompt text. The state
+file also keeps a short spoken summary of up to 3 blocked calls (program, file and
+host names) for the confirm read-back.
 
 Imports stay light on purpose: the hook starts a fresh interpreter per tool
 call, so this module must not pull in undertone.paths or anything heavy.
@@ -51,6 +53,7 @@ import shlex
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -62,6 +65,9 @@ MAX_USED = 200
 MAX_STATE_BYTES = 64 * 1024
 MAX_AGENTS = 100
 MAX_AGENT_ID = 128
+MAX_BLOCKED = 3
+MAX_WHAT_CHARS = 120
+NOTHING_BLOCKED = "undertone has not blocked anything yet."
 _NO_AGENT: Any = object()  # payload had no agent_id key: the main thread
 
 STOPWORDS = frozenset({
@@ -81,6 +87,16 @@ UNGATED_TOOLS = frozenset({
     "Read", "Grep", "Glob", "LS", "WebSearch", "TodoWrite", "Task", "Agent",
     "AskUserQuestion", "ToolSearch", "Skill", "EnterPlanMode", "ExitPlanMode",
     "BashOutput", "TaskOutput", "mcp__undertone__reply",
+})
+
+# Exact MCP tool names that run ungated on a voice turn. They live in code, not a
+# config file, because a typed turn could edit a config file to widen the voice
+# gate. Each one is vetted read-only: cast-record opens cast.db with mode=ro and
+# exposes no SQL tool (claude-agent-team scripts/cast-mcp-server.py, 2026-10-03).
+READ_ONLY_MCP_TOOLS = frozenset({
+    "mcp__cast-record__cast_decisions", "mcp__cast-record__cast_incidents",
+    "mcp__cast-record__cast_cost", "mcp__cast-record__cast_sessions",
+    "mcp__cast-record__cast_ask",
 })
 
 PLAIN_READ = frozenset({
@@ -177,6 +193,7 @@ def _default_state() -> dict[str, Any]:
         "grant": None,
         "used_phrases": [],
         "agents": {},
+        "blocked": [],
     }
 
 
@@ -229,6 +246,14 @@ def _validate(raw: Any) -> dict[str, Any]:
         clean[agent_id] = {"voice": rec["voice"], "granted_at": rec.get("granted_at"),
                            "started_at": rec["started_at"]}
     state["agents"] = clean
+    blocked = raw.get("blocked", [])
+    if not isinstance(blocked, list) or len(blocked) > MAX_BLOCKED:
+        raise GuardError("state field blocked has the wrong type")
+    for entry in blocked:
+        if not (isinstance(entry, dict) and _is_num(entry.get("at"))
+                and isinstance(entry.get("what"), str) and 0 < len(entry["what"]) <= MAX_WHAT_CHARS):
+            raise GuardError("state field blocked has the wrong type")
+    state["blocked"] = [{"at": e["at"], "what": e["what"]} for e in blocked]
     return state
 
 
@@ -374,6 +399,7 @@ def record_voice(
         )
         state["grant"] = {"at": stamp} if granted else None
         state["challenge"] = None  # one attempt per challenge
+        state["blocked"] = []  # a new utterance starts fresh
         return granted
 
     return _update(home, token, fn)
@@ -416,6 +442,7 @@ def record_typed(home: Any, token: str, *, now: float | None = None) -> None:
         state["typed_at"] = stamp
         state["grant"] = None
         state["challenge"] = None
+        state["blocked"] = []
         for rec in state["agents"].values():
             rec["granted_at"] = None  # a typed "stop" revokes inherited grants
 
@@ -627,7 +654,7 @@ def bash_gate_reason(command: str) -> str | None:
 
 def gate_reason(tool_name: str, tool_input: Any) -> str | None:
     """None when the tool call is ungated, else a short log reason (never command text)."""
-    if tool_name in UNGATED_TOOLS:
+    if tool_name in UNGATED_TOOLS or tool_name in READ_ONLY_MCP_TOOLS:
         return None
     if tool_name == "Bash":
         if not isinstance(tool_input, dict) or not isinstance(tool_input.get("command"), str):
@@ -635,6 +662,201 @@ def gate_reason(tool_name: str, tool_input: Any) -> str | None:
         reason = bash_gate_reason(tool_input["command"])
         return None if reason is None else f"Bash:{reason}"
     return tool_name
+
+
+# -- spoken summary of a blocked call ---------------------------------------
+
+
+def _cut(text: str, limit: int) -> str:
+    """Cut at a word boundary to at most `limit` chars."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    if text[limit] != " " and " " in head:
+        head = head.rsplit(" ", 1)[0]
+    return head.strip(" ,")
+
+
+def _speakable(text: str, limit: int = MAX_WHAT_CHARS) -> str:
+    words = (w.strip(".") for w in re.sub(r"[^A-Za-z0-9.]+", " ", text).split())
+    return _cut(" ".join(w for w in words if w), limit)
+
+
+def _path_words(path: str) -> str:
+    special = {".": "this folder", "..": "parent folder", "*": "everything"}
+    if path in special:
+        return special[path]
+    prefix = ""
+    if path.startswith("~"):
+        prefix, path = "home ", path[1:]
+    elif path.startswith("/"):
+        prefix, path = "root ", path[1:]
+    return (prefix + _speakable(path)).strip()
+
+
+def _arg_words(arg: str) -> str:
+    if arg.startswith("-"):
+        return _speakable(arg)
+    if "/" in arg or arg.startswith(("~", ".")) or arg == "*":
+        return _path_words(arg)
+    return _speakable(arg)
+
+
+_UNREADABLE_BASH = "a shell command undertone could not read"
+_COMPLEX_MARKERS = ("`", "$(", "<(", ">(", "<<")
+_SUBCOMMAND_PROGRAMS = frozenset({
+    "git", "npm", "pnpm", "yarn", "uv", "cargo", "go", "make", "just", "brew", "pip",
+    "pip3", "docker", "kubectl", "gh",
+})
+_SINGLE_PHRASE_CHARS = 100
+
+
+def _bash_segments(command: str) -> list[list[str]]:
+    """Split into [program, *args] segments, env assignments dropped. Raises ValueError."""
+    lex = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""  # bash treats `a#` as a word, not a comment
+    segments: list[list[str]] = [[]]
+    for tok in lex:
+        if set(tok) <= _SEPARATOR_CHARS:
+            segments.append([])
+        elif not set(tok) <= _OPERATOR_CHARS:
+            segments[-1].append(tok)
+    out = []
+    for seg in segments:
+        while seg and _ENV_ASSIGN_RE.match(seg[0]):
+            seg = seg[1:]
+        if seg:
+            out.append(seg)
+    return out
+
+
+def _program_words(tok: str, limit: int) -> str:
+    return _speakable(os.path.basename(tok), limit) or "unknown"
+
+
+def _bash_words(command: str) -> str:
+    """Vague is fine; never omit a program that runs or pass a partial list off as whole."""
+    try:
+        segments = _bash_segments(command)
+    except ValueError:
+        return _UNREADABLE_BASH
+    if not segments:
+        return _UNREADABLE_BASH
+    if any(marker in command for marker in _COMPLEX_MARKERS):
+        first = _speakable(os.path.basename(segments[0][0]), 40)
+        return f"a complex shell command starting with {first}" if first else _UNREADABLE_BASH
+    if len(segments) == 1:
+        seg = segments[0]
+        phrase = f"the shell command {_program_words(seg[0], 60)}"
+        for i, arg in enumerate(seg[1:]):
+            words = _arg_words(arg)
+            if not words:
+                if arg.strip():
+                    return phrase + " and more"
+                continue
+            if len(phrase) + 1 + len(words) > _SINGLE_PHRASE_CHARS:
+                return phrase + " and more"
+            phrase += " " + words
+        return phrase
+    total = len(segments)
+    shown = segments[:3]
+    more = f", and {total - 3} more commands" if total > 3 else ""
+    for with_sub in (True, False):
+        names = []
+        for seg in shown:
+            name = _program_words(seg[0], 20)
+            if with_sub and name in _SUBCOMMAND_PROGRAMS:
+                sub = next((a for a in seg[1:] if not a.startswith("-")), "")
+                name = f"{name} {_speakable(sub, 16)}".strip()
+            names.append(name)
+        text = "the shell commands " + ", then ".join(names) + more
+        if len(text) <= MAX_WHAT_CHARS:
+            return text
+    return f"the shell commands {_program_words(segments[0][0], 20)} and {total - 1} more commands"
+
+
+def _file_words(path: Any) -> str:
+    parts = [p for p in str(path).split("/") if p] if isinstance(path, str) else []
+    if not parts:
+        return ""
+    name = _path_words(parts[-1])
+    if len(parts) == 1:
+        return name
+    return f"{name} in {_path_words(parts[-2])}"
+
+
+def _describe(tool_name: str, tool_input: Any) -> str:
+    args = tool_input if isinstance(tool_input, dict) else {}
+    if tool_name == "Bash":
+        command = args.get("command")
+        return _bash_words(command) if isinstance(command, str) else "a shell command undertone could not read"
+    for names, verb, noun, key in (
+        (("Write",), "write", "file", "file_path"),
+        (("Edit", "MultiEdit"), "edit", "file", "file_path"),
+        (("NotebookEdit",), "edit", "notebook", "notebook_path"),
+    ):
+        if tool_name in names:
+            where = _file_words(args.get(key))
+            return f"{verb} the {noun} {where}" if where else f"{verb} a {noun}"
+    if tool_name == "WebFetch":
+        url = args.get("url")
+        host = urllib.parse.urlsplit(url).hostname if isinstance(url, str) else None
+        host_words = _speakable(host) if host else ""
+        return f"fetch a web page from {host_words}" if host_words else "fetch a web page"
+    if tool_name.startswith("mcp__") and tool_name.count("__") >= 2:
+        server, tool = tool_name[5:].split("__", 1)
+        text = f"the {_speakable(server)} tool {_speakable(tool)}"
+        extras = []
+        for key, value in args.items():
+            if isinstance(value, (str, int, float, bool)):
+                words = _speakable(str(value), 24)
+                if words and _speakable(str(key)):
+                    extras.append(f", {_speakable(str(key))} {words}")
+            if len(extras) == 2:
+                break
+        return text + "".join(extras)
+    return f"the {_speakable(tool_name)} tool"
+
+
+def describe_call(tool_name: Any, tool_input: Any) -> str:
+    """A short plain-words phrase for what a call would do; never raises.
+
+    Output holds only [A-Za-z0-9. ,] and at most MAX_WHAT_CHARS characters.
+    """
+    try:
+        text = _describe(tool_name, tool_input)
+    except Exception:
+        try:
+            text = f"the {_speakable(tool_name)} tool"
+        except Exception:
+            text = "a tool call"
+    text = _cut(re.sub(r"[^A-Za-z0-9. ,]", "", text), MAX_WHAT_CHARS)
+    return text if text.strip() else "a tool call"
+
+
+def record_blocked(home: Any, token: str, what: str, *, now: float | None = None) -> None:
+    """Remember a denied call's spoken summary (latest MAX_BLOCKED, deduped)."""
+    stamp = _now(now)
+
+    def fn(state: dict[str, Any]) -> None:
+        kept = [e for e in state["blocked"] if e["what"] != what]
+        state["blocked"] = (kept + [{"at": stamp, "what": what}])[-MAX_BLOCKED:]
+
+    _update(home, token, fn)
+
+
+def read_back(home: Any, token: str, *, now: float | None = None) -> str:
+    """Spoken summary of the recently blocked calls, for the confirm request."""
+    stamp = _now(now)
+    state = load_state(home, token)
+    whats = [
+        e["what"] for e in (state["blocked"] if state else [])
+        if 0 <= stamp - e["at"] <= CHALLENGE_TTL_S
+    ]
+    if not whats:
+        return NOTHING_BLOCKED
+    return "This will run: " + "; and ".join(whats) + "."
 
 
 def _agent_tainted(state: dict[str, Any], agent_id: Any) -> bool:
@@ -798,6 +1020,10 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         }
     }))
     stdout.flush()
+    try:
+        record_blocked(home, token, describe_call(tool_name, tool_input))
+    except Exception:
+        _log(home, "pretooluse", "error", tool_name, "record_blocked")
 
 
 _EVENTS = ("sessionstart", "userpromptsubmit", "stop", "subagentstart", "subagentstop", "pretooluse")

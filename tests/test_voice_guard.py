@@ -10,6 +10,7 @@ import fcntl
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -774,6 +775,245 @@ class SubprocessEntryTests(GuardTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         decision = json.loads(proc.stdout)["hookSpecificOutput"]
         self.assertEqual(decision["permissionDecision"], "deny")
+
+
+CAST_TOOLS = [
+    "mcp__cast-record__cast_decisions", "mcp__cast-record__cast_incidents",
+    "mcp__cast-record__cast_cost", "mcp__cast-record__cast_sessions",
+    "mcp__cast-record__cast_ask",
+]
+NEAR_MISS_TOOLS = [
+    "mcp__cast-record__cast_write", "mcp__cast-recordx__cast_cost",
+    "mcp__other__cast_cost", "MCP__cast-record__cast_cost", "mcp__cast-record__cast_cost ",
+]
+SPOKEN_RE = re.compile(r"[A-Za-z0-9. ,]*", re.ASCII)
+
+
+class ReadOnlyMcpTierTests(GuardTestCase):
+    def test_gate_reason(self):
+        for tool in CAST_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertIsNone(vg.gate_reason(tool, {}))
+        for tool in NEAR_MISS_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertIsNotNone(vg.gate_reason(tool, {}))
+
+    def test_allowed_on_voice_turn_and_from_tainted_subagent(self):
+        vg.record_voice(self.home, TOKEN, "how much did I spend")
+        for tool in CAST_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertAllowed(tool)
+                rc, out, _ = self.hook(
+                    "pretooluse", {"tool_name": tool, "tool_input": {}, "agent_id": "unknown"})
+                self.assertEqual((rc, out), (0, ""))
+
+    def test_near_misses_denied(self):
+        vg.record_voice(self.home, TOKEN, "how much did I spend")
+        for tool in NEAR_MISS_TOOLS:
+            with self.subTest(tool=tool):
+                self.assertDenied(tool)
+
+
+class DescribeCallTests(unittest.TestCase):
+    CASES = [
+        ("Bash", {"command": "rm -rf ~/Projects"}, "the shell command rm rf home Projects"),
+        ("Bash", {"command": "git push --force origin main"}, "the shell command git push force origin main"),
+        ("Bash", {"command": "rm -rf ~/Projects && git status"},
+         "the shell commands rm, then git status"),
+        ("Bash", {"command": "FOO=1 /usr/bin/make clean"}, "the shell command make clean"),
+        ("Bash", {"command": "ls .. ; ls *"}, "the shell commands ls, then ls"),
+        ("Bash", {"command": "a 1; b 2\nc 3; d 4; e 5"},
+         "the shell commands a, then b, then c, and 2 more commands"),
+        ("Bash", {"command": "echo 'unclosed"}, "a shell command undertone could not read"),
+        ("Bash", {"command": ";;"}, "a shell command undertone could not read"),
+        ("Bash", {"command": 5}, "a shell command undertone could not read"),
+        ("Bash", None, "a shell command undertone could not read"),
+        ("Write", {"file_path": "/Users/ed/notes/todo.md"}, "write the file todo.md in notes"),
+        ("Write", {}, "write a file"),
+        ("Edit", {"file_path": "src/guard.py"}, "edit the file guard.py in src"),
+        ("MultiEdit", {"file_path": "guard.py"}, "edit the file guard.py"),
+        ("Edit", None, "edit a file"),
+        ("NotebookEdit", {"notebook_path": "/a/b/c.ipynb"}, "edit the notebook c.ipynb in b"),
+        ("NotebookEdit", {}, "edit a notebook"),
+        ("WebFetch", {"url": "https://example.com/x?y=1"}, "fetch a web page from example.com"),
+        ("WebFetch", {"url": "not a url"}, "fetch a web page"),
+        ("WebFetch", [], "fetch a web page"),
+        ("mcp__che_ical__create_reminder", {"title": "Buy milk"},
+         "the che ical tool create reminder, title Buy milk"),
+        ("mcp__srv__do", {"a": {"x": 1}, "n": 3, "flag": True, "z": "extra"},
+         "the srv tool do, n 3, flag True"),
+        ("mcp__srv__do", {"long": "x" * 80}, "the srv tool do, long " + "x" * 24),
+        ("FutureTool", {}, "the FutureTool tool"),
+        ("Weird_Tool-9", None, "the Weird Tool 9 tool"),
+    ]
+
+    def check(self, what):
+        self.assertLessEqual(len(what), vg.MAX_WHAT_CHARS)
+        self.assertTrue(what)
+        self.assertIsNotNone(SPOKEN_RE.fullmatch(what), what)
+
+    def test_table(self):
+        for tool, tool_input, expected in self.CASES:
+            with self.subTest(tool=tool, tool_input=tool_input):
+                got = vg.describe_call(tool, tool_input)
+                self.assertEqual(got, expected)
+                self.check(got)
+
+    def test_hostile_inputs(self):
+        inputs = [None, [], "x", 5, {"command": "ls " + "a" * 10_000},
+                  {"command": " ; ".join(["word"] * 3000)},
+                  {"command": "rm ‮é中文 \x00 $(x)"},
+                  {"file_path": "中/文"}, {"url": "http://éx中.com"},
+                  {"title": "中" * 50}]
+        tools = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "mcp__a__b", "mcp__a",
+                 "mcp____", "", None, 7, "X" * 500]
+        for tool in tools:
+            for tool_input in inputs:
+                with self.subTest(tool=tool, tool_input=str(tool_input)[:30]):
+                    self.check(vg.describe_call(tool, tool_input))
+
+    def test_long_command_cut_at_word_boundary(self):
+        got = vg.describe_call("Bash", {"command": "ls " + " ".join(["abcdefgh"] * 40)})
+        self.check(got)
+        self.assertTrue(got.endswith("abcdefgh and more"))
+
+    def test_bash_comment_char_does_not_hide_later_command(self):
+        got = vg.describe_call("Bash", {"command": "echo a#;rm -rf ~"})
+        self.assertIn("rm", got)
+        self.assertIn("echo", got)
+
+    def test_bash_substitution_is_complex(self):
+        got = vg.describe_call("Bash", {"command": "echo a b c $(rm -rf ~)"})
+        self.assertEqual(got, "a complex shell command starting with echo")
+        for cmd in ("echo `rm x`", "diff <(ls) b", "tee >(cat) x"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(vg.describe_call("Bash", {"command": cmd}).startswith(
+                    "a complex shell command starting with "))
+
+    def test_bash_trailing_flag_not_dropped(self):
+        got = vg.describe_call("Bash", {"command": "find . -name x.py -delete"})
+        self.assertEqual(got, "the shell command find this folder name x.py delete")
+
+    def test_bash_heredoc_is_complex(self):
+        got = vg.describe_call("Bash", {"command": "cat <<EOF > x\nhi\nEOF"})
+        self.assertEqual(got, "a complex shell command starting with cat")
+
+    def test_bash_long_single_segment_ends_with_more(self):
+        got = vg.describe_call("Bash", {"command": "rm " + " ".join(f"file{i}" for i in range(40))})
+        self.check(got)
+        self.assertTrue(got.endswith(" and more"))
+        self.assertTrue(got.startswith("the shell command rm file0 file1"))
+
+    def test_bash_long_first_segment_keeps_later_programs(self):
+        for n in range(30):
+            progs = [f"prog{n}x{i}" for i in range(2 + n % 6)]
+            cmd = " ; ".join(
+                f"{prog} " + " ".join(f"argument{j}" * 3 for j in range(20 if i == 0 else 1))
+                for i, prog in enumerate(progs))
+            with self.subTest(cmd=cmd[:60]):
+                got = vg.describe_call("Bash", {"command": cmd})
+                self.check(got)
+                total = len(progs)
+                if total <= 3:
+                    for prog in progs:
+                        self.assertIn(prog, got)
+                else:
+                    self.assertIn(f"and {total - 3} more commands", got)
+                    for prog in progs[:3]:
+                        self.assertIn(prog, got)
+
+    def test_bash_subcommand_programs_and_fallback(self):
+        got = vg.describe_call("Bash", {"command": "git push; npm publish; docker rm x; ls"})
+        self.assertEqual(got, "the shell commands git push, then npm publish, then docker rm, and 1 more commands")
+        long_prog = "p" * 30
+        cmd = "; ".join([f"git {'s' * 30}", f"{long_prog} x", f"{long_prog} y", "ls"] + ["z"] * 10)
+        got = vg.describe_call("Bash", {"command": cmd})
+        self.check(got)
+        self.assertIn("more commands", got)
+
+    def test_non_ascii_stripped(self):
+        got = vg.describe_call("Write", {"file_path": "/x/中文.txt"})
+        self.check(got)
+        self.assertEqual(got, "write the file txt in x")
+
+
+class BlockedStateTests(GuardTestCase):
+    def blocked(self):
+        return vg.load_state(self.home, TOKEN)["blocked"]
+
+    def test_default_and_old_file_without_key(self):
+        self.assertEqual(vg._default_state()["blocked"], [])
+        self.assertEqual(vg._validate({"voice_at": 1.0})["blocked"], [])
+
+    def test_validate_rejects_bad_shapes(self):
+        ok = {"at": 1.0, "what": "x"}
+        for bad in ("x", {"at": 1}, [ok] * 4, ["x"], [{"at": "1", "what": "x"}],
+                    [{"at": True, "what": "x"}], [{"at": float("nan"), "what": "x"}],
+                    [{"at": 1, "what": 5}], [{"at": 1}],
+                    [{"at": 1, "what": "x" * (vg.MAX_WHAT_CHARS + 1)}]):
+            with self.subTest(bad=bad), self.assertRaises(vg.GuardError):
+                vg._validate({"blocked": bad})
+        self.assertEqual(vg._validate({"blocked": [ok] * 3})["blocked"], [ok] * 3)
+
+    def test_dedupe_and_cap(self):
+        vg.record_blocked(self.home, TOKEN, "a", now=T0)
+        vg.record_blocked(self.home, TOKEN, "b", now=T0 + 1)
+        vg.record_blocked(self.home, TOKEN, "a", now=T0 + 2)
+        self.assertEqual([e["what"] for e in self.blocked()], ["b", "a"])
+        self.assertEqual(self.blocked()[1]["at"], T0 + 2)
+        vg.record_blocked(self.home, TOKEN, "c", now=T0 + 3)
+        vg.record_blocked(self.home, TOKEN, "d", now=T0 + 4)
+        self.assertEqual([e["what"] for e in self.blocked()], ["a", "c", "d"])
+
+    def test_cleared_by_voice_and_typed(self):
+        for clear in (lambda: vg.record_voice(self.home, TOKEN, "hello", now=T0 + 1),
+                      lambda: vg.record_typed(self.home, TOKEN, now=T0 + 1)):
+            vg.record_blocked(self.home, TOKEN, "a", now=T0)
+            clear()
+            self.assertEqual(self.blocked(), [])
+
+    def test_survives_stop_and_confirm_request(self):
+        vg.record_blocked(self.home, TOKEN, "a", now=T0)
+        vg.record_stopped(self.home, TOKEN, now=T0 + 1)
+        vg.record_confirm_request(self.home, TOKEN, "say confirm purple walrus", now=T0 + 2)
+        self.assertEqual([e["what"] for e in self.blocked()], ["a"])
+
+    def test_read_back(self):
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0), vg.NOTHING_BLOCKED)
+        vg.record_blocked(self.home, TOKEN, "a", now=T0)
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 1), "This will run: a.")
+        vg.record_blocked(self.home, TOKEN, "b", now=T0 + 2)
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 3), "This will run: a; and b.")
+
+    def test_read_back_ttl(self):
+        vg.record_blocked(self.home, TOKEN, "old", now=T0)
+        vg.record_blocked(self.home, TOKEN, "new", now=T0 + 200)
+        at = T0 + vg.CHALLENGE_TTL_S + 1
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=at), "This will run: new.")
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 200 + vg.CHALLENGE_TTL_S + 1),
+                         vg.NOTHING_BLOCKED)
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 - 5), vg.NOTHING_BLOCKED)
+
+
+class PretoolBlockedTests(GuardTestCase):
+    def blocked(self):
+        return vg.load_state(self.home, TOKEN)["blocked"]
+
+    def test_deny_records_allow_does_not(self):
+        vg.record_voice(self.home, TOKEN, "do it")
+        self.assertAllowed("Read")
+        self.assertEqual(self.blocked(), [])
+        self.assertDenied("Bash", {"command": "rm -rf ~/Projects"})
+        self.assertEqual([e["what"] for e in self.blocked()], ["the shell command rm rf home Projects"])
+        self.assertNotIn("Projects", (Path(self.home) / "logs" / "guard.log").read_text())
+
+    def test_deny_stands_when_record_blocked_fails(self):
+        vg.record_voice(self.home, TOKEN, "do it")
+        with mock.patch.object(vg, "record_blocked", side_effect=RuntimeError("boom")):
+            rc, out, _ = self.pre("Write", {"file_path": "/a/b.txt"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("record_blocked", (Path(self.home) / "logs" / "guard.log").read_text())
 
 
 if __name__ == "__main__":
