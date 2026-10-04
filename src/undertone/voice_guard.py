@@ -1336,8 +1336,31 @@ def _identity(path: str) -> tuple[int, int] | None:
     return (st.st_dev, st.st_ino)
 
 
-def _home_ids(home: str) -> tuple[tuple[int, int] | None, frozenset[tuple[int, int]]]:
-    """Identity of the home and the set of identities of its ancestors up to "/"."""
+_MAX_ENTRIES = 256  # directory entries whose identity is collected per listed dir
+
+
+def _entry_ids(directory: str) -> set[tuple[int, int]]:
+    """Identities of up to _MAX_ENTRIES entries directly in a directory (symlinks followed)."""
+    out: set[tuple[int, int]] = set()
+    try:
+        with os.scandir(directory) as it:
+            for i, entry in enumerate(it):
+                if i >= _MAX_ENTRIES:
+                    break
+                ident = _identity(entry.path)
+                if ident is not None:
+                    out.add(ident)
+    except OSError:
+        pass
+    return out
+
+
+def _home_ids(
+    home: str,
+) -> tuple[tuple[int, int] | None, frozenset[tuple[int, int]], frozenset[tuple[int, int]]]:
+    """Identity of the home, identities of its ancestors up to "/", and identities of the
+    files directly in the home and its sessions/ dir (so a renamed symlink or hard link to
+    safe_phrase.json is recognised by inode)."""
     ancestors: set[tuple[int, int]] = set()
     cur = os.path.dirname(home)
     for _ in range(_MAX_WALK):
@@ -1348,20 +1371,47 @@ def _home_ids(home: str) -> tuple[tuple[int, int] | None, frozenset[tuple[int, i
         if parent == cur:
             break
         cur = parent
-    return _identity(home), frozenset(ancestors)
+    files = _entry_ids(home) | _entry_ids(os.path.join(home, "sessions"))
+    phrase = _identity(os.path.join(home, SAFE_PHRASE_FILE))
+    if phrase is not None:
+        files.add(phrase)
+    return _identity(home), frozenset(ancestors), frozenset(files)
+
+
+def _identity_hits(start: str, ids: Any) -> bool:
+    """Identity test on one path as the kernel sees it: the path is the home, inside it, an
+    ancestor of it, or one of the home's files (by inode)."""
+    home_id, ancestors, files = ids
+    first = _identity(start)
+    if first is not None and (first in ancestors or first in files):
+        return True
+    cur = start
+    for _ in range(_MAX_WALK):
+        ident = _identity(cur)
+        if ident is not None and ident == home_id:
+            return True
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return False
 
 
 def _path_hits(raw: Any, home: str, cwd: str | None, ids: Any = None) -> bool:
     """True when the path is the home, inside it, or an ancestor of it (fail closed on junk).
 
-    Compared by file identity as well as by string, so `//`, case variants, firmlinks
-    and symlinks into the home cannot slip past."""
+    Compared by file identity as well as by string, so `//`, case variants, firmlinks,
+    symlinks (including `..` taken after a symlink) and renamed links to the home's files
+    cannot slip past."""
     if not isinstance(raw, str) or not raw:
         return True
     try:
         p = _abs_path(raw, cwd)
         if p is None:
             return True
+        rawj = os.path.expanduser(raw)
+        if not os.path.isabs(rawj):
+            rawj = os.path.join(cwd or "", rawj)
         p = re.sub(r"^/+", "/", p)
         h = re.sub(r"^/+", "/", home)
         pc, hc = p.casefold(), h.casefold()
@@ -1369,24 +1419,27 @@ def _path_hits(raw: Any, home: str, cwd: str | None, ids: Any = None) -> bool:
             return True
         if os.path.basename(p).casefold() == SAFE_PHRASE_FILE.casefold():
             return True
-        home_id, ancestors = ids if ids is not None else _home_ids(h)
-        if home_id is None:
+        ids = ids if ids is not None else _home_ids(h)
+        if ids[0] is None:
             return False
-        cur = p
-        for _ in range(_MAX_WALK):
-            ident = _identity(cur)
-            if ident is not None:
-                if ident == home_id:
-                    return True
-                if cur == p and ident in ancestors:
-                    return True
-            parent = os.path.dirname(cur)
-            if parent == cur:
-                break
-            cur = parent
-        return False
+        return any(_identity_hits(c, ids) for c in (p, rawj, os.path.realpath(rawj)))
     except Exception:  # noqa: BLE001 - fail closed; decide must never raise
         return True
+
+
+_GLOB_CHARS = re.compile(r"[*?\[{]")
+
+
+def _glob_pattern_hits(pattern: Any, home: str, cwd: str | None, ids: Any) -> bool:
+    """A Glob pattern that is absolute or climbs with `..` is judged by its literal directory part."""
+    if not isinstance(pattern, str) or not pattern:
+        return False
+    if not (pattern.startswith(("/", "~")) or ".." in pattern.split("/")):
+        return False
+    m = _GLOB_CHARS.search(pattern)
+    prefix = pattern[: m.start()] if m else pattern
+    directory = prefix[: prefix.rfind("/") + 1] or "."
+    return _path_hits(directory, home, cwd, ids)
 
 
 def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -> bool:
@@ -1402,6 +1455,8 @@ def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -
     if tool_name in ("Read", "NotebookRead"):
         return _path_hits(inp.get("file_path" if tool_name == "Read" else "notebook_path"), home, cwd, ids)
     if tool_name in ("Grep", "Glob", "LS"):
+        if tool_name == "Glob" and _glob_pattern_hits(inp.get("pattern"), home, cwd, ids):
+            return True
         path = inp.get("path")
         if path is None:
             return cwd is None or _path_hits(cwd, home, cwd, ids)
@@ -1424,7 +1479,11 @@ def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -
         return True
     for tok in tokens:
         for part in (tok, tok.partition("=")[2]):
-            if part and ("/" in part or part[0] in "~.") and _path_hits(part, home, cwd, ids):
+            if not part or part.startswith("-"):
+                continue
+            if cwd is None and not ("/" in part or part[0] in "~."):
+                continue  # a bare word can't be resolved without a cwd
+            if _path_hits(part, home, cwd, ids):
                 return True
     return False
 

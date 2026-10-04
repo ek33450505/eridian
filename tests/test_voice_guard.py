@@ -1468,6 +1468,7 @@ class TouchesHomeTests(unittest.TestCase):
             ("Glob root", "Glob", {"path": "/"}, self.project),
             ("LS home", "LS", {"path": h}, None),
             ("cat file", "Bash", {"command": f"cat {h}/safe_phrase.json"}, self.project),
+            ("safe_phrase word", "Bash", {"command": "cat safe_phrase.json"}, self.project),
             ("cat tilde", "Bash", {"command": "cat ~/.undertone/x"}, self.project),
             ("grep -r in parent", "Bash", {"command": "grep -r foo ."}, self.parent),
             ("grep -r no path in parent", "Bash", {"command": "grep -rn foo"}, self.parent),
@@ -1488,7 +1489,6 @@ class TouchesHomeTests(unittest.TestCase):
             ("Grep project", "Grep", {"path": self.project}, self.project),
             ("Grep no path", "Grep", {"pattern": "x"}, self.project),
             ("cat README", "Bash", {"command": "cat README.md"}, self.project),
-            ("safe_phrase word", "Bash", {"command": "cat safe_phrase.json"}, self.project),
             ("ls src", "Bash", {"command": "ls src && git status"}, self.project),
             ("other tool", "Write", {"file_path": f"{self.h}/x"}, self.project),
             ("mcp", "mcp__undertone__reply", {}, self.project),
@@ -1564,6 +1564,38 @@ class IdentityHomeTests(unittest.TestCase):
         self.assertIsNone(self.decide("Read", {"file_path": proj_file}))
         self.assertIsNone(self.decide("Bash", {"command": "grep -n safe_phrase src/undertone/cli.py"}))
         self.assertIsNone(self.decide("Bash", {"command": "ls .."}))
+
+    def test_renamed_file_aliases(self):
+        filelink = os.path.join(self.project, "filelink")
+        os.symlink(self.phrase, filelink)
+        hl = os.path.join(self.project, "hl.txt")
+        os.link(self.phrase, hl)
+        self.assertDenied("Read", {"file_path": filelink})
+        self.assertDenied("Read", {"file_path": hl})
+        self.assertDenied("Bash", {"command": "cat hl.txt"})
+        self.assertDenied("Bash", {"command": "cat filelink"})
+
+    def test_relative_tokens_and_dotdot_through_symlink(self):
+        os.mkdir(os.path.join(self.home, "sub"))
+        os.symlink(self.home, os.path.join(self.project, "dirlink"))
+        os.symlink(os.path.dirname(self.home), os.path.join(self.project, "parentlink"))
+        os.symlink(os.path.join(self.home, "sub"), os.path.join(self.project, "sublink"))
+        for cmd in ("grep -r . dirlink", "grep -r . parentlink", "grep -r . sublink/.."):
+            with self.subTest(cmd):
+                self.assertDenied("Bash", {"command": cmd})
+        self.assertDenied("Grep", {"pattern": "x", "path": os.path.join(self.project, "sublink", "..")})
+
+    def test_glob_pattern(self):
+        self.assertDenied("Glob", {"pattern": self.home + "/*"})
+        self.assertDenied("Glob", {"pattern": "lnk/../*"})
+
+    def test_relative_non_hits(self):
+        Path(self.project, "README.md").write_text("x")
+        os.mkdir(os.path.join(self.project, "src"))
+        for cmd in ("grep -r foo src", "cat README.md", "ls", "git log --oneline",
+                    "python -m unittest tests"):
+            with self.subTest(cmd):
+                self.assertIsNone(self.decide("Bash", {"command": cmd}))
 
     def test_unexpected_error_fails_closed(self):
         with mock.patch.object(vg, "_identity", side_effect=RuntimeError("boom")):
