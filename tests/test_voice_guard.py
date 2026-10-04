@@ -1469,7 +1469,6 @@ class TouchesHomeTests(unittest.TestCase):
             ("LS home", "LS", {"path": h}, None),
             ("cat file", "Bash", {"command": f"cat {h}/safe_phrase.json"}, self.project),
             ("cat tilde", "Bash", {"command": "cat ~/.undertone/x"}, self.project),
-            ("safe_phrase word", "Bash", {"command": "cat safe_phrase.json"}, self.project),
             ("grep -r in parent", "Bash", {"command": "grep -r foo ."}, self.parent),
             ("grep -r no path in parent", "Bash", {"command": "grep -rn foo"}, self.parent),
             ("dotdot token", "Bash", {"command": "cat ../.state/x"}, self.project),
@@ -1489,6 +1488,7 @@ class TouchesHomeTests(unittest.TestCase):
             ("Grep project", "Grep", {"path": self.project}, self.project),
             ("Grep no path", "Grep", {"pattern": "x"}, self.project),
             ("cat README", "Bash", {"command": "cat README.md"}, self.project),
+            ("safe_phrase word", "Bash", {"command": "cat safe_phrase.json"}, self.project),
             ("ls src", "Bash", {"command": "ls src && git status"}, self.project),
             ("other tool", "Write", {"file_path": f"{self.h}/x"}, self.project),
             ("mcp", "mcp__undertone__reply", {}, self.project),
@@ -1496,6 +1496,78 @@ class TouchesHomeTests(unittest.TestCase):
         for name, tool, inp, cwd in cases:
             with self.subTest(name):
                 self.assertFalse(self.hits(tool, inp, cwd))
+
+
+class IdentityHomeTests(unittest.TestCase):
+    """Home gate compares file identity, on a real filesystem."""
+
+    def setUp(self) -> None:
+        self.home = tempfile.mkdtemp()
+        self.proj_parent = tempfile.mkdtemp()
+        for d in (self.home, self.proj_parent):
+            self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        self.project = os.path.join(self.proj_parent, "proj")
+        os.mkdir(self.project)
+        vg.set_safe_phrase(self.home, "copper maple")
+        self.phrase = os.path.join(self.home, "safe_phrase.json")
+        self.link = os.path.join(self.project, "lnk")
+        os.symlink(self.home, self.link)
+        self.sibling = self.home + "2"
+        os.mkdir(self.sibling)
+        self.addCleanup(shutil.rmtree, self.sibling, ignore_errors=True)
+        vg.record_voice(self.home, TOKEN, "do it", now=T0)
+
+    def decide(self, tool, inp, cwd=None):
+        state = vg.load_state(self.home, TOKEN)
+        return vg.decide(state, tool, inp, T0 + 2, home=self.home, cwd=cwd or self.project)
+
+    def assertDenied(self, tool, inp, cwd=None):
+        self.assertEqual(self.decide(tool, inp, cwd), vg.HOME_DENY_REASON)
+
+    def case_variant(self):
+        up = os.path.realpath(self.home).upper()
+        if not os.path.exists(up):
+            self.skipTest("case-sensitive filesystem")
+        return up
+
+    def test_leading_double_slash(self):
+        self.assertDenied("Read", {"file_path": "/" + self.phrase})
+        self.assertDenied("Read", {"file_path": "/" + self.home + "/other.json"})
+
+    def test_case_variant(self):
+        up = self.case_variant()
+        self.assertDenied("Read", {"file_path": up + "/safe_phrase.json"})
+        self.assertDenied("Bash", {"command": f"ls {up}"})
+
+    def test_firmlink_prefix(self):
+        path = "/System/Volumes/Data" + os.path.realpath(self.home) + "/safe_phrase.json"
+        if not os.path.exists(path):
+            self.skipTest("no /System/Volumes/Data firmlink")
+        self.assertDenied("Read", {"file_path": path})
+        self.assertDenied("Read", {"file_path": path.replace("safe_phrase", "other")})
+
+    def test_symlink_into_home(self):
+        self.assertDenied("Read", {"file_path": self.link + "/safe_phrase.json"})
+        self.assertDenied("Grep", {"pattern": "x", "path": self.link})
+        self.assertDenied("Bash", {"command": f"cat {self.link}/safe_phrase.json"})
+
+    def test_basename_anywhere(self):
+        self.assertDenied("Read", {"file_path": os.path.join(self.project, "Safe_Phrase.JSON")})
+
+    def test_ancestor_of_home(self):
+        self.assertDenied("Grep", {"pattern": "x", "path": os.path.dirname(os.path.realpath(self.home))})
+
+    def test_non_hits(self):
+        proj_file = os.path.join(self.project, "a.py")
+        Path(proj_file).write_text("x")
+        self.assertIsNone(self.decide("Read", {"file_path": self.sibling + "/f"}))
+        self.assertIsNone(self.decide("Read", {"file_path": proj_file}))
+        self.assertIsNone(self.decide("Bash", {"command": "grep -n safe_phrase src/undertone/cli.py"}))
+        self.assertIsNone(self.decide("Bash", {"command": "ls .."}))
+
+    def test_unexpected_error_fails_closed(self):
+        with mock.patch.object(vg, "_identity", side_effect=RuntimeError("boom")):
+            self.assertTrue(vg._path_hits(self.project, self.home, None))
 
 
 class HomeGateTests(GuardTestCase):

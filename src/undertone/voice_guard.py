@@ -84,6 +84,7 @@ MAX_WHAT_CHARS = 160
 MAX_BLOCKED_MORE = 1_000_000
 NOTHING_BLOCKED = "undertone has not blocked anything yet."
 SAFE_PHRASE_FILE = "safe_phrase.json"
+_MAX_WALK = 64  # ancestor steps when comparing path identity
 SAFE_PHRASE_MARKER = "<safe phrase>"  # challenge phrase in safe-phrase mode; normalize() can never produce it
 REDACTED_PHRASE = "[safe phrase]"
 MAX_SAFE_PHRASE_BYTES = 1024
@@ -1326,35 +1327,94 @@ def _abs_path(raw: str, cwd: str | None) -> str | None:
     return os.path.normpath(p)
 
 
-def _path_hits(raw: Any, home: str, cwd: str | None) -> bool:
-    """True when the path is the home, inside it, or an ancestor of it (fail closed on junk)."""
+def _identity(path: str) -> tuple[int, int] | None:
+    """(st_dev, st_ino) of the file a path resolves to (symlinks followed), or None."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _home_ids(home: str) -> tuple[tuple[int, int] | None, frozenset[tuple[int, int]]]:
+    """Identity of the home and the set of identities of its ancestors up to "/"."""
+    ancestors: set[tuple[int, int]] = set()
+    cur = os.path.dirname(home)
+    for _ in range(_MAX_WALK):
+        ident = _identity(cur)
+        if ident is not None:
+            ancestors.add(ident)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return _identity(home), frozenset(ancestors)
+
+
+def _path_hits(raw: Any, home: str, cwd: str | None, ids: Any = None) -> bool:
+    """True when the path is the home, inside it, or an ancestor of it (fail closed on junk).
+
+    Compared by file identity as well as by string, so `//`, case variants, firmlinks
+    and symlinks into the home cannot slip past."""
     if not isinstance(raw, str) or not raw:
         return True
-    p = _abs_path(raw, cwd)
-    if p is None:
+    try:
+        p = _abs_path(raw, cwd)
+        if p is None:
+            return True
+        p = re.sub(r"^/+", "/", p)
+        h = re.sub(r"^/+", "/", home)
+        pc, hc = p.casefold(), h.casefold()
+        if pc == hc or pc == "/" or pc.startswith(hc + "/") or hc.startswith(pc.rstrip("/") + "/"):
+            return True
+        if os.path.basename(p).casefold() == SAFE_PHRASE_FILE.casefold():
+            return True
+        home_id, ancestors = ids if ids is not None else _home_ids(h)
+        if home_id is None:
+            return False
+        cur = p
+        for _ in range(_MAX_WALK):
+            ident = _identity(cur)
+            if ident is not None:
+                if ident == home_id:
+                    return True
+                if cur == p and ident in ancestors:
+                    return True
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        return False
+    except Exception:  # noqa: BLE001 - fail closed; decide must never raise
         return True
-    return p == home or p == "/" or p.startswith(home + "/") or home.startswith(p.rstrip("/") + "/")
 
 
 def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -> bool:
-    """True when the call could read or search undertone's home. String logic only."""
+    """True when the call could read or search undertone's home.
+
+    Paths are compared by file identity (device+inode, symlinks followed) as well as by
+    string, so `//`, case variants, firmlinks and symlinks into the home are caught. After
+    a confirm, Bash access is best-effort: `$` expansion, globs and `python -c` can still
+    reach files; before a grant, those are already gated by the plain-argument rules."""
     home = os.path.normpath(home)
+    ids = _home_ids(re.sub(r"^/+", "/", home))
     inp = tool_input if isinstance(tool_input, dict) else {}
     if tool_name in ("Read", "NotebookRead"):
-        return _path_hits(inp.get("file_path" if tool_name == "Read" else "notebook_path"), home, cwd)
+        return _path_hits(inp.get("file_path" if tool_name == "Read" else "notebook_path"), home, cwd, ids)
     if tool_name in ("Grep", "Glob", "LS"):
         path = inp.get("path")
         if path is None:
-            return cwd is None or _path_hits(cwd, home, cwd)
-        return _path_hits(path, home, cwd)
+            return cwd is None or _path_hits(cwd, home, cwd, ids)
+        return _path_hits(path, home, cwd, ids)
     if tool_name != "Bash":
         return False
     command = inp.get("command")
     if not isinstance(command, str):
         return True
-    if ".undertone" in command or "safe_phrase" in command or home in command:
+    folded = command.casefold()
+    if ".undertone" in folded or home.casefold() in folded:
         return True
-    if cwd is not None and _path_hits(cwd, home, cwd):
+    if cwd is not None and _path_hits(cwd, home, cwd, ids):
         return True
     try:
         lex = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -1364,7 +1424,7 @@ def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -
         return True
     for tok in tokens:
         for part in (tok, tok.partition("=")[2]):
-            if part and ("/" in part or part[0] in "~.") and _path_hits(part, home, cwd):
+            if part and ("/" in part or part[0] in "~.") and _path_hits(part, home, cwd, ids):
                 return True
     return False
 
