@@ -4,9 +4,29 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-10-03 — Confirm with your own safe phrase (Phase 8a follow-up)
+
+Changes made after Ed's Phase 8a live test. **Live test: pending.**
+
+**Added**
+- `undertone safe-phrase` sets your own fixed confirm phrase (1–3 words, at least 2 words or 8 letters). It reads the phrase twice with hidden input and refuses to run without an interactive terminal. `--clear` goes back to fresh two-word confirms, and `--status` says whether a phrase is set. Restart `undertone attach` and `undertone session` after changing it.
+- With a phrase set, a voice confirm is the wake word in silence followed by your phrase. Claude asks with "say the wake word, then your safe phrase", and never knows the phrase: the channel passes the raw words to the guard but replaces them with `[safe phrase]` before Claude sees them, and attach shows `[safe phrase]` on screen.
+- The phrase is stored only as an scrypt hash (n=2^14, r=8, p=1, salted) in `<home>/safe_phrase.json` (0600). A file with the wrong owner, wrong mode or any other format never grants.
+- While a confirm is pending, a wake word heard during or within 1 s after undertone's own speech no longer reaches Claude and no longer uses up the confirm. attach prints `[too soon after I spoke, so not sent: …]` and says "That was too soon after I spoke. Wait a moment, then say the wake word again." in its own voice. The pending confirm expires with the guard's 300 s challenge.
+
+**Changed**
+- The read-back now plays **before** Claude's confirm prompt, so the last thing you hear is your cue to answer.
+- The blocked-call list survives a voice turn that doesn't grant. It is cleared on a grant or a typed turn, so a re-asked confirm still reads back what was blocked.
+- The channel instructions name the five read-only cast-record tools and tell Claude to prefer them over shell commands. In the live test, Claude had reached for `just` recipes, which the guard blocks.
+
+**Security**
+- On a voice turn the guard now refuses any read or search of undertone's own folder (`<home>`) or a folder above it, even after a confirm: `Read`, `Grep`, `Glob`, `LS`, and shell commands that name it or run from a folder at or above it. `undertone session` also adds a Claude Code deny rule for reading `safe_phrase.json`.
+- Paths are matched by file identity (`os.stat` device and inode), not text. A re-check had bypassed a string-only first version with a leading `//`, a case variant (APFS is case-insensitive), the `/System/Volumes/Data` alias and a symlink. The gate also catches renamed symlinks and hard links to files in `<home>`, `..` taken after a symlink, and bare shell arguments such as `grep -r . somelink`. A project file that is itself named `safe_phrase.json` is denied on voice turns too.
+- Security review: PASS WITH FINDINGS. Fixed: M1 (the hash file was readable on a voice turn, and plain SHA-256 is fast to guess), L2 (no owner/mode check), L3 (echoed prompt without a terminal), L4 (pending flag never expired). Accepted: M2, a fixed phrase can be replayed by anyone who has heard it. It still needs the wake word in silence, a pending confirm and the 300 s window, and you hear the read-back first. Don't say the phrase on calls or near recording devices.
+
 ### 2026-10-03 — Phase 8a: voice-safety tier for app tools
 
-**Live test: pending.**
+**Live test (Ed, 2026-10-03):** the read-back was heard in the second voice and read accurately; a file-create confirm granted. Confirms said while undertone was still speaking, or within 1 s after, were refused without telling him why; Claude answered a cost question with shell recipes instead of the cast-record tools. Both are addressed in the follow-up above. Full suite on `bcdcb9d` (Ed): 633 OK, 1 skipped.
 
 **Added**
 - Read-only MCP tier: five cast-record tools (`mcp__cast-record__cast_decisions`, `mcp__cast-record__cast_incidents`, `mcp__cast-record__cast_cost`, `mcp__cast-record__cast_sessions`, `mcp__cast-record__cast_ask`) run ungated on a voice turn. Listed in `voice_guard.READ_ONLY_MCP_TOOLS` as an exact-name allowlist in code (not config), because a typed turn could edit a config file to widen the voice gate. Vetted read-only: the cast-record server opens cast.db with `mode=ro`, uses parameterized queries, and has no SQL tool.

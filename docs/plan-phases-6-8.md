@@ -119,7 +119,20 @@ Units:
 - ✓ 8a.1b (`0a83c94`): wrappers and redirects in the shell read-back.
 - ✓ 8a.5 (`3c2ad1c`): the structural read-back above, after two security review rounds (H1, M1–M3, N1, L1, L3 fixed; residuals in SECURITY.md §7a).
 - ✓ 8a.4: docs.
-- Ed: full suite (`uv run python -m unittest discover -s tests`), then a live test: a voice question that uses a `cast-record` tool runs with no confirm; a voice request for a gated action gets Claude's confirm prompt, then the read-back in the own voice; the two voices are easy to tell apart.
+- ✓ Merged to `main` 2026-10-03 (`bcdcb9d`, local `--no-ff`; `gh` is blocked in Claude's sandbox). Full suite (Ed): 633 OK, 1 skipped.
+- Live test (Ed, 2026-10-03): the read-back was heard in the second voice and read accurately, and a file-create confirm granted. But confirms said during or just after undertone's speech were refused silently (`wake_barge_in` never grants), the two fresh words were tiresome ("ferry" came back as "fairy"), and Claude answered a cost question with `just` shell recipes instead of the `cast-record` tools.
+
+**Follow-up (branch `feature/phase8a-confirm-ux`), Ed's decisions 2026-10-03:**
+- Confirm with **his own fixed safe phrase** instead of two fresh words (`undertone safe-phrase`; scrypt hash; Claude only ever sees `[safe phrase]`). Two-word confirms remain when none is set.
+- The read-back plays **before** Claude's confirm prompt.
+
+Also in the branch:
+- attach holds a too-early wake turn while a confirm is pending and says "That was too soon after I spoke…", so it no longer uses up the confirm;
+- the instructions name the read-only tools;
+- the blocked list survives until a grant;
+- after a security review (PASS WITH FINDINGS), the guard denies reads of undertone's home on voice turns, and session adds a Claude Code deny rule for the phrase file.
+
+Accepted residual: a fixed phrase can be replayed by anyone who has heard it. Live test: pending.
 
 ### 8b — first integrations (S5)
 
