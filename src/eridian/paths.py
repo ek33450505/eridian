@@ -12,10 +12,15 @@ from pathlib import Path
 HOME_MODE = 0o700
 
 
+def home_path() -> Path:
+    """Return ERIDIAN_HOME (default ~/.eridian) without creating it."""
+    raw = os.environ.get("ERIDIAN_HOME")
+    return Path(raw).expanduser() if raw else Path.home() / ".eridian"
+
+
 def home_dir() -> Path:
     """Return ERIDIAN_HOME, creating it (mode 0700) if missing."""
-    raw = os.environ.get("ERIDIAN_HOME")
-    path = Path(raw).expanduser() if raw else Path.home() / ".eridian"
+    path = home_path()
     path.mkdir(mode=HOME_MODE, parents=True, exist_ok=True)
     # mkdir's mode is masked by umask; force it explicitly.
     os.chmod(path, HOME_MODE)

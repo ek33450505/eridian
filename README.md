@@ -121,6 +121,7 @@ This defines a `claude` function that runs `eridian launch -- "$@"`. In an inter
 
 - `eridian listen`: mic → wake word → VAD → STT; prints one JSON event per line (debugging)
 - `eridian models fetch`: download the STT model (one-time ~2.5 GB)
+- `eridian migrate [--dry-run]`: one-time move of the pre-rename `~/.undertone` state folder to the eridian home (refuses while attach runs)
 - `eridian safe-phrase [--clear | --status]`: set your own voice-confirm phrase (hidden prompt, entered twice; 1–3 words, at least 2 words or 8 letters). It's stored only as an scrypt hash in `~/.eridian/safe_phrase.json`. Pick something you never say otherwise, and don't say it on calls or near recording devices: anyone who hears it can confirm. Restart `attach` and `session` after changing it.
 
 ## Custom wake word

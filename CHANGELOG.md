@@ -9,7 +9,7 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 Entries below this one are kept as released, under the old name.
 
 **Changed**
-- The project was renamed from undertone to eridian: package, CLI, MCP server and docs. The `UNDERTONE_*` environment variables and the `~/.undertone` state folder are no longer read. A planned `eridian migrate` command moves the old state folder.
+- The project was renamed from undertone to eridian: package, CLI, MCP server and docs. The `UNDERTONE_*` environment variables and the `~/.undertone` state folder are no longer read. `eridian migrate` moves the old state folder (refuses while attach runs; `--dry-run` to preview).
 
 **Fixed**
 - `eridian attach` no longer opens the no-wake-word follow-up window after an announcement. "Claude finished." fires after every session turn, so room conversation could chain turns into a session without the wake word (seen live 2026-11-05). The window now opens only after the first answer to a turn started by the wake word.

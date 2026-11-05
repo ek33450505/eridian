@@ -605,10 +605,10 @@ def launch_mode(
     return "voice"
 
 
-def _pid_is_attach(pid: int) -> bool:
-    """True if pid is alive and its command line is an eridian attach."""
+def _ps_command(pid: int) -> str:
+    """The command line of pid per `ps`, or "" if it cannot be read."""
     try:
-        out = subprocess.run(
+        return subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)],
             capture_output=True,
             text=True,
@@ -616,7 +616,12 @@ def _pid_is_attach(pid: int) -> bool:
             check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return False
+        return ""
+
+
+def _pid_is_attach(pid: int) -> bool:
+    """True if pid is alive and its command line is an eridian attach."""
+    out = _ps_command(pid)
     # Match tokens, not substrings: `tail -f ~/.eridian/attach.log` must not pass.
     return bool(
         re.search(r"(?:^|/)eridian attach(?:\s|$)|-m eridian attach(?:\s|$)", out)
@@ -745,6 +750,149 @@ def _voice_socket_present(sock_path: Path) -> bool:
         return stat.S_ISSOCK(sock_path.stat().st_mode)
     except OSError:
         return False
+
+
+def _symlink_in(path: Path) -> Path | None:
+    """The first component of path (itself included) that is a symlink, else None.
+
+    Walks every component, anchored or relative. A missing component ends the
+    walk (nothing below it exists); any other lstat error propagates as OSError.
+    """
+    probe = Path(path.anchor)
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        probe = probe / part
+        try:
+            if stat.S_ISLNK(os.lstat(probe).st_mode):
+                return probe
+        except FileNotFoundError:
+            return None
+    return None
+
+
+def _pid_is_legacy_attach(pid: int) -> bool:
+    """True if pid is alive and runs a pre-rename `undertone attach`."""
+    return bool(
+        re.search(
+            r"(?:^|/)undertone attach(?:\s|$)|-m undertone attach(?:\s|$)",
+            _ps_command(pid),
+        )
+    )
+
+
+def _attach_live_in(folder: Path) -> str | None:
+    """Why folder looks like it has a running attach, else None (no connect)."""
+    try:
+        pid = int((folder / "attach.pid").read_text().strip())
+    except (OSError, ValueError):
+        pid = None
+    if pid is not None and (_pid_is_attach(pid) or _pid_is_legacy_attach(pid)):
+        return f"an attach is running (pid {pid}; run `eridian stop` first)"
+    sock = folder / "voice.sock"
+    if _voice_socket_present(sock):
+        return (
+            f"{sock} exists, so an attach may be running; if no attach is "
+            f"running, remove {sock} and retry"
+        )
+    return None
+
+
+def _migrate(source: Path, target: Path, *, dry_run: bool) -> int:
+    """Fail-closed, atomic move of the pre-rename state folder to target.
+
+    Refuses (exit 1, nothing changed) on symlinks, wrong owner, a non-empty
+    target, a running attach, or a cross-filesystem move. The only thing ever
+    removed is an empty target directory.
+    """
+
+    def refuse(msg: str) -> int:
+        print(f"eridian: migrate refused: {msg}", file=sys.stderr)
+        return 1
+
+    if not target.is_absolute():
+        return refuse("ERIDIAN_HOME must be an absolute path")
+    try:
+        src_st = os.lstat(source)
+    except FileNotFoundError:
+        print(f"eridian: {source} does not exist; nothing to migrate")
+        return 0
+    except OSError as exc:
+        return refuse(f"cannot inspect {source}: {exc}")
+    try:
+        for path in (source, target):
+            link = _symlink_in(path)
+            if link is not None:
+                return refuse(f"{link} is a symlink")
+    except OSError as exc:
+        return refuse(f"cannot inspect {path}: {exc}")
+    if not stat.S_ISDIR(src_st.st_mode):
+        return refuse(f"{source} is not a directory")
+    uid = os.getuid()
+    if src_st.st_uid != uid:
+        return refuse(f"{source} is not owned by the current user")
+    try:
+        parent_st = os.lstat(target.parent)
+    except OSError as exc:
+        return refuse(f"cannot inspect {target.parent}: {exc}")
+    if parent_st.st_uid != uid:
+        return refuse(f"{target.parent} is not owned by the current user")
+    if parent_st.st_mode & 0o022:
+        return refuse(f"{target.parent} is group- or world-writable")
+    target_exists = True
+    try:
+        tgt_st = os.lstat(target)
+    except FileNotFoundError:
+        target_exists = False
+        tgt_st = parent_st
+    except OSError as exc:
+        return refuse(f"cannot inspect {target}: {exc}")
+    if target_exists:
+        if not stat.S_ISDIR(tgt_st.st_mode):
+            return refuse(f"{target} exists and is not a directory")
+        if tgt_st.st_uid != uid:
+            return refuse(f"{target} is not owned by the current user")
+    for folder in (source, target) if target_exists else (source,):
+        reason = _attach_live_in(folder)
+        if reason is not None:
+            return refuse(reason)
+    try:
+        if target_exists and any(target.iterdir()):
+            return refuse(f"{target} is not empty")
+    except OSError as exc:
+        return refuse(f"cannot read {target}: {exc}")
+    if src_st.st_dev != tgt_st.st_dev:
+        return refuse(f"{source} and {target} are on different filesystems")
+    if dry_run:
+        print(f"eridian: would move {source} -> {target} (dry run; nothing changed)")
+        return 0
+    try:
+        if target_exists:
+            target.rmdir()
+        os.rename(source, target)
+    except OSError as exc:
+        return refuse(f"could not move {source} -> {target}: {exc}")
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(
+            f"eridian: migrated to {target} but could not set mode 0700: {exc}; "
+            f"fix with chmod 700 {target}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"moved {source} -> {target}")
+    return 0
+
+
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    # The one place that names the pre-rename ~/.undertone folder.
+    return _migrate(
+        Path.home() / ".undertone", paths.home_path(), dry_run=args.dry_run
+    )
 
 
 def _cmd_attach(args: argparse.Namespace) -> int:
@@ -899,6 +1047,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="stop the background `eridian attach`").set_defaults(
         func=_cmd_stop
     )
+
+    migrate_parser = sub.add_parser(
+        "migrate",
+        help="move the pre-rename ~/.undertone state folder to the eridian home",
+    )
+    migrate_parser.add_argument(
+        "--dry-run", action="store_true", help="run every check, change nothing"
+    )
+    migrate_parser.set_defaults(func=_cmd_migrate)
 
     shell_parser = sub.add_parser(
         "shell-init", help="print shell code that makes `claude` autolaunch voice"
