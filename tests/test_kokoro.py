@@ -265,6 +265,233 @@ class VoiceNameTests(KokoroTestBase):
             self.make()
 
 
+class VoiceBlendTests(KokoroTestBase):
+    def setUp(self):
+        super().setUp()
+        d = Path(self._tmp.name)
+        rows = np.arange(510, dtype=np.float32)[:, None] * np.ones((1, 256), np.float32)
+        self.a, self.b = d / "a.bin", d / "b.bin"
+        rows.tofile(self.a)
+        (rows * 3 + 10).tofile(self.b)
+        self.rows = rows
+
+    def blend(self, spec, **kw):
+        return self.make(
+            voice=spec, voice_paths={"am_adam": str(self.a), "bm_george": str(self.b)}, **kw
+        )
+
+    def test_parse_valid(self):
+        got = kokoro.parse_voice_spec("am_adam:0.6,bm_george:0.4")
+        self.assertEqual([n for n, _ in got], ["am_adam", "bm_george"])
+        self.assertAlmostEqual(got[0][1], 0.6)
+        self.assertAlmostEqual(got[1][1], 0.4)
+        self.assertEqual(kokoro.parse_voice_spec("am_adam"), [("am_adam", 1.0)])
+        self.assertEqual(kokoro.voice_names("am_adam:3, bm_george:1"), ["am_adam", "bm_george"])
+
+    def test_parse_normalises_weights(self):
+        got = kokoro.parse_voice_spec("am_adam:3,bm_george:1")
+        self.assertAlmostEqual(got[0][1], 0.75)
+
+    def test_parse_rejects_bad_names_and_weights(self):
+        for bad in (
+            "../x:1,am_adam:1",
+            "am_adam:1,AM_x:1",
+            "am_adam:0,bm_george:1",
+            "am_adam:-1,bm_george:1",
+            "am_adam:nan,bm_george:1",
+            "am_adam:inf,bm_george:1",
+            "am_adam:abc,bm_george:1",
+            "am_adam:,bm_george:1",
+            "am_adam,bm_george:1",
+            "am_adam:1,",
+            "am_adam:1,am_adam:1",
+        ):
+            with self.assertRaises(kokoro.KokoroUnavailable, msg=bad):
+                kokoro.parse_voice_spec(bad)
+
+    def test_blend_is_weighted_sum(self):
+        v = self.blend("am_adam:0.6,bm_george:0.4")
+        expected = 0.6 * self.rows + 0.4 * (self.rows * 3 + 10)
+        np.testing.assert_allclose(v._styles, expected, rtol=1e-5)
+        self.assertEqual(v.voice_names, ["am_adam", "bm_george"])
+        v.render("ab.")
+        np.testing.assert_allclose(self.session.calls[0]["style"][0], expected[2], rtol=1e-5)
+
+    def test_blend_shape_mismatch(self):
+        np.zeros(256 * 3, np.float32).tofile(self.b)
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.blend("am_adam:0.6,bm_george:0.4")
+
+    def test_blend_bad_component_file(self):
+        self.b.write_bytes(np.zeros(100, np.float32).tobytes())
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.blend("am_adam:0.6,bm_george:0.4")
+
+    def test_blend_hashes_model_once(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch("huggingface_hub.hf_hub_download") as dl, \
+                mock.patch.object(kokoro, "_sha256_file") as sha:
+            def fake(repo, name, **kw):
+                calls.append(name)
+                return str(Path(td) / name.replace("/", "_"))
+            dl.side_effect = fake
+            sha.side_effect = lambda path: {
+                **{kokoro.MODEL_FILE.replace("/", "_"): kokoro.MODEL_SHA256,
+                   kokoro.TOKENIZER_FILE: kokoro.TOKENIZER_SHA256},
+                **{f"voices_{n}.bin": h for n, h in kokoro.VOICE_SHA256.items()},
+            }[Path(path).name]
+            model, tok, files = kokoro._model_paths_multi(["am_adam", "bm_george", "am_adam"])
+        self.assertEqual(calls.count(kokoro.MODEL_FILE), 1)
+        self.assertEqual(sha.call_count, 4)  # model, tokenizer, two distinct voices
+        self.assertEqual(len(files), 3)
+
+
+def sine(freq, seconds=2.0, amp=0.4):
+    t = np.arange(int(seconds * RATE)) / RATE
+    return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+
+
+def peak_hz(x):
+    sp = np.abs(np.fft.rfft(x * np.hanning(x.size)))
+    return float(np.argmax(sp)) / (x.size / RATE)
+
+
+class ChordEffectTests(KokoroTestBase):
+    def voice(self, effect):
+        return self.make(sine(150), effect=effect)
+
+    def pcm(self, v, **kw):
+        return np.frombuffer(v.render("ab", **kw), np.int16).astype(np.float64)
+
+    def test_changes_audio_and_keeps_peak(self):
+        dry = self.pcm(self.voice(""))
+        wet = self.pcm(self.voice("chord"))
+        self.assertEqual(dry.size, wet.size)
+        self.assertFalse(np.allclose(dry, wet, atol=100))
+        self.assertLessEqual(np.abs(wet).max(), np.abs(dry).max() + 1)
+
+    def test_skipped_for_own_voice(self):
+        v = self.voice("chord")
+        np.testing.assert_array_equal(self.pcm(v, own=True), self.pcm(self.voice(""), own=True))
+        self.assertFalse(np.array_equal(self.pcm(v), self.pcm(v, own=True)))
+
+    def test_env_switch(self):
+        os.environ[kokoro.EFFECT_ENV] = "chord"
+        self.assertEqual(self.make().effect, "chord")
+        os.environ[kokoro.EFFECT_ENV] = "off"
+        self.assertEqual(self.make().effect, "")
+        del os.environ[kokoro.EFFECT_ENV]
+        self.assertEqual(self.make().effect, "")
+        os.environ[kokoro.EFFECT_ENV] = "bogus"
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.make()
+
+    def test_shift_pitch(self):
+        out = kokoro._shift(sine(150).astype(np.float64), 4.0)[RATE // 2 : 3 * RATE // 2]
+        self.assertAlmostEqual(peak_hz(out), 150 * 2 ** (4 / 12), delta=2.0)
+        out = kokoro._shift(sine(150).astype(np.float64), 7.0)[RATE // 2 : 3 * RATE // 2]
+        self.assertAlmostEqual(peak_hz(out), 150 * 2 ** (7 / 12), delta=2.0)
+
+    def test_chord_has_all_three_pitches(self):
+        wet = kokoro.chord_effect(sine(150))[RATE // 2 : 3 * RATE // 2]
+        sp = np.abs(np.fft.rfft(wet * np.hanning(wet.size)))
+        for semis in (0, 4, 7):
+            f = 150 * 2 ** (semis / 12)
+            band = sp[int(f * 0.95 * wet.size / RATE) : int(f * 1.05 * wet.size / RATE)]
+            self.assertGreater(band.max(), sp.max() * 0.1, semis)
+
+    def test_empty_input_unchanged(self):
+        out = kokoro.chord_effect(np.zeros(0, np.float32))
+        self.assertEqual(out.size, 0)
+
+    def test_crossfade_has_no_clicks_at_delay_wrap(self):
+        # Without the sin^2 crossfade each tap jumps at its wrap. 173 Hz, because the 960-sample
+        # window is a whole number of 150 Hz periods, so that wrap would be invisible.
+        out = kokoro._shift(sine(173, seconds=3.0).astype(np.float64), 4.0)[RATE // 2 :]
+        self.assertLess(np.abs(np.diff(out)).max(), 0.05)
+
+    def test_vibrato_modulates_pitch_but_stays_in_tune(self):
+        x = sine(150, seconds=3.0).astype(np.float64)
+        plain = kokoro._shift(x, 4.0)[RATE // 2 : 5 * RATE // 2]
+        wobbly = kokoro._shift(x, 4.0, 5.3)[RATE // 2 : 5 * RATE // 2]
+        rms = lambda a: float(np.sqrt(np.mean(a**2)))
+        self.assertGreater(rms(plain - wobbly), 0.1 * rms(plain))
+        self.assertAlmostEqual(peak_hz(wobbly), 150 * 2 ** (4 / 12), delta=4.0)
+
+    def test_cost_under_budget(self):
+        import time
+
+        x = sine(150, seconds=4.0)
+        kokoro.chord_effect(x)
+        best = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            kokoro.chord_effect(x)
+            best = min(best, time.perf_counter() - t0)
+        ms_per_s = best / 4.0 * 1000
+        print(f"\nchord effect: {ms_per_s:.2f} ms per second of audio")
+        self.assertLess(ms_per_s, 10.0)
+
+
+class PitchTests(KokoroTestBase):
+    def pcm(self, v, **kw):
+        return np.frombuffer(v.render("ab", **kw), np.int16)
+
+    def test_pitch_moves_fft_peak(self):
+        for semis in (2.0, -3.0):
+            v = self.make(sine(150, seconds=3.0), pitch=semis)
+            out = self.pcm(v).astype(np.float64)[RATE // 2 : 5 * RATE // 2]
+            self.assertAlmostEqual(peak_hz(out), 150 * 2 ** (semis / 12), delta=2.0, msg=semis)
+
+    def test_zero_is_identity(self):
+        # _shift(x, 0) is not identity (it delays by half a window), so the guard must skip it.
+        wave = sine(150)
+        with mock.patch.object(kokoro, "_shift", side_effect=AssertionError("shift called")) as sh:
+            explicit = self.pcm(self.make(wave, pitch=0.0))
+            unset = self.pcm(self.make(wave))
+            os.environ[kokoro.PITCH_ENV] = "0"
+            from_env = self.pcm(self.make(wave))
+        sh.assert_not_called()
+        np.testing.assert_array_equal(explicit, unset)
+        np.testing.assert_array_equal(from_env, unset)
+        # And the samples are the trimmed input itself, undelayed.
+        loud = np.flatnonzero(np.abs(wave) > np.abs(wave).max() * 0.01)
+        start = max(int(loud[0]) - int(0.02 * RATE), 0)
+        end = min(int(loud[-1]) + 1 + int(0.05 * RATE), wave.size)
+        expected = (np.clip(wave[start:end], -1, 1) * 32767).astype(np.int16)
+        np.testing.assert_array_equal(unset[: expected.size], expected)
+
+    def test_own_voice_skipped(self):
+        np.testing.assert_array_equal(
+            self.pcm(self.make(sine(150), pitch=3.0), own=True),
+            self.pcm(self.make(sine(150)), own=True),
+        )
+
+    def test_chord_is_relative_to_shifted_root(self):
+        v = self.make(sine(150, seconds=3.0), pitch=2.0, effect="chord")
+        wet = self.pcm(v).astype(np.float64)[RATE // 2 : 5 * RATE // 2]
+        sp = np.abs(np.fft.rfft(wet * np.hanning(wet.size)))
+        root = 150 * 2 ** (2 / 12)
+        for semis in (0, 4, 7):
+            f = root * 2 ** (semis / 12)
+            band = sp[int(f * 0.95 * wet.size / RATE) : int(f * 1.05 * wet.size / RATE)]
+            self.assertGreater(band.max(), sp.max() * 0.1, semis)
+
+    def test_env_and_bad_values(self):
+        os.environ[kokoro.PITCH_ENV] = "1.5"
+        self.assertEqual(self.make().pitch, 1.5)
+        os.environ[kokoro.PITCH_ENV] = ""
+        self.assertEqual(self.make().pitch, 0.0)
+        for bad in ("7", "-6.5", "nan", "inf", "-inf", "abc"):
+            os.environ[kokoro.PITCH_ENV] = bad
+            with self.assertRaises(kokoro.KokoroUnavailable, msg=bad):
+                self.make()
+        self.assertEqual(self.make(pitch=6.0).pitch, 6.0)
+        with self.assertRaises(kokoro.KokoroUnavailable):
+            self.make(pitch=float("nan"))
+
+
 class ModelConstantsTests(unittest.TestCase):
     def test_default_voice(self):
         self.assertEqual(kokoro.DEFAULT_VOICE, "am_adam")
@@ -447,6 +674,21 @@ class RealModelSmoke(unittest.TestCase):
         v.warm_up()
         out = v.render("həlˈoʊ wˈɜːld.")
         self.assertTrue(out and len(out) % 2 == 0)
+
+    def test_blend_and_chord_sample(self):
+        import wave
+
+        pitch = float(os.environ.get("UNDERTONE_TEST_SAMPLE_PITCH", "0"))
+        v = kokoro.KokoroVoice("am_adam:0.6,bm_george:0.4", effect="chord", pitch=pitch)
+        out = v.render("hɛlˈoʊ, aɪ æm ɹˈɑki. aɪ wɪl hɛlp.")
+        self.assertTrue(out and len(out) % 2 == 0)
+        dest = os.environ.get("UNDERTONE_TEST_SAMPLE_WAV")
+        if dest:
+            with wave.open(dest, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(kokoro.OUT_RATE)
+                w.writeframes(out)
 
 
 if __name__ == "__main__":
