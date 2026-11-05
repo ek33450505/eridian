@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 from typing import TYPE_CHECKING, Any, Callable
@@ -40,6 +41,15 @@ VOICE_ENV = "UNDERTONE_KOKORO_VOICE"
 # am_adam and is American English, so the en-us espeak phonemes fit.
 OWN_VOICE_ENV = "UNDERTONE_KOKORO_OWN_VOICE"
 DEFAULT_OWN_VOICE = "af_heart"
+# "chord" layers +4 and +7 semitone copies over the reply voice (a Rocky-style chord
+# voice); default off. Never applied to undertone's own voice.
+EFFECT_ENV = "UNDERTONE_KOKORO_EFFECT"
+# Semitone shift of the reply voice (never undertone's own), applied before the chord.
+PITCH_ENV = "UNDERTONE_KOKORO_PITCH"
+_PITCH_LIMIT = 6.0
+_CHORD_VOICES = ((4.0, 0.35, 5.3), (7.0, 0.25, 6.1))  # (semitones, gain, vibrato Hz)
+_CHORD_WINDOW_S = 0.04
+_CHORD_VIBRATO_SAMPLES = 8.0  # about +-20 cents at ~5.5 Hz: musical, still intelligible
 
 # ~0.27 s to render on an idle M4 Max with fp32, vs 0.35 s at 47 tokens (measured 2026-10-02).
 FIRST_PIECE_TOKENS = 32
@@ -153,6 +163,115 @@ def _check_voice_name(voice: str) -> str:
     return voice
 
 
+def parse_voice_spec(spec: str) -> list[tuple[str, float]]:
+    """Parse 'name' or 'name:weight,name:weight' into [(name, normalised weight)]."""
+    if "," not in spec and ":" not in spec:
+        return [(_check_voice_name(spec), 1.0)]
+    parts = [p.strip() for p in spec.split(",")]
+    parsed: list[tuple[str, float]] = []
+    for part in parts:
+        name, sep, raw = part.partition(":")
+        if not sep:
+            raise KokoroUnavailable(
+                f"undertone: Kokoro voice blend {spec!r} needs name:weight for every voice"
+            )
+        try:
+            weight = float(raw)
+        except ValueError:
+            weight = math.nan
+        if not (math.isfinite(weight) and weight > 0.0):
+            raise KokoroUnavailable(
+                f"undertone: invalid Kokoro blend weight {raw!r} for {name!r} "
+                "(must be positive and finite)"
+            )
+        parsed.append((_check_voice_name(name), weight))
+    names = [n for n, _ in parsed]
+    if len(set(names)) != len(names):
+        raise KokoroUnavailable(f"undertone: duplicate voice in Kokoro blend {spec!r}")
+    total = sum(w for _, w in parsed)
+    return [(n, w / total) for n, w in parsed]
+
+
+def voice_names(spec: str) -> list[str]:
+    """Component voice names of a plain or blended voice spec."""
+    return [name for name, _ in parse_voice_spec(spec)]
+
+
+def _load_styles(path: str, label: str) -> np.ndarray:
+    try:
+        styles = np.fromfile(path, dtype=np.float32)
+    except (OSError, ValueError) as exc:
+        raise KokoroUnavailable(f"undertone: could not load Kokoro assets: {exc}") from exc
+    if styles.size == 0 or styles.size % STYLE_DIM:
+        raise KokoroUnavailable(f"undertone: Kokoro voice {label!r} has an unexpected shape")
+    return styles.reshape(-1, STYLE_DIM)
+
+
+def blend_styles(parts: list[tuple[str, float, np.ndarray]]) -> np.ndarray:
+    """Weighted sum of voicepacks; weights come normalised from `parse_voice_spec`."""
+    shape = parts[0][2].shape
+    for name, _, arr in parts:
+        if arr.shape != shape:
+            raise KokoroUnavailable(
+                f"undertone: Kokoro voice {name!r} shape {arr.shape} does not match {shape}"
+            )
+    out = np.zeros(shape, dtype=np.float64)
+    for _, w, arr in parts:
+        out += w * arr.astype(np.float64)
+    return out.astype(np.float32)
+
+
+def _shift(x: np.ndarray, semitones: float, vibrato_hz: float = 0.0) -> np.ndarray:
+    """Two-tap crossfaded delay-line pitch shifter (float64 in/out)."""
+    ratio = 2.0 ** (semitones / 12.0)
+    win = _CHORD_WINDOW_S * MODEL_RATE
+    n = np.arange(x.size, dtype=np.float64)
+    wobble = 0.0
+    if vibrato_hz:
+        wobble = _CHORD_VIBRATO_SAMPLES * np.sin(2 * np.pi * vibrato_hz * n / MODEL_RATE)
+    out = np.zeros(x.size, dtype=np.float64)
+    last = x.size - 1
+    for offset in (0.0, 0.5):
+        phase = (n * (ratio - 1.0) / win + offset) % 1.0
+        pos = n - win * (1.0 - phase) - wobble
+        i = np.floor(pos).astype(np.int64)
+        frac = pos - i
+        a = np.where(i >= 0, x[np.clip(i, 0, last)], 0.0)
+        b = np.where(i + 1 >= 0, x[np.clip(i + 1, 0, last)], 0.0)
+        out += np.sin(np.pi * phase) ** 2 * (a * (1.0 - frac) + b * frac)
+    return out
+
+
+def chord_effect(wave: np.ndarray) -> np.ndarray:
+    """Add +4/+7 semitone copies, then peak-normalise back to the dry peak."""
+    if wave.size == 0:
+        return wave
+    dry = wave.astype(np.float64)
+    mix = dry.copy()
+    for semitones, gain, vibrato_hz in _CHORD_VOICES:
+        mix += gain * _shift(dry, semitones, vibrato_hz)
+    dry_peak = float(np.max(np.abs(dry)))
+    mix_peak = float(np.max(np.abs(mix)))
+    if mix_peak > dry_peak > 0.0:
+        mix *= dry_peak / mix_peak
+    return mix.astype(np.float32)
+
+
+def parse_pitch(raw: str | float | None) -> float:
+    """Semitones in [-6, +6]; empty/None means 0."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return 0.0
+    try:
+        semitones = float(raw)
+    except ValueError:
+        semitones = math.nan
+    if not (math.isfinite(semitones) and abs(semitones) <= _PITCH_LIMIT):
+        raise KokoroUnavailable(
+            f"undertone: invalid {PITCH_ENV} value {raw!r} (expected semitones in -6..6)"
+        )
+    return semitones
+
+
 def _sha256_file(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -161,20 +280,18 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def model_paths(voice: str) -> tuple[str, str, str]:
-    """Return (model, tokenizer, voice file) from the local HF cache only, hash-verified."""
-    _check_voice_name(voice)
-    voice_sha = VOICE_SHA256.get(voice)
-    if voice_sha is None:
-        raise KokoroUnavailable(f"undertone: unknown Kokoro voice {voice!r}")
+def _model_paths_multi(voices: list[str]) -> tuple[str, str, list[str]]:
+    """(model, tokenizer, voice files) from the local HF cache only; each file hashed once."""
+    wanted: list[tuple[str, str]] = [(MODEL_FILE, MODEL_SHA256), (TOKENIZER_FILE, TOKENIZER_SHA256)]
+    for voice in dict.fromkeys(voices):
+        _check_voice_name(voice)
+        voice_sha = VOICE_SHA256.get(voice)
+        if voice_sha is None:
+            raise KokoroUnavailable(f"undertone: unknown Kokoro voice {voice!r}")
+        wanted.append((f"voices/{voice}.bin", voice_sha))
     from huggingface_hub import hf_hub_download
 
-    wanted = (
-        (MODEL_FILE, MODEL_SHA256),
-        (TOKENIZER_FILE, TOKENIZER_SHA256),
-        (f"voices/{voice}.bin", voice_sha),
-    )
-    paths: list[str] = []
+    by_name: dict[str, str] = {}
     for name, sha in wanted:
         try:
             path = hf_hub_download(
@@ -183,7 +300,7 @@ def model_paths(voice: str) -> tuple[str, str, str]:
             ok = _sha256_file(path) == sha
         except Exception as exc:  # noqa: BLE001 - any cache miss means "not fetched"
             raise KokoroUnavailable(
-                f"undertone: Kokoro model/voice {voice!r} is not cached locally -- "
+                f"undertone: Kokoro model/voice {', '.join(voices)!r} is not cached locally -- "
                 "run `undertone models fetch` first"
             ) from exc
         if not ok:
@@ -191,8 +308,18 @@ def model_paths(voice: str) -> tuple[str, str, str]:
                 f"undertone: Kokoro file {name!r} failed its integrity check -- "
                 "re-run `undertone models fetch`"
             )
-        paths.append(path)
-    return paths[0], paths[1], paths[2]
+        by_name[name] = path
+    return (
+        by_name[MODEL_FILE],
+        by_name[TOKENIZER_FILE],
+        [by_name[f"voices/{v}.bin"] for v in voices],
+    )
+
+
+def model_paths(voice: str) -> tuple[str, str, str]:
+    """Return (model, tokenizer, voice file) from the local HF cache only, hash-verified."""
+    model, tokenizer, voices = _model_paths_multi([_check_voice_name(voice)])
+    return model, tokenizer, voices[0]
 
 
 def _default_session(model_path: str) -> Any:
@@ -231,14 +358,35 @@ class KokoroVoice:
         resample: Callable[[bytes], bytes] | None = None,
         own_voice: str | None = None,
         own_voice_path: str | None = None,
+        voice_paths: dict[str, str] | None = None,
+        effect: str | None = None,
+        pitch: float | None = None,
     ) -> None:
-        self.voice = _check_voice_name(voice or os.environ.get(VOICE_ENV) or DEFAULT_VOICE)
-        model_path, tokenizer_path, voice_path = paths or model_paths(self.voice)
+        """`voice` may be a blend ('am_adam:0.6,bm_george:0.4'); tests inject `voice_paths`
+        (component name -> file) for blends and `paths` for a plain voice."""
+        self.voice = voice or os.environ.get(VOICE_ENV) or DEFAULT_VOICE
+        components = parse_voice_spec(self.voice)
+        self.voice_names = [name for name, _ in components]
+        blended = len(components) > 1
+        effect = (os.environ.get(EFFECT_ENV, "") if effect is None else effect).strip().lower()
+        if effect not in ("", "off", "none", "chord"):
+            raise KokoroUnavailable(f"undertone: unknown {EFFECT_ENV} value {effect!r}")
+        self.effect = "chord" if effect == "chord" else ""
+        self.pitch = parse_pitch(os.environ.get(PITCH_ENV) if pitch is None else pitch)
+
+        if paths:
+            model_path, tokenizer_path, voice_path = paths
+            component_files = dict(voice_paths or {})
+            if not blended:
+                component_files.setdefault(self.voice_names[0], voice_path)
+        else:
+            model_path, tokenizer_path, files = _model_paths_multi(self.voice_names)
+            component_files = dict(zip(self.voice_names, files))
+            voice_path = files[0]
 
         try:
             with open(tokenizer_path, encoding="utf-8") as fh:
                 vocab = json.load(fh)["model"]["vocab"]
-            styles = np.fromfile(voice_path, dtype=np.float32)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise KokoroUnavailable(f"undertone: could not load Kokoro assets: {exc}") from exc
         if not (
@@ -249,12 +397,16 @@ class KokoroVoice:
             )
         ):
             raise KokoroUnavailable("undertone: Kokoro tokenizer vocab is malformed")
-        if styles.size == 0 or styles.size % STYLE_DIM:
-            raise KokoroUnavailable(
-                f"undertone: Kokoro voice {self.voice!r} has an unexpected shape"
-            )
         self._vocab: dict[str, int] = vocab
-        self._styles = styles.reshape(-1, STYLE_DIM)
+        if blended:
+            missing = [n for n in self.voice_names if n not in component_files]
+            if missing:
+                raise KokoroUnavailable(f"undertone: no voice file for {missing[0]!r}")
+            self._styles = blend_styles(
+                [(n, w, _load_styles(component_files[n], n)) for n, w in components]
+            )
+        else:
+            self._styles = _load_styles(voice_path, self.voice)
 
         self.own_voice = _check_voice_name(
             own_voice or os.environ.get(OWN_VOICE_ENV) or DEFAULT_OWN_VOICE
@@ -358,6 +510,11 @@ class KokoroVoice:
         start = max(int(loud[0]) - int(_LEAD_S * MODEL_RATE), 0)
         end = min(int(loud[-1]) + 1 + int(_TAIL_S * MODEL_RATE), wave.size)
         wave = wave[start:end]
+        if not own:
+            if self.pitch:
+                wave = _shift(wave.astype(np.float64), self.pitch).astype(np.float32)
+            if self.effect == "chord":
+                wave = chord_effect(wave)
 
         last = phonemes.rstrip()[-1:]
         pause_s = (

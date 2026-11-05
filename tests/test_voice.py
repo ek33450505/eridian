@@ -21,18 +21,21 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import voice_guard
+from undertone import voice_guard, wake
 from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
 from undertone.spoken import sanitize_terminal
 from undertone.voice import (
     ANNOUNCE_LEVELS,
     ANNOUNCE_REPEAT_S,
     ANNOUNCE_TEMPLATES,
+    ECHO_GUARD_S,
+    ECHO_HISTORY_S,
     MAX_CHECK_CHARS,
     MAX_CONNECTIONS,
     MAX_LINE_BYTES,
     NO_SESSION_SPEECH,
     TOO_SOON_SPEECH,
+    WAKE_MISMATCH_SPEECH,
     VoiceBridge,
     _Conn,
     self_wake_guard_from_env,
@@ -106,8 +109,11 @@ class _Channel:
     def send_raw(self, data: bytes) -> None:
         self.sock.sendall(data)
 
-    def hello(self, pid: int = 4242, cwd: str = "/work/proj") -> None:
-        self.send_obj({"type": "hello", "pid": pid, "cwd": cwd})
+    def hello(self, pid: int = 4242, cwd: str = "/work/proj", wake: object = None) -> None:
+        msg = {"type": "hello", "pid": pid, "cwd": cwd}
+        if wake is not None:
+            msg["wake"] = wake
+        self.send_obj(msg)
 
     def read_line(self) -> dict | None:
         """Next JSON line, or None on EOF / reset."""
@@ -259,6 +265,111 @@ class StartupTest(VoiceTestCase):
         self.assertFalse(self.sock_path.exists())
         self.assertTrue(_wait_for(lambda: not any(t.is_alive() for t in threads)))
         self.assertTrue(self.player.closed)
+
+
+class WakeMismatchTest(VoiceTestCase):
+    def _refused(self, channel_wake) -> None:
+        self.start()
+        channel = self.connect(wake=channel_wake)
+        self.assertTrue(_wait_for(lambda: "[refused session" in self.out.getvalue()))
+        self.bridge.process_frame(FRAME)  # control queue drains on the main thread
+        return channel
+
+    def test_different_phrase_is_refused_warned_and_spoken(self) -> None:
+        self._refused("hey rocky")
+        out = self.out.getvalue()
+        self.assertIn("'hey rocky'", out)
+        self.assertIn("'hey jarvis'", out)
+        self.assertNotIn("[attached:", out)
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH])
+
+    def test_refused_session_gets_no_utterances(self) -> None:
+        self._refused("hey rocky")
+        self.wake()
+        self.speak("what is the status")
+        self.assertNotIn("[attached:", self.out.getvalue())
+        self.assertIn("[no Claude session attached]", self.out.getvalue())
+
+    def test_non_string_phrase_counts_as_default(self) -> None:
+        self.start()
+        self.attach(wake=["x"])
+        self.assertIn("[attached:", self.out.getvalue())
+
+    def test_matching_and_old_style_hellos_attach(self) -> None:
+        self.start()
+        self.attach(wake="Hey Jarvis")
+        self.attach()  # no phrase field: the default
+        self.assertEqual(self.out.getvalue().count("[attached:"), 2)
+        self.assertEqual(self.player.enqueued, [])
+
+    def test_attach_with_custom_phrase_refuses_old_hello(self) -> None:
+        self.start()
+        with mock.patch.dict(os.environ, {wake.PHRASE_ENV: "hey rocky"}):
+            self.connect()
+            self.assertTrue(_wait_for(lambda: "[refused session" in self.out.getvalue()))
+            self.attach(wake="hey rocky")
+
+
+class WakeMismatchDirectTest(VoiceTestCase):
+    """Drives _handle_line with fake connections: no sockets, deterministic clock."""
+
+    def hello(self, wake_phrase=None, conn=None, session=None):
+        conn = conn or _FakeConn()
+        msg = {"type": "hello", "pid": 9, "cwd": "/w"}
+        if wake_phrase is not None:
+            msg["wake"] = wake_phrase
+        if session is not None:
+            msg["session"] = session
+        self.bridge._handle_line(conn, json.dumps(msg).encode())
+        self.bridge.process_frame(FRAME)
+        return conn
+
+    def test_notice_is_spoken_at_most_once_per_minute(self) -> None:
+        self.hello("hey rocky")
+        self.hello("hey rocky")
+        self.hello("hey nova")  # a different phrase does not get a second notice
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH])
+        self.clock.now += 61.0
+        self.hello("hey rocky")
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH] * 2)
+        self.assertEqual(self.out.getvalue().count("[refused session"), 4)  # the warning is never rate limited
+
+    def test_cycling_many_phrases_is_spoken_once(self) -> None:
+        for i in range(20):
+            self.hello(f"hey name{'x' * i}")
+            self.clock.now += 1.0
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH])
+
+    def test_reply_from_a_refused_connection_is_ignored(self) -> None:
+        conn = self.hello("hey rocky")
+        before = list(self.player.enqueued)
+        self.bridge._handle_line(conn, b'{"type":"reply","text":"sneaky."}')
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, before)
+        self.assertNotIn("sneaky", self.out.getvalue())
+
+    def test_existing_attached_session_survives_a_refused_hello(self) -> None:
+        good = self.hello("hey jarvis", session=TOKEN)
+        self.assertIs(self.bridge._conn, good)
+        self.hello("hey rocky", session=OTHER_TOKEN)
+        self.assertIs(self.bridge._conn, good)
+        self.assertEqual(good.sent, [])  # not detached either
+        self.bridge._handle_line(good, b'{"type":"reply","text":"Still here."}')
+        self.assertTrue(_wait_for(lambda: "Still here." in "".join(self.player.enqueued)))
+
+    def test_announce_from_a_refused_connection_is_not_spoken(self) -> None:
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+        refused = self.hello("hey rocky", session=TOKEN)
+        self.assertIsNot(self.bridge._conn, refused)
+        before = list(self.player.enqueued)
+        self.bridge._handle_line(
+            _FakeConn(), json.dumps({"type": "announce", "event": "finished", "session": TOKEN}).encode()
+        )
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, before)
+        self.assertNotIn("[announce:", self.out.getvalue())
 
 
 class ConversationTest(VoiceTestCase):
@@ -508,7 +619,7 @@ class TalkOverTest(VoiceTestCase):
             channel.read_line(),
             {"type": "utterance", "text": "actually never mind", "via": "talk_over"},
         )
-        self.assertIn("you: actually never mind", self.out.getvalue())
+        self.assertIn("you [talk_over]: actually never mind", self.out.getvalue())
 
     def _assert_talk_over_off(self, **extra) -> None:
         calls = self._bridge()
@@ -596,7 +707,8 @@ class TalkOverTest(VoiceTestCase):
         channel = self.attach()
         heard = "I finished the refactor and all the tests pass"
         self._talk_over_reply(heard, channel)
-        self.assertIn(f'[ignored as my own reply: "{heard}"]', self.out.getvalue())
+        self.assertIn(heard, self.out.getvalue())
+        self.assertIn("[dropped: echo of own speech]", self.out.getvalue())
         self.assertNotIn("you:", self.out.getvalue())
         channel.sock.settimeout(0.3)
         self.assertIsNone(channel.read_line())
@@ -613,7 +725,7 @@ class TalkOverTest(VoiceTestCase):
         )
         out = self.out.getvalue()
         self.assertIn(f'[removed my own words: "{heard}" -> "wait what\'s the time"]', out)
-        self.assertIn("you: wait what's the time", out)
+        self.assertIn("you [talk_over]: wait what's the time", out)
 
     def test_wake_while_speaking_sends_wake_barge_in_via(self) -> None:
         self._bridge()
@@ -1423,7 +1535,7 @@ class TooSoonAndRedactionTest(VoiceTestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0]["via"], "wake_barge_in")
         self.assertNotIn(TOO_SOON_SPEECH, self.player.enqueued)
-        self.assertIn("you: what time is it", self.out.getvalue())
+        self.assertIn("you [wake_barge_in]: what time is it", self.out.getvalue())
 
     def test_safe_phrase_redacted_in_print_but_raw_on_socket(self) -> None:
         voice_guard.set_safe_phrase(self.home, "copper maple")
@@ -1445,6 +1557,98 @@ class TooSoonAndRedactionTest(VoiceTestCase):
     def test_prints_unchanged_without_phrase(self) -> None:
         self.say("wake", "copper maple")
         self.assertIn("you: copper maple\n", self.out.getvalue())
+
+
+class EchoTextGuardTest(VoiceTestCase):
+    """Live failure 2026-11-04: AEC residue of our own voice became `you:` turns."""
+
+    socket_free = True
+    REPLY = (
+        "Columbus has light rain right now, 63 degrees but it feels like 60. "
+        "Wind is about 13 miles an hour and humidity is 93 percent."
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sent: list[dict] = []
+        conn = _Conn(mock.Mock())
+        conn.send = lambda obj: self.sent.append(obj) or True
+        self.bridge._conn = conn
+        self.bridge._handle_line(
+            conn, json.dumps({"type": "reply", "text": self.REPLY}).encode("utf-8")
+        )
+
+    def turn(self, kind: str, text: str, *, busy: bool = True, stamp: bool = True) -> None:
+        if stamp:
+            self.player.busy = True
+            self.bridge.process_frame(FRAME)  # stamps _last_busy
+        self.player.busy = busy
+        self.bridge._on_listener_event(ListenerEvent(kind))
+        self.bridge._on_listener_event(ListenerEvent("utterance", text=text))
+
+    def test_numeric_echo_talk_over_is_dropped(self) -> None:
+        self.turn("talk_over", "Humidity is ninety-four percent.")
+        self.assertEqual(self.sent, [])
+        self.assertIn("[dropped: echo of own speech]", self.out.getvalue())
+
+    def test_second_talk_over_after_barge_in_is_still_dropped(self) -> None:
+        # Barge-in bumps the generation, so the per-gen echo_ref is empty then.
+        self.turn("talk_over", "Humidity is ninety-four percent.")
+        self.turn("talk_over", "Humidity's ninety three percent right now.")
+        self.assertEqual(self.sent, [])
+
+    def test_follow_up_echo_is_dropped(self) -> None:
+        self.turn("follow_up", "wind is about thirteen miles an hour", busy=False)
+        self.assertEqual(self.sent, [])
+        self.assertIn("you [follow_up]:", self.out.getvalue())
+
+    def test_different_utterance_passes(self) -> None:
+        self.turn("follow_up", "No.", busy=False)
+        self.turn("follow_up", "What is the weather in Columbus Ohio", busy=False)
+        self.assertEqual([m["text"] for m in self.sent], ["No.", "What is the weather in Columbus Ohio"])
+        self.assertEqual(self.sent[0]["via"], "follow_up")
+
+    def test_wake_turn_is_never_dropped(self) -> None:
+        self.turn("wake", "humidity is 93 percent")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["via"], "wake_barge_in")
+        self.player.busy = False
+        self.clock.now += 30
+        self.turn("wake", "humidity is 93 percent", busy=False, stamp=False)
+        self.assertEqual(self.sent[-1]["via"], "wake")
+
+    def test_window_expires(self) -> None:
+        self.player.busy = True
+        self.bridge.process_frame(FRAME)
+        self.clock.now += ECHO_GUARD_S + 1
+        self.turn("follow_up", "humidity is 93 percent", busy=False, stamp=False)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_history_expires(self) -> None:
+        self.clock.now += ECHO_HISTORY_S + 1
+        self.turn("talk_over", "humidity is ninety three percent")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_announcement_text_counts(self) -> None:
+        self.bridge._spoken_log.clear()
+        self.bridge._on_announce("finished")
+        spoken = self.player.enqueued[-1]
+        self.turn("talk_over", spoken)
+        self.assertEqual(self.sent, [])
+
+    def test_guard_leaves_grant_rules_alone(self) -> None:
+        conn = self.bridge._conn
+        self.bridge._handle_line(
+            conn,
+            json.dumps({"type": "reply", "text": "Say confirm walnut lantern.", "kind": "confirm"}).encode("utf-8"),
+        )
+        self.assertTrue(self.bridge._confirm_pending)
+        self.turn("talk_over", "go ahead and do it")  # not echo: sent, but as talk_over
+        self.assertEqual(self.sent[-1]["via"], "talk_over")
+        self.player.busy = False
+        self.clock.now += 30
+        self.turn("wake", "say confirm walnut lantern", busy=False, stamp=False)  # matches recent speech
+        self.assertEqual(self.sent[-1], {"type": "utterance", "text": "say confirm walnut lantern", "via": "wake"})
 
 
 class HomeDefaultIsLazyTest(unittest.TestCase):

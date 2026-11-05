@@ -545,7 +545,7 @@ class MakeAudioIoTest(unittest.TestCase):
     def test_kokoro_path_shares_one_voice_across_players(self) -> None:
         from undertone.player import KokoroRenderer
 
-        voice = mock.Mock(voice="am_michael", own_voice="af_heart")
+        voice = mock.Mock(voice="am_michael", own_voice="af_heart", voice_names=["am_michael"])
         factory = mock.Mock(return_value=voice)
         err = io.StringIO()
         io_ = self._kokoro_io(factory=factory, err=err)
@@ -656,35 +656,41 @@ class MakeAudioIoTest(unittest.TestCase):
             )
             self.assertEqual(err.getvalue(), "")
 
-    SAME_VOICE_WARNING = (
-        "undertone: undertone's own voice is the same as the reply voice ({}); "
-        "its read-backs will sound like Claude"
-    )
+    def test_same_own_voice_refuses_for_kokoro(self) -> None:
+        voice = mock.Mock(voice="af_heart", own_voice="af_heart", voice_names=["af_heart"])
+        with self.assertRaises(cli.OwnVoiceError) as ctx:
+            self._kokoro_io(factory=mock.Mock(return_value=voice))
+        self.assertIn("af_heart", str(ctx.exception))
 
-    def test_same_own_voice_warns_once_for_kokoro(self) -> None:
-        voice = mock.Mock(voice="af_heart", own_voice="af_heart")
+    def test_blend_containing_own_voice_refuses(self) -> None:
+        blend = "am_adam:0.6,af_heart:0.4"
+        voice = mock.Mock(voice=blend, own_voice="af_heart", voice_names=["am_adam", "af_heart"])
+        with self.assertRaises(cli.OwnVoiceError) as ctx:
+            self._kokoro_io(factory=mock.Mock(return_value=voice))
+        self.assertIn(blend, str(ctx.exception))
+
+    def test_blend_without_own_voice_is_silent(self) -> None:
+        voice = mock.Mock(voice="am_adam:0.6,bm_george:0.4", own_voice="af_heart",
+                          voice_names=["am_adam", "bm_george"])
         err = io.StringIO()
-        io_ = self._kokoro_io(factory=mock.Mock(return_value=voice), err=err)
-        self.assertEqual(err.getvalue().splitlines(), [self.SAME_VOICE_WARNING.format("af_heart")])
-        self.assertTrue(io_.voice_label.startswith("Kokoro ("))  # continues, not a hard stop
+        self._kokoro_io(factory=mock.Mock(return_value=voice), err=err)
+        self.assertEqual(err.getvalue(), "")
 
-    def test_same_own_voice_warns_once_for_say_fallback(self) -> None:
+    def test_same_own_voice_refuses_for_say_fallback(self) -> None:
         env = {"UNDERTONE_VOICE": "Samantha", "UNDERTONE_OWN_VOICE": "Samantha"}
-        with mock.patch.dict(os.environ, env):
-            err = io.StringIO()
-            self._kokoro_io(factory=mock.Mock(), tts="say", err=err)
-            self.assertEqual(
-                err.getvalue().splitlines(), [self.SAME_VOICE_WARNING.format("Samantha")]
-            )
+        with mock.patch.dict(os.environ, env), self.assertRaises(cli.OwnVoiceError) as ctx:
+            self._kokoro_io(factory=mock.Mock(), tts="say")
+        self.assertIn("Samantha", str(ctx.exception))
 
-    def test_same_own_voice_warns_on_no_aec_path(self) -> None:
+    def test_same_own_voice_refuses_on_no_aec_path(self) -> None:
         env = {"UNDERTONE_VOICE": "Samantha", "UNDERTONE_OWN_VOICE": ""}
-        with mock.patch.dict(os.environ, env):
-            err = io.StringIO()
-            cli.make_audio_io(True, err=err)
-            self.assertEqual(
-                err.getvalue().splitlines(), [self.SAME_VOICE_WARNING.format("Samantha")]
-            )
+        with mock.patch.dict(os.environ, env), self.assertRaises(cli.OwnVoiceError):
+            cli.make_audio_io(True, err=io.StringIO())
+
+    def test_default_say_voices_do_not_refuse(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k not in ("UNDERTONE_VOICE", "UNDERTONE_OWN_VOICE")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            cli.make_audio_io(True, err=io.StringIO())
 
     def test_parser_tts_option(self) -> None:
         parser = cli.build_parser()

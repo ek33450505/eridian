@@ -10,7 +10,7 @@ calling the channel's `reply` tool, and the channel sends the text back as a
 Socket protocol (newline-delimited UTF-8 JSON, each line <= 64 KB; an oversized
 line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
 
-    channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"[,"session":"<32 hex>"]}
+    channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"[,"wake":"<phrase>"][,"session":"<32 hex>"]}
                                                                     (first line)
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"[,"check":"..."]}
                                                                     (any number; `check` is
@@ -62,6 +62,15 @@ speech leaking through imperfect echo cancellation). A talk-over transcript
 has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
 if nothing is left it is dropped instead of sent.
 
+Echo text guard: a `talk_over` or `follow_up` turn (never a wake turn) whose
+transcript mostly repeats what undertone itself just said (replies, read-backs,
+announcements; numbers compared as digits, so "ninety three" matches "93") is
+dropped and printed as `[dropped: echo of own speech]`, because a live speaker
+leaks more than the offline AEC check shows. It only drops: it never changes
+whether a turn may grant a confirmation. A talk-over that already stopped
+playback stays stopped. attach prints every turn except a plain `wake` turn as
+`you [via]: ...` (`talk_over`, `follow_up`, `wake_barge_in`).
+
 `wake_barge_in`: a wake word heard while we are speaking, or within
 SELF_WAKE_GUARD_S after we stopped, may be our own voice tripping the detector
 (a reply containing "hey jarvice"). It still interrupts and opens a turn, but
@@ -92,6 +101,7 @@ or real `claude`.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import hmac
 import json
@@ -108,16 +118,18 @@ import threading
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol, TextIO
 
-from . import paths
+from . import paths, wake
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
-from .spoken import sanitize_terminal, strip_echo
+from .spoken import is_echo, sanitize_terminal, strip_echo
 from . import voice_guard
 from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
+WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
+WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
 
 ANNOUNCE_TEMPLATES = {
@@ -144,6 +156,15 @@ MAX_CHECK_CHARS = 600  # a confirm reply's read-back is ~400 chars at most
 # never grants a confirmation.
 SELF_WAKE_GUARD_S = 1.0
 _SELF_WAKE_GUARD_MAX_S = 10.0
+# Text guard for turns with no wake word (talk_over, follow_up): the transcript
+# is compared with what undertone itself said. A turn is checked only if it
+# opened while we were speaking or within ECHO_GUARD_S after the player went
+# idle: the 6 s follow-up window opens right at idle, so its first words are
+# the room's tail of our last sentence (reverb, output latency, AEC residue);
+# 3 s is that tail with margin, and anything later is the user. Spoken text
+# older than ECHO_HISTORY_S before the turn opened is not compared.
+ECHO_GUARD_S = 3.0
+ECHO_HISTORY_S = 60.0
 _POLL_S = 0.2  # accept/recv poll, so shutdown never waits on a blocked call
 _IO_TIMEOUT_S = 2.0  # bound on any single socket send
 _LOCK_TIMEOUT_S = 5.0
@@ -233,6 +254,8 @@ class VoiceBridge:
         self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
         self._turn_via = ""  # main thread: what opened the current turn
         self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
+        self._spoken_log: collections.deque[tuple[float, str]] = collections.deque(maxlen=24)  # session lock: (time, text) of everything we said
+        self._echo_hist = ""  # main thread: spoken text a non-wake turn is checked against
         self._conn: _Conn | None = None  # the attached (latest-hello) channel
         self._conns: set[_Conn] = set()
         self._closed = False
@@ -250,6 +273,7 @@ class VoiceBridge:
         self._threads: list[threading.Thread] = []
         self._chunker = SentenceChunker()
         self._control: queue.Queue = queue.Queue()
+        self._mismatch_spoken_at: float | None = None  # when we last spoke the wake-mismatch notice
         self._speech_q: queue.Queue = queue.Queue()
 
         self._player = player_factory()
@@ -379,6 +403,10 @@ class VoiceBridge:
             if kind == "announce":
                 self._on_announce(arg)
                 continue
+            if kind == "wake_mismatch":
+                self._note_spoken(WAKE_MISMATCH_SPEECH)
+                self._player.enqueue(WAKE_MISMATCH_SPEECH, own=True)
+                continue
             gen = arg
             if (
                 kind == "reply_done"
@@ -422,6 +450,7 @@ class VoiceBridge:
             self._gen += 1
             gen = self._gen
             self._no_talk_over_gen = gen  # short: heard in full; the wake word still barges in
+            self._spoken_log.append((self._clock(), template))
             self._player.enqueue(template)  # queues behind current speech; never stop()
         self._print(f"[announce: {event}]\n")
         self._speech_q.put((gen, "answer" if event == "finished" else "announce"))
@@ -433,11 +462,12 @@ class VoiceBridge:
                 or (self._clock() - self._last_busy) <= self._self_wake_guard_s
             )
             self._turn_via = "wake_barge_in" if own_voice else "wake"
-            self._echo_ref = ""
+            self._echo_ref = self._echo_hist = ""
             self._cue("wake")
             self._maybe_barge_in()
         elif event.kind == "talk_over":
             self._turn_via = "talk_over"
+            self._echo_hist = self._recent_spoken()
             # Snapshot before the barge-in bumps the generation.
             with _bounded(self._lock):
                 self._echo_ref = (
@@ -446,9 +476,23 @@ class VoiceBridge:
             self._maybe_barge_in()  # no cue: the user is already talking
         elif event.kind == "follow_up":
             self._turn_via, self._echo_ref = "follow_up", ""
+            self._echo_hist = self._recent_spoken()
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
+            if (
+                self._turn_via in ("talk_over", "follow_up")
+                and self._echo_hist
+                and is_echo(text, self._echo_hist)
+            ):
+                # Drop only; never alters a grant decision. A talk-over that
+                # already stopped playback stays stopped: the player has no
+                # resume, and replaying a half-heard reply is worse than silence.
+                self._print(
+                    f"you [{self._turn_via}]: {self._redact(text)} "
+                    "[dropped: echo of own speech]\n"
+                )
+                return
             if self._turn_via == "talk_over" and self._echo_ref:
                 kept = strip_echo(text, self._echo_ref)
                 if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
@@ -469,9 +513,12 @@ class VoiceBridge:
                         "[too soon after I spoke, so not sent: wait a moment, "
                         "then say the wake word again]\n"
                     )
+                    self._note_spoken(TOO_SOON_SPEECH)
                     self._player.enqueue(TOO_SOON_SPEECH, own=True)
                     return
-            self._print(f"you: {self._redact(text)}\n")
+            via = self._turn_via
+            tag = f" [{via}]" if via not in ("", "wake") else ""
+            self._print(f"you{tag}: {self._redact(text)}\n")
             with _bounded(self._lock):
                 self._gen += 1
                 conn = self._conn
@@ -482,8 +529,22 @@ class VoiceBridge:
                     self._confirm_pending = False
                 return
             self._print("[no Claude session attached]\n")
+            self._note_spoken(NO_SESSION_SPEECH)
             self._player.enqueue(NO_SESSION_SPEECH)
         # wake_no_speech / dropped_empty: nothing to do
+
+    def _note_spoken(self, text: str) -> None:
+        """Remember something undertone said, for the echo text guard. Session lock NOT held."""
+        with _bounded(self._lock):
+            self._spoken_log.append((self._clock(), text))
+
+    def _recent_spoken(self) -> str:
+        """Spoken text to check a no-wake turn against; "" once the guard window has passed."""
+        now = self._clock()
+        if not self._player.busy and now - self._last_busy > ECHO_GUARD_S:
+            return ""
+        with _bounded(self._lock):
+            return " ".join(t for at, t in self._spoken_log if now - at <= ECHO_HISTORY_S)
 
     def _maybe_barge_in(self) -> None:
         # Decide AND bump in one locked section (session lock, then the
@@ -599,6 +660,25 @@ class VoiceBridge:
             if isinstance(pid, int) and not isinstance(pid, bool) and isinstance(cwd, str):
                 session = msg.get("session")
                 valid = isinstance(session, str) and TOKEN_RE.fullmatch(session)
+                theirs = msg.get("wake")
+                theirs = theirs.lower() if isinstance(theirs, str) else wake.DEFAULT_PHRASE
+                ours = wake.current().phrase
+                if theirs != ours:
+                    # Fail closed: this session would tell Claude a different wake word
+                    # than the one we listen for. Stay unattached (replies are ignored).
+                    self._print(
+                        f"[refused session pid {pid}: it expects wake word {self._redact(theirs[:60])!r} "
+                        f"but this voice process listens for {ours!r}; restart one of them]\n"
+                    )
+                    now = self._clock()
+                    with _bounded(self._lock):
+                        last = self._mismatch_spoken_at
+                        speak = last is None or now - last >= WAKE_MISMATCH_REPEAT_S
+                        if speak:
+                            self._mismatch_spoken_at = now
+                    if speak:
+                        self._control.put(("wake_mismatch", None))
+                    return
                 self._attach(conn, pid, cwd, session if valid else "")
         elif kind == "announce":
             self._on_announce_line(msg.get("event"), msg.get("session"))
@@ -678,12 +758,13 @@ class VoiceBridge:
             if self._spoken_gen != gen:
                 self._spoken_gen, self._spoken_text = gen, ""
             self._spoken_text += " ".join(check_sentences + sentences) + " "
+            self._spoken_log.append((self._clock(), " ".join(check_sentences + sentences)))
             for sentence in check_sentences:
                 self._player.enqueue(sentence, own=True)
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":
-            self._print('[confirmation needed: when I finish, say "hey jarvis" and the phrase]\n')
+            self._print(f'[confirmation needed: when I finish, say "{wake.current().phrase}" and the phrase]\n')
         self._speech_q.put((gen, kind))
 
     # ---- speech watcher thread -----------------------------------------
@@ -766,7 +847,11 @@ def run_attach(
     vad = SileroVoiceActivityDetector()
     cues = {"wake": cli._WAKE_CUE, "follow_up": cli._FOLLOW_UP_CUE}
 
-    io = cli.make_audio_io(no_aec, tts=tts)
+    try:
+        io = cli.make_audio_io(no_aec, tts=tts)
+    except cli.OwnVoiceError as exc:
+        print(f"undertone: {exc}", file=sys.stderr)
+        return 1
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -796,7 +881,7 @@ def run_attach(
         print(cli.banner_line(io))
         paths.write_attach_pid(pid)
         print(
-            "undertone attach: listening for 'hey jarvis'. Start a Claude session with "
+            f"undertone attach: listening for '{wake.current().phrase}'. Start a Claude session with "
             "`undertone session` in another terminal. Ctrl-C to quit.",
             flush=True,
         )

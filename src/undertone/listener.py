@@ -16,22 +16,16 @@ the last `talk_over_preroll_s` of audio. The wake word is always checked first.
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Callable, Iterable, Protocol
 
 import numpy as np
 
+from . import wake
+
 FRAME_BYTES = 320  # 160 int16 samples = 10 ms at 16 kHz
 VAD_CHUNK_BYTES = 1024  # 512 int16 samples = 32 ms at 16 kHz
 SAMPLE_RATE = 16000
-
-# STT sometimes hears "hey" as "a"; that one needs a separator so "ajarvis"
-# and "Alpha Jarvis" are left alone.
-_WAKE_PHRASE_RE = re.compile(
-    r"^\s*(hey|hi|okay|ok|a(?=[\s,]))?[\s,]*jarvis[\s,.!?:]*", re.IGNORECASE
-)
-
 
 class WakeDetector(Protocol):
     def __call__(self, frame: bytes) -> bool: ...
@@ -83,11 +77,11 @@ class ListenerEvent:
 def strip_wake_phrase(text: str) -> str:
     """Strip a leading wake phrase (e.g. "Hey Jarvis,") from a transcript.
 
-    The tail of "hey jarvis" sometimes spills into the recording, so a
+    The tail of the wake phrase sometimes spills into the recording, so a
     transcript can come back as just "Hey Jarvis." -- after stripping, that
     collapses to "", which callers treat as an empty transcript.
     """
-    return _WAKE_PHRASE_RE.sub("", text, count=1).strip()
+    return wake.strip_pattern(wake.current()).sub("", text, count=1).strip()
 
 
 class Listener:
@@ -196,7 +190,7 @@ class Listener:
         self._clear_talk_over()
         if mode == "stop":
             # Stay IDLE and keep the wake detector: the user may be mid-"hey
-            # jarvis" and it must still fire.
+            # jarvis" (the configured wake phrase) and it must still fire.
             self._emit(ListenerEvent(kind="talk_over_stop"))
             return
         # The VAD has been tracking this speech continuously, so no vad_reset.

@@ -71,6 +71,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from . import wake
+
 TOKEN_RE = re.compile(r"[0-9a-f]{32}", re.ASCII)
 GRANT_TTL_S = 300.0
 CHALLENGE_TTL_S = 300.0
@@ -403,8 +405,13 @@ def validate_safe_phrase(phrase: str) -> str:
         raise ValueError("The safe phrase must be letters only, no digits.")
     if not 4 <= len(norm) <= 40:
         raise ValueError("The safe phrase must be 4 to 40 characters long.")
-    if any(w in SAFE_PHRASE_RESERVED for w in words):
-        raise ValueError("The safe phrase cannot use the words hey, jarvis or confirm.")
+    configured = wake.current()
+    if any(w in SAFE_PHRASE_RESERVED or w in configured.words for w in words):
+        if configured.is_default:
+            raise ValueError("The safe phrase cannot use the words hey, jarvis or confirm.")
+        raise ValueError(
+            f"The safe phrase cannot use the words hey, jarvis, confirm or any word of {configured.phrase!r}."
+        )
     if all(w in STOPWORDS for w in words):
         raise ValueError("The safe phrase is too common; use at least one uncommon word.")
     if len(words) < 2 and len(norm) < 8:

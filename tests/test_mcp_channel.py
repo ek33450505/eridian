@@ -486,6 +486,16 @@ class LogTest(ChannelTestCase):
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
 
+class InstructionsTest(unittest.TestCase):
+    def test_voice_turn_guidance_in_both_variants(self):
+        for safe_phrase in (False, True):
+            text = mcp_channel.build_instructions(safe_phrase)
+            self.assertIn("use WebSearch: it runs on a voice turn with no confirmation", text)
+            self.assertIn("Do not use curl, wget or WebFetch for lookups", text)
+            self.assertIn('ToolSearch "select:mcp__undertone__reply"', text)
+            self.assertIn("never answer a voice message in text only", text)
+
+
 class ReadBackTest(unittest.TestCase):
     """Socket-free: _handle_tool_call is driven directly with a capturing send stub."""
 
