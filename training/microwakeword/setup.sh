@@ -164,6 +164,8 @@ else
 	# TF >= 2.18 (arm64 wheel) with numpy 2+; installed before microWakeWord
 	# so its requirements resolve against them.
 	pip_install 'tensorflow>=2.18' 'numpy>=2'
+	# TF 2.21 (and possibly earlier) no longer pulls in tensorboard, but microWakeWord's training calls tf.summary.
+	pip_install 'tensorboard>=2.18'
 	# pymicro-features from PyPI (see above); audio-metadata fork as in the notebook.
 	pip_install "$PYMICRO_FEATURES_SPEC"
 	pip_install "$AUDIO_METADATA_SPEC"
@@ -356,7 +358,7 @@ log "verify imports"
 "$PY" -I - <<'PYEOF' 2>&1 | tee -a "$LOG"
 import importlib
 
-for mod in ("tensorflow", "microwakeword", "pymicro_features", "torch"):
+for mod in ("tensorflow", "tensorboard", "microwakeword", "pymicro_features", "torch"):
     m = importlib.import_module(mod)
     print(f"{mod}: {getattr(m, '__version__', 'ok (no __version__)')}")
 PYEOF

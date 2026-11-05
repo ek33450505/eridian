@@ -51,6 +51,8 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
 - `pymicro-features==2.0.2` from PyPI (universal2 wheel) replaces the notebook's
   macOS fork, which no longer builds with current clang; it matches undertone's
   runtime frontend.
+- `tensorboard>=2.18` is installed explicitly: TF 2.21 no longer bundles it, but
+  microWakeWord's training calls `tf.summary`.
 
 ## Train
 
