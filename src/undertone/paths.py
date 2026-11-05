@@ -32,3 +32,46 @@ def log_dir() -> Path:
     path = home_dir() / "logs"
     path.mkdir(mode=HOME_MODE, parents=True, exist_ok=True)
     return path
+
+
+def attach_pid_path() -> Path:
+    """Pidfile of the running `undertone attach` (0600)."""
+    return home_dir() / "attach.pid"
+
+
+def attach_lock_path() -> Path:
+    """flock target that serializes `undertone launch` check-and-spawn."""
+    return home_dir() / "attach.lock"
+
+
+def attach_log_path() -> Path:
+    """Where a background attach appends its stdout and stderr."""
+    return home_dir() / "attach.log"
+
+
+def write_attach_pid(pid: int) -> None:
+    """Record pid in the attach pidfile, created 0600."""
+    path = attach_pid_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, f"{pid}\n".encode())
+    finally:
+        os.close(fd)
+
+
+def read_attach_pid() -> int | None:
+    """The pid in the attach pidfile, or None if missing or malformed."""
+    try:
+        return int(attach_pid_path().read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def remove_attach_pid(pid: int) -> None:
+    """Remove the pidfile, but only if it still names pid (a newer attach may own it)."""
+    if read_attach_pid() == pid:
+        try:
+            attach_pid_path().unlink()
+        except OSError:
+            pass
