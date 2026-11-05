@@ -40,11 +40,23 @@ an utterance is next sent to the channel -- because a no-wake-word follow-up
 window must never be able to burn a pending confirm challenge. Any announce is
 skipped while the listener is not IDLE or if the same event was spoken within
 ANNOUNCE_REPEAT_S. An announcement queues behind current speech (never stops
-it), bumps the generation, and plays with talk-over off. Only "finished" opens
-the follow-up window (as an `answer` does).
+it), bumps the generation, and plays with talk-over off. No announcement
+(including "finished") ever opens the follow-up window: a session's Stop hook
+fires after every turn, so ambient speech in such a window would chain turns.
 
 Reply `kind` gates the no-wake-word follow-up window: only an `answer` (the
-default when `kind` is missing) opens it, once its speech goes idle. `ack` (an
+default when `kind` is missing) opens it, once its speech goes idle, and only
+as a one-shot credit: when an utterance is sent, its `via` is remembered, and
+the first non-`ack` reply afterwards spends it. Only "wake" / "wake_barge_in"
+credit a window; an answer to a `follow_up` or `talk_over` turn, a second or
+unprompted answer, one landing after an announcement or barge-in, or one with
+no known origin opens none, so ambient audio can never chain windows. The
+protocol carries no turn ids, so the bridge grants a window only when exactly
+one utterance is outstanding (sent, not yet answered; reset by "finished", a
+detach or a new hello) and the credit is under REPLY_WINDOW_CREDIT_TTL_S old;
+any ambiguity fails closed (no window). A reset on Stop can let the answer to a
+still-queued follow_up spend a wake credit sent right after it (one short
+window, no chaining, no grant); closing that needs turn ids in the protocol. `ack` (an
 early "running the tests now") never does, and neither does `confirm` -- a
 spoken confirmation prompt must not be answerable by ambient audio (a video
 saying "yes") inside an open mic window, so it needs a fresh wake word. An
@@ -145,6 +157,8 @@ ANNOUNCE_LEVELS = {
     "off": frozenset(),
 }
 ANNOUNCE_REPEAT_S = 3.0  # the same event is not spoken twice within this
+WAKE_TURN_VIAS = ("wake", "wake_barge_in")  # turns whose answer may open the no-wake window
+REPLY_WINDOW_CREDIT_TTL_S = 600.0  # a window credit older than this is void (ack-ed long work still fits)
 
 _BACKLOG = 32  # above MAX_CONNECTIONS so the cap, not the kernel queue, is the limit
 MAX_CONNECTIONS = 16
@@ -252,7 +266,10 @@ class VoiceBridge:
         self._no_talk_over_gen = -1  # gen whose speech (confirm) talk-over must not cut
         self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
         self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
-        self._turn_via = ""  # main thread: what opened the current turn
+        self._turn_via = ""  # main thread: what opened the current turn (tagging / echo filter only)
+        self._reply_origin = ""  # session lock: via of the sole outstanding utterance; one-shot credit for one answer
+        self._reply_origin_at = 0.0  # session lock: self._clock() when the credit was set
+        self._outstanding = 0  # session lock: utterances sent and not yet answered
         self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._spoken_log: collections.deque[tuple[float, str]] = collections.deque(maxlen=24)  # session lock: (time, text) of everything we said
         self._echo_hist = ""  # main thread: spoken text a non-wake turn is checked against
@@ -450,10 +467,11 @@ class VoiceBridge:
             self._gen += 1
             gen = self._gen
             self._no_talk_over_gen = gen  # short: heard in full; the wake word still barges in
+            self._reply_origin = ""  # an answer landing after an announcement opens no window
             self._spoken_log.append((self._clock(), template))
             self._player.enqueue(template)  # queues behind current speech; never stop()
         self._print(f"[announce: {event}]\n")
-        self._speech_q.put((gen, "answer" if event == "finished" else "announce"))
+        self._speech_q.put((gen, False))  # an announcement never opens a window
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
@@ -522,12 +540,20 @@ class VoiceBridge:
             with _bounded(self._lock):
                 self._gen += 1
                 conn = self._conn
+                # Before the send: the reply can race the lock below. The
+                # credit is bound only when exactly one turn is outstanding.
+                self._outstanding += 1
+                self._reply_origin = via if self._outstanding == 1 else ""
+                self._reply_origin_at = self._clock()
             if conn is not None and conn.send(
-                {"type": "utterance", "text": text, "via": self._turn_via}
+                {"type": "utterance", "text": text, "via": via}
             ):
                 with _bounded(self._lock):
                     self._confirm_pending = False
                 return
+            with _bounded(self._lock):
+                self._outstanding = max(0, self._outstanding - 1)  # a failed send is not a turn
+                self._reply_origin = ""
             self._print("[no Claude session attached]\n")
             self._note_spoken(NO_SESSION_SPEECH)
             self._player.enqueue(NO_SESSION_SPEECH)
@@ -558,6 +584,7 @@ class VoiceBridge:
                 # `busy` can lag the stop; keep talk-over off for the next gen
                 self._no_talk_over_gen = self._gen + 1
             self._gen += 1
+            self._reply_origin = ""
         self._player.stop()
         self._print("[interrupted]\n")
 
@@ -698,16 +725,22 @@ class VoiceBridge:
 
     def _on_announce_line(self, event: object, session: object) -> None:
         """Reader thread: validate and hand off; never speaks or touches the player."""
-        if not isinstance(event, str) or event not in self._announce:
+        if not isinstance(event, str) or event not in ANNOUNCE_TEMPLATES:
             return
         if not isinstance(session, str) or not TOKEN_RE.fullmatch(session):
             return
         with _bounded(self._lock):
             conn = self._conn
             expected = conn.session if conn is not None else ""
-        if not expected or not hmac.compare_digest(session, expected):
-            return
-        self._control.put(("announce", event))
+            if not expected or not hmac.compare_digest(session, expected):
+                return
+            if event == "finished":
+                # The Stop hook fired: Claude's turn ended, so nothing is
+                # outstanding and no credit survives -- whether or not the
+                # level speaks it, and before any skip rule can drop it.
+                self._outstanding, self._reply_origin = 0, ""
+        if event in self._announce:
+            self._control.put(("announce", event))
 
     def _attach(self, conn: _Conn, pid: int, cwd: str, session: str = "") -> None:
         conn.pid, conn.cwd, conn.hello, conn.session = pid, cwd, True, session
@@ -715,6 +748,7 @@ class VoiceBridge:
             old, self._conn = self._conn, conn
             if old is not conn:  # the flags belong to the previous session
                 self._answered = self._confirm_pending = False
+                self._outstanding, self._reply_origin = 0, ""
         if old is not None and old is not conn:
             old.send({"type": "detached"})
             old.close()
@@ -727,6 +761,7 @@ class VoiceBridge:
             was_current = self._conn is conn
             if was_current:
                 self._conn = None
+                self._outstanding, self._reply_origin = 0, ""
             closed = self._closed
         if was_current and not closed:
             self._print("[detached]\n")
@@ -759,13 +794,24 @@ class VoiceBridge:
                 self._spoken_gen, self._spoken_text = gen, ""
             self._spoken_text += " ".join(check_sentences + sentences) + " "
             self._spoken_log.append((self._clock(), " ".join(check_sentences + sentences)))
+            # One-shot credit bound when the utterance was sent: only the first
+            # answer to a wake-word turn opens a window. ack keeps the credit;
+            # every other kind (answer, confirm, unknown) spends it, fail closed.
+            opens_window = (
+                kind == "answer"
+                and self._reply_origin in WAKE_TURN_VIAS
+                and self._clock() - self._reply_origin_at <= REPLY_WINDOW_CREDIT_TTL_S
+            )
+            if kind != "ack":
+                self._reply_origin = ""
+                self._outstanding = max(0, self._outstanding - 1)
             for sentence in check_sentences:
                 self._player.enqueue(sentence, own=True)
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":
             self._print(f'[confirmation needed: when I finish, say "{wake.current().phrase}" and the phrase]\n')
-        self._speech_q.put((gen, kind))
+        self._speech_q.put((gen, opens_window))
 
     # ---- speech watcher thread -----------------------------------------
 
@@ -774,11 +820,11 @@ class VoiceBridge:
             item = self._speech_q.get()
             if item is None:
                 return
-            gen, kind = item
+            gen, opens_window = item
             while not self._closed:
                 if self._player.wait_idle(_POLL_S):
-                    # Only an answer opens the open-mic window (see module doc).
-                    if kind == "answer":
+                    # Only an answer to a wake-word turn opens the open-mic window.
+                    if opens_window:
                         self._control.put(("reply_done", gen))
                     break
 

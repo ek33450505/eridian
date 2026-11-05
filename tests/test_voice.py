@@ -34,6 +34,7 @@ from undertone.voice import (
     MAX_CONNECTIONS,
     MAX_LINE_BYTES,
     NO_SESSION_SPEECH,
+    REPLY_WINDOW_CREDIT_TTL_S,
     TOO_SOON_SPEECH,
     WAKE_MISMATCH_SPEECH,
     VoiceBridge,
@@ -109,8 +110,12 @@ class _Channel:
     def send_raw(self, data: bytes) -> None:
         self.sock.sendall(data)
 
-    def hello(self, pid: int = 4242, cwd: str = "/work/proj", wake: object = None) -> None:
+    def hello(
+        self, pid: int = 4242, cwd: str = "/work/proj", wake: object = None, session: str | None = None
+    ) -> None:
         msg = {"type": "hello", "pid": pid, "cwd": cwd}
+        if session is not None:
+            msg["session"] = session
         if wake is not None:
             msg["wake"] = wake
         self.send_obj(msg)
@@ -447,6 +452,7 @@ class FollowUpTest(VoiceTestCase):
     def test_follow_up_window_opens_after_reply_speech_goes_idle(self) -> None:
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self._reply(channel)
         self.assertEqual(self.state, "IDLE")
         self.bridge.process_frame(FRAME)
@@ -456,6 +462,7 @@ class FollowUpTest(VoiceTestCase):
     def test_follow_up_waits_for_the_speech_to_finish(self) -> None:
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self.player.idle.clear()
         channel.send_obj({"type": "reply", "text": "Still talking."})
         self.assertTrue(_wait_for(lambda: self.player.enqueued))
@@ -472,6 +479,7 @@ class FollowUpTest(VoiceTestCase):
         self.addCleanup(self.bridge.close)
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self._reply(channel)
         self.bridge.process_frame(FRAME)
         self.assertEqual(self.cues, [])
@@ -480,6 +488,7 @@ class FollowUpTest(VoiceTestCase):
     def test_barge_in_stops_speech_and_leaves_no_stale_follow_up(self) -> None:
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self.player.idle.clear()
         self.player.busy = True
         channel.send_obj({"type": "reply", "text": "A long answer."})
@@ -529,12 +538,14 @@ class ReplyKindTest(VoiceTestCase):
     def test_answer_opens_follow_up(self) -> None:
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self._send(channel, kind="answer")
         self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
 
     def test_missing_kind_defaults_to_answer(self) -> None:
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self._send(channel)
         self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
 
@@ -563,6 +574,7 @@ class ReplyKindTest(VoiceTestCase):
     def test_ack_then_answer_opens_follow_up_only_after_the_answer(self) -> None:
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self._send(channel, kind="ack")
         self._settle_watcher()  # the ack's speech has gone idle
         for _ in range(3):
@@ -575,6 +587,266 @@ class ReplyKindTest(VoiceTestCase):
         self.assertEqual(self.cues, [])
         self.player.idle.set()
         self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
+
+
+class FollowUpOriginTest(VoiceTestCase):
+    """The no-wake window is a one-shot credit bound when a wake-word utterance is sent."""
+
+    def _begin(self) -> _Channel:
+        self.start()
+        self._base = self.player.idle_returns
+        self._items = 0
+        self.bridge._announce = ANNOUNCE_LEVELS["all"]
+        return self.attach(session=TOKEN)
+
+    def _reply(self, channel: _Channel, kind: str = "answer") -> None:
+        before = len(self.player.enqueued)
+        channel.send_obj({"type": "reply", "text": "Okay then.", "kind": kind})
+        self.assertTrue(_wait_for(lambda: len(self.player.enqueued) > before))
+        self._items += 1
+
+    def _flush(self) -> None:
+        """Block until the speech watcher has fully handled every reply sent so far."""
+        # The sentinel is a second item behind the replies; the watcher reaches its
+        # wait_idle only after finishing (and posting reply_done for) the one before.
+        self.bridge._speech_q.put((self.bridge._gen, False))
+        self.assertTrue(
+            _wait_for(lambda: self.player.idle_returns >= self._base + self._items + 1)
+        )
+        self._base, self._items = self.player.idle_returns, 0
+
+    def _windows(self) -> int:
+        return self.cues.count("follow_up")
+
+    def _expect_window(self) -> None:
+        before = self._windows()
+        self.assertTrue(self.pump_until(lambda: self._windows() == before + 1))
+        self.assertEqual(self.state, "LISTENING")
+
+    def _expect_no_window(self) -> None:
+        self.assertEqual(self.state, "IDLE")  # else a missing window proves nothing
+        self._flush()
+        before = self._windows()
+        for _ in range(3):
+            self.bridge.process_frame(FRAME)
+        self.assertEqual(self._windows(), before)
+        self.assertEqual(self.state, "IDLE")
+
+    def _expire_window(self) -> None:
+        self.clock.now += 10.0  # past the no-speech timeout
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.state, "IDLE")
+
+    def _wake_turn(self, channel: _Channel) -> None:
+        self.wake()
+        self.speak("do the thing")
+        self.assertEqual(channel.read_line()["via"], "wake")
+
+    def _origin_case(self, origin: str, opens: bool) -> None:
+        channel = self._begin()
+        self.bridge._reply_origin = origin
+        self._reply(channel)
+        if opens:
+            self._expect_window()
+        else:
+            self._expect_no_window()
+
+    def test_answer_to_wake_origin_opens_window(self) -> None:
+        self._origin_case("wake", True)
+
+    def test_answer_to_wake_barge_in_origin_opens_window(self) -> None:
+        self._origin_case("wake_barge_in", True)
+
+    def test_answer_to_follow_up_origin_opens_no_window(self) -> None:
+        self._origin_case("follow_up", False)
+
+    def test_answer_to_talk_over_origin_opens_no_window(self) -> None:
+        self._origin_case("talk_over", False)
+
+    def test_answer_with_unknown_origin_opens_no_window(self) -> None:
+        self._origin_case("", False)
+
+    def test_confirm_spends_the_credit_and_opens_no_window(self) -> None:
+        channel = self._begin()
+        self.bridge._reply_origin = "wake"
+        self._reply(channel, "confirm")
+        self._expect_no_window()
+        self._reply(channel)
+        self._expect_no_window()
+
+    def test_answer_to_wake_turn_opens_one_window_only(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel)
+        self._expect_window()
+        self._expire_window()
+        self.wake()
+        self._expire_window()  # sticky _turn_via is "wake" again
+        self.bridge._gen += 1  # fresh gen: the per-gen dedupe must not mask a window
+        self._reply(channel)  # a second answer in the same turn
+        self._expect_no_window()
+
+    def test_unprompted_answer_after_a_window_opens_no_window(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel)
+        self._expect_window()
+        self._expire_window()
+        self.wake()  # a silent wake leaves the sticky _turn_via at "wake"
+        self._expire_window()
+        self.bridge._gen += 1  # fresh gen: the per-gen dedupe must not mask a window
+        self._reply(channel)  # no new utterance was sent
+        self._expect_no_window()
+
+    def test_ack_then_answer_opens_exactly_one_window(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel, "ack")
+        self._flush()
+        for _ in range(3):
+            self.bridge.process_frame(FRAME)
+        self.assertEqual(self._windows(), 0)
+        self._reply(channel)
+        self._expect_window()
+        self._expire_window()
+        self._reply(channel)
+        self._expect_no_window()
+
+    def test_late_answer_to_follow_up_after_a_silent_wake_opens_no_window(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel)
+        self._expect_window()
+        self.speak("one more thing")  # the follow_up utterance is in flight
+        self.assertEqual(channel.read_line()["via"], "follow_up")
+        self.wake()  # a wake word with no speech after it
+        self._expire_window()
+        self.assertEqual(self.bridge._turn_via, "wake")  # the sticky global says wake
+        self._reply(channel)  # the late answer to the follow_up
+        self._expect_no_window()
+
+    def test_answer_to_earlier_follow_up_does_not_spend_a_later_wake_credit(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel)
+        self._expect_window()
+        self.speak("one more thing")  # follow_up sent; Claude still working
+        self.assertEqual(channel.read_line()["via"], "follow_up")
+        self._wake_turn(channel)  # a second turn is now outstanding
+        self._reply(channel)  # the answer to the follow_up
+        self._expect_no_window()
+        self._reply(channel)
+        self._expect_no_window()
+
+    def test_chain_of_answers_after_a_window_opens_no_further_window(self) -> None:
+        # Real path only: the follow_up utterance bumps the generation itself.
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel)
+        self._expect_window()
+        self.speak("one more thing")
+        self.assertEqual(channel.read_line()["via"], "follow_up")
+        self._reply(channel)  # the answer to the follow_up
+        self._expect_no_window()
+        self._reply(channel)  # then an unprompted one
+        self._expect_no_window()
+
+    def test_each_answered_wake_turn_opens_its_own_window(self) -> None:
+        channel = self._begin()
+        for _ in range(3):
+            self._wake_turn(channel)
+            self._reply(channel)
+            self._expect_window()
+            self._expire_window()
+        self.assertEqual(self.bridge._outstanding, 0)
+
+    def test_sole_wake_turn_still_opens_one_window(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self.assertEqual(self.bridge._outstanding, 1)
+        self._reply(channel)
+        self.assertEqual(self.bridge._outstanding, 0)
+        self._expect_window()
+
+    def test_finished_announce_resets_outstanding_even_when_skipped(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self.wake()  # listening: the "finished" announce will be skipped
+        self.bridge._on_announce_line("finished", TOKEN)
+        self.bridge.process_frame(FRAME)
+        self.assertIn("[announce skipped: finished (listening)]", self.out.getvalue())
+        self.assertEqual(self.bridge._outstanding, 0)
+        self._expire_window()
+        self._wake_turn(channel)
+        self._reply(channel)
+        self._expect_window()
+
+    def test_skipped_finished_after_an_ack_voids_the_credit(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self._reply(channel, "ack")
+        self._flush()
+        self.wake()  # listening: the "finished" announce will be skipped
+        self.bridge._on_announce_line("finished", TOKEN)
+        self.bridge.process_frame(FRAME)
+        self.assertIn("[announce skipped: finished (listening)]", self.out.getvalue())
+        self.assertEqual((self.bridge._outstanding, self.bridge._reply_origin), (0, ""))
+        self._expire_window()
+        self._reply(channel)  # unprompted answer, no new wake turn
+        self._expect_no_window()
+
+    def test_finished_voids_the_credit_even_when_its_level_is_disabled(self) -> None:
+        channel = self._begin()
+        self.bridge._announce = ANNOUNCE_LEVELS["permission"]  # "finished" not spoken
+        self._wake_turn(channel)
+        self._reply(channel, "ack")
+        self._flush()
+        self.bridge._on_announce_line("finished", TOKEN)
+        self.assertEqual((self.bridge._outstanding, self.bridge._reply_origin), (0, ""))
+        self.assertTrue(self.bridge._control.empty())  # and nothing was queued to speak
+        self._reply(channel)
+        self._expect_no_window()
+
+    def test_finished_with_the_wrong_token_changes_nothing(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        for session in ("f" * 32, "not-a-token", None, ""):
+            self.bridge._on_announce_line("finished", session)
+        self.assertEqual((self.bridge._outstanding, self.bridge._reply_origin), (1, "wake"))
+        self._reply(channel)
+        self._expect_window()
+
+    def test_credit_expires_after_the_ttl(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self.clock.now += REPLY_WINDOW_CREDIT_TTL_S + 1
+        self._reply(channel)
+        self._expect_no_window()
+
+    def test_credit_still_valid_just_inside_the_ttl(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self.clock.now += REPLY_WINDOW_CREDIT_TTL_S - 1
+        self._reply(channel)
+        self._expect_window()
+
+    def test_sent_via_is_the_credited_via(self) -> None:
+        channel = self._begin()
+        self.player.busy = True  # our own voice is playing: a barge-in wake
+        self.wake()
+        self.speak("do the thing")
+        self.assertEqual(channel.read_line()["via"], "wake_barge_in")
+        self.assertEqual(self.bridge._reply_origin, "wake_barge_in")
+        self.player.busy = False
+        self._reply(channel)
+        self._expect_window()
+
+    def test_answer_after_an_announcement_opens_no_window(self) -> None:
+        channel = self._begin()
+        self._wake_turn(channel)
+        self.bridge._on_announce("finished")
+        self._reply(channel)
+        self._expect_no_window()
 
 
 class TalkOverTest(VoiceTestCase):
@@ -681,6 +953,7 @@ class TalkOverTest(VoiceTestCase):
         self._bridge()
         self.start()
         channel = self.attach()
+        self.bridge._reply_origin = "wake"  # the window follows a wake-word turn
         self.player.busy = False
         channel.send_obj({"type": "reply", "text": "Okay then.", "kind": "answer"})
         self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
@@ -1173,29 +1446,17 @@ class AnnounceTest(_AnnounceBase):
         self.announce("permission")
         self.assertEqual(self.bridge._gen, before + 1)
 
-    def test_finished_opens_follow_up_window_after_idle(self) -> None:
+    def test_finished_opens_no_follow_up_window(self) -> None:
         self.watcher()
+        self.bridge._reply_origin = "wake"  # even with wake credit outstanding
         self.announce()
-        self.assertTrue(
-            _wait_for(lambda: (self.bridge.process_frame(FRAME), self.cues)[1] == ["follow_up"])
-        )
-        self.assertEqual(self.bridge._listener.state, "LISTENING")
-        self.assertEqual(self.bridge._turn_via, "follow_up")
-
-    def test_finished_opens_window_even_if_gen_already_followed(self) -> None:
-        self.watcher()
-        self.reply("answer")
-        self.assertTrue(
-            _wait_for(lambda: (self.bridge.process_frame(FRAME), self.cues)[1] == ["follow_up"])
-        )
-        self.bridge._listener._state = "IDLE"
-        self.bridge._answered = False
-        self.announce()
-        self.assertTrue(
-            _wait_for(
-                lambda: (self.bridge.process_frame(FRAME), self.cues)[1] == ["follow_up"] * 2
-            )
-        )
+        self.assertTrue(_wait_for(lambda: self.player.idle_returns > 0))
+        for _ in range(5):
+            self.bridge.process_frame(FRAME)
+        time.sleep(0.05)
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.cues, [])
+        self.assertEqual(self.bridge._listener.state, "IDLE")
 
     def test_permission_opens_no_follow_up_window(self) -> None:
         self.watcher()
