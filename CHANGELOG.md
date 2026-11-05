@@ -4,6 +4,17 @@ All notable changes to undertone are documented here, in the style of [Keep a Ch
 
 ## [Unreleased]
 
+### 2026-11-04 — Echo text guard (live test: own voice heard as `you:`)
+
+Live test (Ed, MacBook speakers, echo cancellation on): after Claude read out the weather, attach printed `you: Humidity is ninety-four percent.` and `you: Humidity's ninety three percent right now.`, which Ed never said. Claude then asked whether the microphone was hearing it. **Live test of the fix: pending.**
+
+**Added**
+- Echo text guard: a talk-over or follow-up turn (never a wake-word turn) whose transcript mostly repeats what undertone itself just said is dropped and printed as `you [talk_over]: … [dropped: echo of own speech]`. It covers replies, read-backs and announcements, compares numbers as digits ("ninety three" matches "93") and ignores a swapped word. It is checked only if the turn opened while undertone was speaking or within 3 s after, against speech from the last 60 s. It only drops turns; confirm rules are unchanged. A talk-over that had already stopped playback leaves the reply stopped.
+- attach prints how each turn started, except a plain wake-word turn: `you [talk_over]: …`, `you [follow_up]: …` or `you [wake_barge_in]: …`.
+
+**Fixed**
+- The older talk-over echo filter compared words literally and only against the current reply, so a number heard as words (or a second talk-over after the first stopped playback) got through.
+
 ### 2026-10-03 — Confirm with your own safe phrase (Phase 8a follow-up)
 
 Changes made after Ed's Phase 8a live test. **Live test: pending.**

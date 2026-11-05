@@ -116,3 +116,129 @@ def strip_echo(heard: str, spoken: str, *, min_run: int = 2) -> str:
     while kept and not _WORD_RE.search(kept[-1].lower()):
         kept.pop()
     return " ".join(kept)
+
+
+_UNITS = {
+    w: i
+    for i, w in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve "
+        "thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split()
+    )
+}
+_TENS = {
+    w: 10 * (i + 2)
+    for i, w in enumerate(
+        "twenty thirty forty fifty sixty seventy eighty ninety".split()
+    )
+}
+
+
+def normalize_tokens(text: str) -> list[str]:
+    """Lowercase word tokens with spoken numbers as digits, for echo matching.
+
+    "Humidity's ninety-three percent" and "humidity is 93%" both come out with
+    a "93" token: possessive 's is dropped, "%" becomes "percent", and runs of
+    number words up to 999 ("ninety three", "one hundred twenty") collapse to
+    one digit token. Anything else is kept as a plain word.
+    """
+    text = re.sub(r"['’]s\b", "", text.lower().replace("%", " percent "))
+    text = text.replace("'", "").replace("’", "").replace("-", " ")
+    raw = _WORD_RE.findall(text)
+    out: list[str] = []
+    i = 0
+    while i < len(raw):
+        value, j = _read_number(raw, i)
+        if j > i:
+            out.append(str(value))
+            i = j
+        else:
+            out.append(raw[i])
+            i += 1
+    return out
+
+
+def _read_number(tokens: list[str], i: int) -> tuple[int, int]:
+    """Parse a spoken number (< 1000) at tokens[i]; return (value, end) or (0, i)."""
+    j, total, hundreds = i, 0, 0
+    if tokens[j] in _UNITS and j + 1 < len(tokens) and tokens[j + 1] == "hundred":
+        hundreds, j = _UNITS[tokens[j]] * 100, j + 2
+        if j < len(tokens) and tokens[j] == "and":
+            j += 1
+    elif tokens[j] == "hundred":
+        return 0, i
+    start = j
+    if j < len(tokens) and tokens[j] in _TENS:
+        total, j = _TENS[tokens[j]], j + 1
+        if j < len(tokens) and 1 <= _UNITS.get(tokens[j], 0) <= 9:
+            total, j = total + _UNITS[tokens[j]], j + 1
+    elif j < len(tokens) and tokens[j] in _UNITS:
+        total, j = _UNITS[tokens[j]], j + 1
+    if j == start and not hundreds:
+        return 0, i
+    return hundreds + total, j
+
+
+# Turns over 60 tokens are never treated as echo. Trade-off: a talk-over or
+# follow-up turn lasts at most 15 s (ListenerConfig.max_utterance_s), so a
+# continuous leak of fast speech (~4 words/s) can reach ~60 tokens and pass
+# through as a turn; we accept that, because truncating instead drops genuine
+# long turns. It also bounds the LCS table (60 x 800) on the main thread.
+MAX_HEARD_TOKENS = 60
+
+
+def echo_score(heard: str, spoken: str) -> tuple[float, int, int]:
+    """How much of `heard` is our own `spoken` text.
+
+    Returns (coverage, matched tokens, longest run of unmatched heard tokens).
+    Matching is the longest common subsequence of normalised tokens (not a
+    contiguous run), so it survives the STT dropping or swapping a word of
+    leaked speech. Coverage is matched / heard tokens. The unmatched run tells
+    a swapped word ("94" for "93", run 1) from real speech appended to an echo
+    (a whole new phrase, run 3+). More than MAX_HEARD_TOKENS heard tokens
+    scores as no match at all.
+    """
+    h = normalize_tokens(heard)
+    s = normalize_tokens(spoken)[-800:]
+    if not h or not s or len(h) > MAX_HEARD_TOKENS:
+        return 0.0, 0, len(h)
+    table = [[0] * (len(s) + 1) for _ in range(len(h) + 1)]
+    for i, a in enumerate(h, 1):
+        for k, b in enumerate(s, 1):
+            table[i][k] = (
+                table[i - 1][k - 1] + 1 if a == b else max(table[i - 1][k], table[i][k - 1])
+            )
+    matched = [False] * len(h)
+    i, k = len(h), len(s)
+    while i and k:
+        if h[i - 1] == s[k - 1]:
+            matched[i - 1] = True
+            i, k = i - 1, k - 1
+        elif table[i - 1][k] >= table[i][k - 1]:
+            i -= 1
+        else:
+            k -= 1
+    run = longest = 0
+    for m in matched:
+        run = 0 if m else run + 1
+        longest = max(longest, run)
+    total = sum(matched)
+    return total / len(h), total, longest
+
+
+def is_echo(
+    heard: str,
+    spoken: str,
+    *,
+    min_coverage: float = 0.6,
+    min_tokens: int = 3,
+    max_novel_run: int = 2,
+) -> bool:
+    """True when `heard` is, with high probability, our own speech picked up again.
+
+    Needs enough coverage, at least `min_tokens` matched tokens (a short real
+    answer like "yes it is" never matches on one or two common words), and no
+    run of more than `max_novel_run` unmatched words (that is the user talking
+    after or over the echo, which `strip_echo` separates instead).
+    """
+    coverage, matched, novel = echo_score(heard, spoken)
+    return matched >= min_tokens and coverage >= min_coverage and novel <= max_novel_run

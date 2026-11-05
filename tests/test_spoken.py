@@ -1,8 +1,13 @@
 """Tests for undertone.spoken: markdown stripping and the TTS/terminal sanitizers."""
 
+import time
 import unittest
 
 from undertone.spoken import (
+    MAX_HEARD_TOKENS,
+    echo_score,
+    is_echo,
+    normalize_tokens,
     sanitize_for_tts,
     sanitize_terminal,
     scrub_wake_word,
@@ -137,6 +142,70 @@ class StripEchoTest(unittest.TestCase):
         heard = "adaptive filter then something else"
         self.assertEqual(strip_echo(heard, self.SPOKEN), "then something else")
         self.assertEqual(strip_echo(heard, self.SPOKEN, min_run=3), heard)
+
+
+class NormalizeTokensTest(unittest.TestCase):
+    def test_number_words_become_digits(self) -> None:
+        self.assertEqual(normalize_tokens("ninety three percent"), ["93", "percent"])
+        self.assertEqual(normalize_tokens("ninety-four"), ["94"])
+        self.assertEqual(normalize_tokens("thirteen miles"), ["13", "miles"])
+        self.assertEqual(normalize_tokens("one hundred and twenty"), ["120"])
+        self.assertEqual(normalize_tokens("two hundred"), ["200"])
+        self.assertEqual(normalize_tokens("twenty twenty"), ["20", "20"])
+
+    def test_digits_percent_and_possessive(self) -> None:
+        self.assertEqual(normalize_tokens("Humidity's 93%."), ["humidity", "93", "percent"])
+
+    def test_lone_hundred_and_plain_words_untouched(self) -> None:
+        self.assertEqual(normalize_tokens("a hundred one"), ["a", "hundred", "1"])
+
+
+class IsEchoTest(unittest.TestCase):
+    SPOKEN = "Wind is about 13 miles an hour and humidity is 93 percent."
+
+    def test_number_word_mismatch_is_echo(self) -> None:
+        self.assertTrue(is_echo("Humidity is ninety-four percent.", self.SPOKEN))
+
+    def test_unrelated_is_not(self) -> None:
+        self.assertFalse(is_echo("What is the weather in Columbus Ohio", self.SPOKEN))
+
+    def test_short_answer_never_matches(self) -> None:
+        self.assertFalse(is_echo("yes it is", "Sure, it is fine"))
+        self.assertEqual(echo_score("No.", self.SPOKEN)[1], 0)
+
+    def test_long_heard_text_is_never_echo_and_fast(self) -> None:
+        heard = " ".join(["alpha"] * 5000)
+        start = time.monotonic()
+        self.assertEqual(echo_score(heard, "alpha " * 5)[1], 0)
+        self.assertFalse(is_echo(heard, "alpha " * 5))
+        self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_long_genuine_turn_ending_in_an_echo_is_not_echo(self) -> None:
+        user = " ".join(f"word{i}" for i in range(MAX_HEARD_TOKENS))
+        self.assertFalse(is_echo(user + " " + self.SPOKEN, self.SPOKEN))
+
+    def test_user_speech_before_a_long_echo_tail_is_not_echo(self) -> None:
+        # Only the old "keep the last 200 heard tokens" cut made this look like pure echo.
+        spoken = " ".join(f"echo{i}" for i in range(210))
+        heard = " ".join(f"mine{i}" for i in range(40)) + " " + spoken
+        self.assertFalse(is_echo(heard, spoken))
+
+    def test_user_speech_after_a_long_echo_head_is_not_echo(self) -> None:
+        # Mirror of the above: a "keep the first 200 heard tokens" cut fails it.
+        spoken = " ".join(f"echo{i}" for i in range(210))
+        heard = spoken + " " + " ".join(f"mine{i}" for i in range(40))
+        self.assertFalse(is_echo(heard, spoken))
+
+    def test_many_genuine_words_before_an_echo_are_not_echo(self) -> None:
+        spoken = " ".join(f"echo{i}" for i in range(200))
+        heard = " ".join(f"mine{i}" for i in range(300)) + " " + spoken
+        self.assertFalse(is_echo(heard, spoken))
+
+    def test_short_pure_echo_is_still_echo(self) -> None:
+        self.assertTrue(is_echo(self.SPOKEN, self.SPOKEN))
+
+    def test_echo_followed_by_new_speech_is_not_echo(self) -> None:
+        self.assertFalse(is_echo(self.SPOKEN + " wait what is the time", self.SPOKEN))
 
 
 if __name__ == "__main__":

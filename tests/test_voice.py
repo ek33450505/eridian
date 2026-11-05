@@ -28,6 +28,8 @@ from undertone.voice import (
     ANNOUNCE_LEVELS,
     ANNOUNCE_REPEAT_S,
     ANNOUNCE_TEMPLATES,
+    ECHO_GUARD_S,
+    ECHO_HISTORY_S,
     MAX_CHECK_CHARS,
     MAX_CONNECTIONS,
     MAX_LINE_BYTES,
@@ -508,7 +510,7 @@ class TalkOverTest(VoiceTestCase):
             channel.read_line(),
             {"type": "utterance", "text": "actually never mind", "via": "talk_over"},
         )
-        self.assertIn("you: actually never mind", self.out.getvalue())
+        self.assertIn("you [talk_over]: actually never mind", self.out.getvalue())
 
     def _assert_talk_over_off(self, **extra) -> None:
         calls = self._bridge()
@@ -596,7 +598,8 @@ class TalkOverTest(VoiceTestCase):
         channel = self.attach()
         heard = "I finished the refactor and all the tests pass"
         self._talk_over_reply(heard, channel)
-        self.assertIn(f'[ignored as my own reply: "{heard}"]', self.out.getvalue())
+        self.assertIn(heard, self.out.getvalue())
+        self.assertIn("[dropped: echo of own speech]", self.out.getvalue())
         self.assertNotIn("you:", self.out.getvalue())
         channel.sock.settimeout(0.3)
         self.assertIsNone(channel.read_line())
@@ -613,7 +616,7 @@ class TalkOverTest(VoiceTestCase):
         )
         out = self.out.getvalue()
         self.assertIn(f'[removed my own words: "{heard}" -> "wait what\'s the time"]', out)
-        self.assertIn("you: wait what's the time", out)
+        self.assertIn("you [talk_over]: wait what's the time", out)
 
     def test_wake_while_speaking_sends_wake_barge_in_via(self) -> None:
         self._bridge()
@@ -1423,7 +1426,7 @@ class TooSoonAndRedactionTest(VoiceTestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0]["via"], "wake_barge_in")
         self.assertNotIn(TOO_SOON_SPEECH, self.player.enqueued)
-        self.assertIn("you: what time is it", self.out.getvalue())
+        self.assertIn("you [wake_barge_in]: what time is it", self.out.getvalue())
 
     def test_safe_phrase_redacted_in_print_but_raw_on_socket(self) -> None:
         voice_guard.set_safe_phrase(self.home, "copper maple")
@@ -1445,6 +1448,98 @@ class TooSoonAndRedactionTest(VoiceTestCase):
     def test_prints_unchanged_without_phrase(self) -> None:
         self.say("wake", "copper maple")
         self.assertIn("you: copper maple\n", self.out.getvalue())
+
+
+class EchoTextGuardTest(VoiceTestCase):
+    """Live failure 2026-11-04: AEC residue of our own voice became `you:` turns."""
+
+    socket_free = True
+    REPLY = (
+        "Columbus has light rain right now, 63 degrees but it feels like 60. "
+        "Wind is about 13 miles an hour and humidity is 93 percent."
+    )
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sent: list[dict] = []
+        conn = _Conn(mock.Mock())
+        conn.send = lambda obj: self.sent.append(obj) or True
+        self.bridge._conn = conn
+        self.bridge._handle_line(
+            conn, json.dumps({"type": "reply", "text": self.REPLY}).encode("utf-8")
+        )
+
+    def turn(self, kind: str, text: str, *, busy: bool = True, stamp: bool = True) -> None:
+        if stamp:
+            self.player.busy = True
+            self.bridge.process_frame(FRAME)  # stamps _last_busy
+        self.player.busy = busy
+        self.bridge._on_listener_event(ListenerEvent(kind))
+        self.bridge._on_listener_event(ListenerEvent("utterance", text=text))
+
+    def test_numeric_echo_talk_over_is_dropped(self) -> None:
+        self.turn("talk_over", "Humidity is ninety-four percent.")
+        self.assertEqual(self.sent, [])
+        self.assertIn("[dropped: echo of own speech]", self.out.getvalue())
+
+    def test_second_talk_over_after_barge_in_is_still_dropped(self) -> None:
+        # Barge-in bumps the generation, so the per-gen echo_ref is empty then.
+        self.turn("talk_over", "Humidity is ninety-four percent.")
+        self.turn("talk_over", "Humidity's ninety three percent right now.")
+        self.assertEqual(self.sent, [])
+
+    def test_follow_up_echo_is_dropped(self) -> None:
+        self.turn("follow_up", "wind is about thirteen miles an hour", busy=False)
+        self.assertEqual(self.sent, [])
+        self.assertIn("you [follow_up]:", self.out.getvalue())
+
+    def test_different_utterance_passes(self) -> None:
+        self.turn("follow_up", "No.", busy=False)
+        self.turn("follow_up", "What is the weather in Columbus Ohio", busy=False)
+        self.assertEqual([m["text"] for m in self.sent], ["No.", "What is the weather in Columbus Ohio"])
+        self.assertEqual(self.sent[0]["via"], "follow_up")
+
+    def test_wake_turn_is_never_dropped(self) -> None:
+        self.turn("wake", "humidity is 93 percent")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0]["via"], "wake_barge_in")
+        self.player.busy = False
+        self.clock.now += 30
+        self.turn("wake", "humidity is 93 percent", busy=False, stamp=False)
+        self.assertEqual(self.sent[-1]["via"], "wake")
+
+    def test_window_expires(self) -> None:
+        self.player.busy = True
+        self.bridge.process_frame(FRAME)
+        self.clock.now += ECHO_GUARD_S + 1
+        self.turn("follow_up", "humidity is 93 percent", busy=False, stamp=False)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_history_expires(self) -> None:
+        self.clock.now += ECHO_HISTORY_S + 1
+        self.turn("talk_over", "humidity is ninety three percent")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_announcement_text_counts(self) -> None:
+        self.bridge._spoken_log.clear()
+        self.bridge._on_announce("finished")
+        spoken = self.player.enqueued[-1]
+        self.turn("talk_over", spoken)
+        self.assertEqual(self.sent, [])
+
+    def test_guard_leaves_grant_rules_alone(self) -> None:
+        conn = self.bridge._conn
+        self.bridge._handle_line(
+            conn,
+            json.dumps({"type": "reply", "text": "Say confirm walnut lantern.", "kind": "confirm"}).encode("utf-8"),
+        )
+        self.assertTrue(self.bridge._confirm_pending)
+        self.turn("talk_over", "go ahead and do it")  # not echo: sent, but as talk_over
+        self.assertEqual(self.sent[-1]["via"], "talk_over")
+        self.player.busy = False
+        self.clock.now += 30
+        self.turn("wake", "say confirm walnut lantern", busy=False, stamp=False)  # matches recent speech
+        self.assertEqual(self.sent[-1], {"type": "utterance", "text": "say confirm walnut lantern", "via": "wake"})
 
 
 class HomeDefaultIsLazyTest(unittest.TestCase):
