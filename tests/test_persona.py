@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -81,6 +82,9 @@ class PassthroughTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop(persona.PERSONA_ENV, None)
+        tmp = tempfile.TemporaryDirectory(prefix="ut")
+        self.addCleanup(tmp.cleanup)
+        os.environ["ERIDIAN_HOME"] = tmp.name  # ChannelServer() resolves paths.home_dir()
 
     def test_unset_not_passed(self) -> None:
         self.assertNotIn(persona.PERSONA_ENV, self._env())

@@ -6,8 +6,18 @@ test modules in sorted order and this name sorts first. Tests that need a
 specific variable set it themselves (mock.patch.dict). ERIDIAN_TEST_* opt-ins
 (e.g. ERIDIAN_TEST_REAL_KOKORO) are kept. Running a single module directly
 (not via discover) skips this scrub.
+
+After the scrub, ERIDIAN_HOME is pointed at a throwaway temp dir so a test that
+forgets to set its own never creates or touches the real ~/.eridian.
 """
+import atexit
 import os
+import shutil
+import tempfile
 
 for _name in [k for k in os.environ if k.startswith("ERIDIAN_") and not k.startswith("ERIDIAN_TEST_")]:
     del os.environ[_name]
+
+_TEST_HOME = tempfile.mkdtemp(prefix="eridian-test-home-")
+atexit.register(shutil.rmtree, _TEST_HOME, ignore_errors=True)
+os.environ["ERIDIAN_HOME"] = _TEST_HOME
