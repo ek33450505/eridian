@@ -10,7 +10,7 @@ calling the channel's `reply` tool, and the channel sends the text back as a
 Socket protocol (newline-delimited UTF-8 JSON, each line <= 64 KB; an oversized
 line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
 
-    channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"[,"session":"<32 hex>"]}
+    channel -> voice   {"type":"hello","pid":<int>,"cwd":"<str>"[,"wake":"<phrase>"][,"session":"<32 hex>"]}
                                                                     (first line)
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"[,"check":"..."]}
                                                                     (any number; `check` is
@@ -118,7 +118,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol, TextIO
 
-from . import paths
+from . import paths, wake
 from .chunker import SentenceChunker
 from .listener import Clock, Listener, ListenerConfig, ListenerEvent
 from .player import SpeechQueue
@@ -128,6 +128,8 @@ from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
+WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
+WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
 
 ANNOUNCE_TEMPLATES = {
@@ -271,6 +273,7 @@ class VoiceBridge:
         self._threads: list[threading.Thread] = []
         self._chunker = SentenceChunker()
         self._control: queue.Queue = queue.Queue()
+        self._mismatch_spoken_at: float | None = None  # when we last spoke the wake-mismatch notice
         self._speech_q: queue.Queue = queue.Queue()
 
         self._player = player_factory()
@@ -399,6 +402,10 @@ class VoiceBridge:
                 return
             if kind == "announce":
                 self._on_announce(arg)
+                continue
+            if kind == "wake_mismatch":
+                self._note_spoken(WAKE_MISMATCH_SPEECH)
+                self._player.enqueue(WAKE_MISMATCH_SPEECH, own=True)
                 continue
             gen = arg
             if (
@@ -653,6 +660,25 @@ class VoiceBridge:
             if isinstance(pid, int) and not isinstance(pid, bool) and isinstance(cwd, str):
                 session = msg.get("session")
                 valid = isinstance(session, str) and TOKEN_RE.fullmatch(session)
+                theirs = msg.get("wake")
+                theirs = theirs.lower() if isinstance(theirs, str) else wake.DEFAULT_PHRASE
+                ours = wake.current().phrase
+                if theirs != ours:
+                    # Fail closed: this session would tell Claude a different wake word
+                    # than the one we listen for. Stay unattached (replies are ignored).
+                    self._print(
+                        f"[refused session pid {pid}: it expects wake word {self._redact(theirs[:60])!r} "
+                        f"but this voice process listens for {ours!r}; restart one of them]\n"
+                    )
+                    now = self._clock()
+                    with _bounded(self._lock):
+                        last = self._mismatch_spoken_at
+                        speak = last is None or now - last >= WAKE_MISMATCH_REPEAT_S
+                        if speak:
+                            self._mismatch_spoken_at = now
+                    if speak:
+                        self._control.put(("wake_mismatch", None))
+                    return
                 self._attach(conn, pid, cwd, session if valid else "")
         elif kind == "announce":
             self._on_announce_line(msg.get("event"), msg.get("session"))
@@ -738,7 +764,7 @@ class VoiceBridge:
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":
-            self._print('[confirmation needed: when I finish, say "hey jarvis" and the phrase]\n')
+            self._print(f'[confirmation needed: when I finish, say "{wake.current().phrase}" and the phrase]\n')
         self._speech_q.put((gen, kind))
 
     # ---- speech watcher thread -----------------------------------------
@@ -821,7 +847,11 @@ def run_attach(
     vad = SileroVoiceActivityDetector()
     cues = {"wake": cli._WAKE_CUE, "follow_up": cli._FOLLOW_UP_CUE}
 
-    io = cli.make_audio_io(no_aec, tts=tts)
+    try:
+        io = cli.make_audio_io(no_aec, tts=tts)
+    except cli.OwnVoiceError as exc:
+        print(f"undertone: {exc}", file=sys.stderr)
+        return 1
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -851,7 +881,7 @@ def run_attach(
         print(cli.banner_line(io))
         paths.write_attach_pid(pid)
         print(
-            "undertone attach: listening for 'hey jarvis'. Start a Claude session with "
+            f"undertone attach: listening for '{wake.current().phrase}'. Start a Claude session with "
             "`undertone session` in another terminal. Ctrl-C to quit.",
             flush=True,
         )

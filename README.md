@@ -123,6 +123,12 @@ This defines a `claude` function that runs `undertone launch -- "$@"`. In an int
 - `undertone models fetch`: download the STT model (one-time ~2.5 GB)
 - `undertone safe-phrase [--clear | --status]`: set your own voice-confirm phrase (hidden prompt, entered twice; 1–3 words, at least 2 words or 8 letters). It's stored only as an scrypt hash in `~/.undertone/safe_phrase.json`. Pick something you never say otherwise, and don't say it on calls or near recording devices: anyone who hears it can confirm. Restart `attach` and `session` after changing it.
 
+## Custom wake word
+
+By default undertone listens for "hey jarvis". To use your own trained microWakeWord model, set `UNDERTONE_WAKE_MODEL` to the absolute path of its manifest json (a leading `~` is fine). The `.tflite` file named by its `model` key must sit next to it. The manifest's directory is resolved first, so a symlinked directory is accepted, but the manifest and model files themselves must not be symlinks. Both files and that directory must be owned by you and not writable by group or other. At startup undertone validates them and copies them into a private directory under `~/.undertone/wake-model/`; every detector (the listener's and the self-screen's per-chunk ones) is then built from that copy, never from the source. A damaged copy is rebuilt; a symlinked one is refused. A bad manifest stops startup with an error; it never falls back to "hey jarvis".
+
+The manifest's `wake_word` becomes the phrase everywhere (detector, self-screen, spoken-text scrub, transcript stripping, hints, Claude's instructions) and its last word is the assistant's name. Replies never say the full phrase. For a multi-word phrase the bare name (say "rocky") is not scrubbed from replies; Claude is told to avoid it, and the acoustic self-screen blocks audio that fires the detector. A single-word phrase is scrubbed whole. `attach` refuses a `session` whose wake phrase differs from its own. Training steps: `training/microwakeword/README.md`.
+
 ## Architecture
 
 ```
@@ -246,12 +252,14 @@ Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word 
 ## Environment variables
 
 - `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
+- `UNDERTONE_WAKE_MODEL` — absolute path to a microWakeWord manifest json (a custom wake word, e.g. "hey rocky"); replaces "hey jarvis" everywhere. Unset uses the builtin. A missing or invalid manifest stops startup with an error; see [Custom wake word](#custom-wake-word)
+- `UNDERTONE_WAKE_PHRASE` (set by `undertone session`) — the resolved wake phrase passed to the channel via MCP config; internal use only
 - `UNDERTONE_AUTOLAUNCH` — set to `0` to make `undertone launch` (and the `shell-init` function) run plain `claude`
 - `UNDERTONE_SESSION` (set by `undertone session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Daniel"`); empty string uses system voice
-- `UNDERTONE_KOKORO_OWN_VOICE` — Kokoro voice for undertone's own words, the confirm read-back (default `af_heart`); keep it different from `UNDERTONE_KOKORO_VOICE`
+- `UNDERTONE_KOKORO_OWN_VOICE` — Kokoro voice for undertone's own words, the confirm read-back (default `af_heart`); it must differ from `UNDERTONE_KOKORO_VOICE` (and from every voice in a blend), or `attach` and `chat` refuse to start
 - `UNDERTONE_KOKORO_VOICE` — voice name for Kokoro (e.g., `am_michael`, `bm_george`; default `am_adam`)
-- `UNDERTONE_OWN_VOICE` — `say` voice for undertone's own words (default `Samantha`); keep it different from `UNDERTONE_VOICE`
+- `UNDERTONE_OWN_VOICE` — `say` voice for undertone's own words (default `Samantha`); it must differ from `UNDERTONE_VOICE`, or `attach` and `chat` refuse to start
 - `UNDERTONE_SELF_WAKE_GUARD_S` — window (seconds) after undertone stops speaking during which a wake word is treated as barge-in, not exact wake (default 1.0 s, floor 1.0, cap 10.0; for AirPlay latency, try 3)
 - `UNDERTONE_ESPEAK_CMD` (tests only) — path to espeak-ng or stub
 - `UNDERTONE_TEST_REAL_KOKORO` (tests only) — set to `1` to run real Kokoro smoke tests

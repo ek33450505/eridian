@@ -19,23 +19,35 @@ import sys
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from . import paths
+from . import paths, wake
 
 
 _WAKE_CUE = "/System/Library/Sounds/Tink.aiff"
 _FOLLOW_UP_CUE = "/System/Library/Sounds/Pop.aiff"
+
+# Commands that use the wake word; a bad UNDERTONE_WAKE_MODEL stops them at startup.
+_WAKE_COMMANDS = frozenset({"attach", "chat", "launch", "listen", "session"})
 
 
 def _make_wake_factory(
     *, probability_cutoff: float | None = None
 ) -> Callable[[], Callable[[bytes], bool]]:
     # Lazy import: pymicro-wakeword is heavy and only the voice commands need it.
-    from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures, Model
+    from pymicro_wakeword import MicroWakeWordFeatures
+
+    configured = wake.current()  # validated and copied privately once; every load reads the copy
+    # Fail closed at startup if the model won't load; the first detector reuses this load.
+    preloaded = [configured.load_model()]
 
     def wake_factory():
-        mww = MicroWakeWord.from_builtin(Model.HEY_JARVIS)
+        mww = preloaded.pop() if preloaded else configured.load_model()
         if probability_cutoff is not None:
-            mww.probability_cutoff = probability_cutoff
+            # A custom model may run a live cutoff below the screen's: never screen looser than live.
+            mww.probability_cutoff = (
+                probability_cutoff
+                if configured.is_default
+                else min(probability_cutoff, mww.probability_cutoff)
+            )
         feats = MicroWakeWordFeatures()
 
         def detect(frame: bytes) -> bool:
@@ -143,12 +155,14 @@ def _say_voice_label() -> str:
     return f"say ({reply}; undertone's own voice: {own})"
 
 
-def _warn_same_own_voice(name: str, err) -> None:
-    print(
-        f"undertone: undertone's own voice is the same as the reply voice ({name}); "
-        "its read-backs will sound like Claude",
-        file=err,
-        flush=True,
+class OwnVoiceError(Exception):
+    """undertone's own voice is part of Claude's voice: read-backs would be indistinguishable."""
+
+
+def _same_say_voice_message(name: str) -> str:
+    return (
+        f"undertone's own voice is the same as the reply voice ({name}); "
+        "set UNDERTONE_VOICE or UNDERTONE_OWN_VOICE so they differ"
     )
 
 
@@ -180,7 +194,7 @@ def make_audio_io(
     if no_aec:
         reply, own = _say_voices()
         if reply == own:
-            _warn_same_own_voice(reply, err)
+            raise OwnVoiceError(_same_say_voice_message(reply))
         return AudioIO(
             player_factory=lambda on_start=None: SpeechQueue(on_start),
             talk_over=False,
@@ -200,12 +214,17 @@ def make_audio_io(
             print(f"undertone: Kokoro voice unavailable ({exc}); using say", file=err, flush=True)
 
     if voice is not None:
-        if voice.own_voice == voice.voice:
-            _warn_same_own_voice(voice.voice, err)
+        if voice.own_voice in voice.voice_names:
+            # Fail closed: the confirm read-back is only trustworthy if it sounds unlike Claude.
+            raise OwnVoiceError(
+                f"undertone's own voice ({voice.own_voice}) is part of the reply voice "
+                f"({voice.voice}); set UNDERTONE_KOKORO_OWN_VOICE or UNDERTONE_KOKORO_VOICE "
+                "so they differ"
+            )
     else:
         reply, own = _say_voices()
         if reply == own:
-            _warn_same_own_voice(reply, err)
+            raise OwnVoiceError(_same_say_voice_message(reply))
 
     if engine_factory is None:
         from .duplex import DuplexAudio as engine_factory
@@ -245,7 +264,7 @@ def banner_line(io: AudioIO) -> str:
     if io.talk_over:
         line = "Echo cancellation on: talk over a reply to stop it."
     else:
-        line = "Echo cancellation off: say 'hey jarvis' to stop a reply."
+        line = f"Echo cancellation off: say '{wake.current().phrase}' to stop a reply."
     return f"{line} Voice: {io.voice_label}."
 
 
@@ -323,7 +342,11 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     cues = {"wake": _WAKE_CUE, "follow_up": _FOLLOW_UP_CUE}
 
-    io = make_audio_io(args.no_aec, tts=args.tts)
+    try:
+        io = make_audio_io(args.no_aec, tts=args.tts)
+    except OwnVoiceError as exc:
+        print(f"undertone: {exc}", file=sys.stderr)
+        return 1
     session = ChatSession(
         wake_factory=_make_wake_factory(),
         vad=lambda chunk: vad(chunk),
@@ -349,7 +372,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         "it cannot run commands or edit files."
     )
     print(banner_line(io))
-    print("Say 'hey jarvis'. Ctrl-C to quit.", flush=True)
+    print(f"Say '{wake.current().phrase}'. Ctrl-C to quit.", flush=True)
     try:
         try:
             io.start()
@@ -367,14 +390,22 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
 
 def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
-    """MCP config that launches the channel server with the same UNDERTONE_HOME."""
+    """MCP config that launches the channel server with the same UNDERTONE_HOME.
+
+    The channel gets the resolved wake PHRASE (never the model path): it only needs
+    the words for its instructions, and this keeps it from loading the manifest.
+    """
+    env = {"UNDERTONE_HOME": str(home), "UNDERTONE_SESSION": token}
+    phrase = wake.current()
+    if not phrase.is_default:
+        env[wake.PHRASE_ENV] = phrase.phrase
     return {
         "mcpServers": {
             "undertone": {
                 "command": executable,
                 # -P: keep the session cwd off sys.path so a hostile checkout can't shadow us.
                 "args": ["-P", "-m", "undertone.cli", "channel"],
-                "env": {"UNDERTONE_HOME": str(home), "UNDERTONE_SESSION": token},
+                "env": env,
             }
         }
     }
@@ -859,7 +890,8 @@ def build_parser() -> argparse.ArgumentParser:
     shell_parser.set_defaults(func=_cmd_shell_init)
 
     attach_parser = sub.add_parser(
-        "attach", help="listen for 'hey jarvis' and send speech to the latest `undertone session`"
+        "attach",
+        help="listen for the wake word ('hey jarvis' by default) and send speech to the latest `undertone session`",
     )
     attach_parser.add_argument(
         "--no-beep", action="store_true", help="skip the audible wake/follow-up cues"
@@ -925,6 +957,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.claude_args = raw[1:]
     else:
         args = parser.parse_args(raw)
+    if getattr(args, "command", None) in _WAKE_COMMANDS:
+        try:
+            wake.resolve()
+        except wake.WakeWordError as exc:
+            print(f"undertone: {exc}", file=sys.stderr)
+            return 1
     return args.func(args)
 
 

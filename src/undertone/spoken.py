@@ -8,6 +8,8 @@ from __future__ import annotations
 import difflib
 import re
 
+from . import wake
+
 _FENCED_CODE_RE = re.compile(r"```.*?```", re.DOTALL)
 _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
@@ -23,18 +25,6 @@ _FILE_PATH_RE = re.compile(r"(?<!\w)(?:~|\.{1,2})?/[\w./\-]+")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
-# Letter-spaced / punctuated "jarvis" ("J.A.R.V.I.S.", "jar vis"), plus the
-# common mishearing "jervis", with the optional hey/hi/okay lead-in. Matched
-# anywhere (unlike listener._WAKE_PHRASE_RE). Alphanumeric look-arounds rather
-# than \b so "jarvisfoo" and "jar visit" are left alone while separators
-# between the letters are free. A false positive only costs a substitution.
-_SEP = r"[\W_]*"
-_WAKE_WORD_RE = re.compile(
-    r"(?<![^\W_])(?:(?:hey|hi|okay|ok)[\W_]+)?"
-    + _SEP.join(["j", "[ae]", "r", "v", "[iy]", "s"])
-    + r"(?![^\W_])",
-    re.IGNORECASE,
-)
 # Zero-width characters and the soft hyphen: invisible to a reader, but they
 # break up a regex match while `say` still pronounces the word.
 _INVISIBLE_RE = re.compile("[\u200b-\u200d\u2060\ufeff\u00ad]")
@@ -46,7 +36,9 @@ _SAY_CMD_RE = re.compile(r"[\[\]]")
 
 def scrub_wake_word(text: str) -> str:
     """Replace any spoken form of the wake phrase with "the wake word"."""
-    return _WAKE_WORD_RE.sub("the wake word", _INVISIBLE_RE.sub("", text))
+    # The pattern comes from the configured wake word (see wake.scrub_pattern);
+    # it matches the phrase anywhere, letter-spaced and with common homophones.
+    return wake.scrub_pattern(wake.current()).sub("the wake word", _INVISIBLE_RE.sub("", text))
 
 
 def sanitize_for_tts(text: str) -> str:

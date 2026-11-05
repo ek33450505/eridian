@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import voice_guard
+from undertone import voice_guard, wake
 from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
 from undertone.spoken import sanitize_terminal
 from undertone.voice import (
@@ -35,6 +35,7 @@ from undertone.voice import (
     MAX_LINE_BYTES,
     NO_SESSION_SPEECH,
     TOO_SOON_SPEECH,
+    WAKE_MISMATCH_SPEECH,
     VoiceBridge,
     _Conn,
     self_wake_guard_from_env,
@@ -108,8 +109,11 @@ class _Channel:
     def send_raw(self, data: bytes) -> None:
         self.sock.sendall(data)
 
-    def hello(self, pid: int = 4242, cwd: str = "/work/proj") -> None:
-        self.send_obj({"type": "hello", "pid": pid, "cwd": cwd})
+    def hello(self, pid: int = 4242, cwd: str = "/work/proj", wake: object = None) -> None:
+        msg = {"type": "hello", "pid": pid, "cwd": cwd}
+        if wake is not None:
+            msg["wake"] = wake
+        self.send_obj(msg)
 
     def read_line(self) -> dict | None:
         """Next JSON line, or None on EOF / reset."""
@@ -261,6 +265,111 @@ class StartupTest(VoiceTestCase):
         self.assertFalse(self.sock_path.exists())
         self.assertTrue(_wait_for(lambda: not any(t.is_alive() for t in threads)))
         self.assertTrue(self.player.closed)
+
+
+class WakeMismatchTest(VoiceTestCase):
+    def _refused(self, channel_wake) -> None:
+        self.start()
+        channel = self.connect(wake=channel_wake)
+        self.assertTrue(_wait_for(lambda: "[refused session" in self.out.getvalue()))
+        self.bridge.process_frame(FRAME)  # control queue drains on the main thread
+        return channel
+
+    def test_different_phrase_is_refused_warned_and_spoken(self) -> None:
+        self._refused("hey rocky")
+        out = self.out.getvalue()
+        self.assertIn("'hey rocky'", out)
+        self.assertIn("'hey jarvis'", out)
+        self.assertNotIn("[attached:", out)
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH])
+
+    def test_refused_session_gets_no_utterances(self) -> None:
+        self._refused("hey rocky")
+        self.wake()
+        self.speak("what is the status")
+        self.assertNotIn("[attached:", self.out.getvalue())
+        self.assertIn("[no Claude session attached]", self.out.getvalue())
+
+    def test_non_string_phrase_counts_as_default(self) -> None:
+        self.start()
+        self.attach(wake=["x"])
+        self.assertIn("[attached:", self.out.getvalue())
+
+    def test_matching_and_old_style_hellos_attach(self) -> None:
+        self.start()
+        self.attach(wake="Hey Jarvis")
+        self.attach()  # no phrase field: the default
+        self.assertEqual(self.out.getvalue().count("[attached:"), 2)
+        self.assertEqual(self.player.enqueued, [])
+
+    def test_attach_with_custom_phrase_refuses_old_hello(self) -> None:
+        self.start()
+        with mock.patch.dict(os.environ, {wake.PHRASE_ENV: "hey rocky"}):
+            self.connect()
+            self.assertTrue(_wait_for(lambda: "[refused session" in self.out.getvalue()))
+            self.attach(wake="hey rocky")
+
+
+class WakeMismatchDirectTest(VoiceTestCase):
+    """Drives _handle_line with fake connections: no sockets, deterministic clock."""
+
+    def hello(self, wake_phrase=None, conn=None, session=None):
+        conn = conn or _FakeConn()
+        msg = {"type": "hello", "pid": 9, "cwd": "/w"}
+        if wake_phrase is not None:
+            msg["wake"] = wake_phrase
+        if session is not None:
+            msg["session"] = session
+        self.bridge._handle_line(conn, json.dumps(msg).encode())
+        self.bridge.process_frame(FRAME)
+        return conn
+
+    def test_notice_is_spoken_at_most_once_per_minute(self) -> None:
+        self.hello("hey rocky")
+        self.hello("hey rocky")
+        self.hello("hey nova")  # a different phrase does not get a second notice
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH])
+        self.clock.now += 61.0
+        self.hello("hey rocky")
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH] * 2)
+        self.assertEqual(self.out.getvalue().count("[refused session"), 4)  # the warning is never rate limited
+
+    def test_cycling_many_phrases_is_spoken_once(self) -> None:
+        for i in range(20):
+            self.hello(f"hey name{'x' * i}")
+            self.clock.now += 1.0
+        self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH])
+
+    def test_reply_from_a_refused_connection_is_ignored(self) -> None:
+        conn = self.hello("hey rocky")
+        before = list(self.player.enqueued)
+        self.bridge._handle_line(conn, b'{"type":"reply","text":"sneaky."}')
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, before)
+        self.assertNotIn("sneaky", self.out.getvalue())
+
+    def test_existing_attached_session_survives_a_refused_hello(self) -> None:
+        good = self.hello("hey jarvis", session=TOKEN)
+        self.assertIs(self.bridge._conn, good)
+        self.hello("hey rocky", session=OTHER_TOKEN)
+        self.assertIs(self.bridge._conn, good)
+        self.assertEqual(good.sent, [])  # not detached either
+        self.bridge._handle_line(good, b'{"type":"reply","text":"Still here."}')
+        self.assertTrue(_wait_for(lambda: "Still here." in "".join(self.player.enqueued)))
+
+    def test_announce_from_a_refused_connection_is_not_spoken(self) -> None:
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+        refused = self.hello("hey rocky", session=TOKEN)
+        self.assertIsNot(self.bridge._conn, refused)
+        before = list(self.player.enqueued)
+        self.bridge._handle_line(
+            _FakeConn(), json.dumps({"type": "announce", "event": "finished", "session": TOKEN}).encode()
+        )
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, before)
+        self.assertNotIn("[announce:", self.out.getvalue())
 
 
 class ConversationTest(VoiceTestCase):

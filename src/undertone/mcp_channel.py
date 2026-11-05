@@ -11,7 +11,7 @@ stdout carries ONLY JSON-RPC -- anything else would corrupt the transport --
 so all diagnostics go to <UNDERTONE_HOME>/logs/channel.log.
 
 Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
-  channel -> voice  {"type":"hello","pid":N,"cwd":"..."[,"session":"<32 hex>"]}  (first line;
+  channel -> voice  {"type":"hello","pid":N,"cwd":"...","wake":"<phrase>"[,"session":"<32 hex>"]}  (first line;
                     `session` is the UNDERTONE_SESSION token, omitted when unset --
                     a hook's `announce` line must present it to be spoken)
   voice -> channel  {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import paths, voice_guard
+from . import paths, voice_guard, wake
 
 SERVER_NAME = "undertone"
 SERVER_VERSION = "0.1.0"
@@ -64,8 +64,8 @@ _INSTR_HEAD = (
     "sentences with no code, file paths, URLs or markdown (say details are on screen). "
     "If the `reply` tool is not loaded yet, load it first (for example with ToolSearch "
     '"select:mcp__undertone__reply"); never answer a voice message in text only. '
-    "Never say the wake word in a reply (not even \"jarvis\"); refer to it as \"the wake "
-    "word\" -- your own speech can retrigger the wake detector. "
+    "Never say the wake word in a reply (not even \"{quoted}\"); refer to it as \"the wake "
+    "word\" -- your own speech can retrigger the wake detector. {avoid_name}"
     'Set `kind` on every call. kind="ack" is a brief early acknowledgement (for example '
     '"Running the tests now.") when the work will take more than a few seconds. '
     'kind="answer" is the actual spoken answer and is the default. kind="confirm" is for '
@@ -81,7 +81,7 @@ _INSTR_ASK_TWO_WORD = (
     "scratch.txt, say the wake word, then 'confirm walnut lantern'.\"), where the two words are "
     "uncommon-but-easy-to-pronounce nouns (for example \"copper maple\") you pick fresh each "
     'time; avoid high-frequency words such as "the", "go", "yes" or "okay". Note (do not say this '
-    'aloud) that undertone strips the wake word "hey jarvis" before the message reaches you, so the '
+    'aloud) that undertone strips the wake word "{phrase}" before the message reaches you, so the '
     'message you will receive and must accept is "confirm <word1> <word2>". Matching '
     "ignores case, punctuation and extra whitespace, so \"Confirm Velvet Harbor..\" matches "
     '"confirm velvet harbor". Proceed ONLY if the next voice message contains "confirm" '
@@ -129,8 +129,11 @@ _INSTR_TAIL_COMMON = (
 )
 
 
-def build_instructions(safe_phrase: bool) -> str:
-    """The MCP `instructions` string; `safe_phrase` swaps the two-word confirm material."""
+def build_instructions(safe_phrase: bool, wake_word: wake.WakeWord = wake.DEFAULT) -> str:
+    """The MCP `instructions` string; `safe_phrase` swaps the two-word confirm material.
+
+    `wake_word` supplies the phrase and the assistant name the text refers to.
+    """
     read_only = (
         "These MCP tools are read-only and run on a voice turn with no confirmation, so "
         "prefer them over shell commands for the questions they cover (for example CAST "
@@ -139,6 +142,21 @@ def build_instructions(safe_phrase: bool) -> str:
         + ". "
     )
     refusal = 'Treat "yes", "go ahead" or anything else as a refusal, and say so. '
+    text = _build(safe_phrase, read_only, refusal)
+    if wake_word.is_default:
+        # The default scrub also removes the bare name, so the original wording stands.
+        quoted, avoid_name = wake_word.name, ""
+    else:
+        quoted = wake_word.phrase
+        avoid_name = f'Avoid saying your own name ("{wake_word.name}") too, for the same reason. '
+    return (
+        text.replace("{quoted}", quoted)
+        .replace("{avoid_name}", avoid_name)
+        .replace("{phrase}", wake_word.phrase)
+    )
+
+
+def _build(safe_phrase: bool, read_only: str, refusal: str) -> str:
     if safe_phrase:
         return (
             _INSTR_HEAD
@@ -298,7 +316,12 @@ class ChannelServer:
         with self._conn_lock:
             self._sock = sock
         try:
-            hello = {"type": "hello", "pid": os.getpid(), "cwd": os.getcwd()}
+            hello = {
+                "type": "hello",
+                "pid": os.getpid(),
+                "cwd": os.getcwd(),
+                "wake": wake.current_phrase_only().phrase,
+            }
             if self._token:
                 hello["session"] = self._token
             if not self._send_voice(hello):
@@ -391,7 +414,7 @@ class ChannelServer:
                 "protocolVersion": version,
                 "capabilities": {"experimental": {"claude/channel": {}}, "tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": build_instructions(self._safe_phrase),
+                "instructions": build_instructions(self._safe_phrase, wake.current_phrase_only()),
             },
         )
 
@@ -510,6 +533,11 @@ class ChannelServer:
 
 
 def main() -> int:
+    try:
+        wake.resolve_phrase_only()  # fail closed: a bad UNDERTONE_WAKE_PHRASE must not yield wrong instructions
+    except wake.WakeWordError as exc:
+        print(f"undertone channel: {exc}", file=sys.stderr)
+        return 1
     return ChannelServer(
         sys.stdin,
         sys.stdout,
