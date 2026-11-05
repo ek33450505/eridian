@@ -14,7 +14,7 @@
 # canonical $HOME. Every delete requires the sentinel in the canonical root and
 # a relative subpath whose parent resolves under that root.
 
-MWW_SENTINEL_NAME=".undertone-mww-root"
+MWW_SENTINEL_NAME=".eridian-mww-root"
 
 _mww_die() {
 	echo "ERROR: $*" >&2
@@ -68,7 +68,7 @@ mww_init() {
 	shift || true
 	[[ "$mode" == setup || "$mode" == train ]] || _mww_die "mww_init: mode must be setup or train"
 
-	canon="$(mww_canon_root "${MWW_ROOT-$HOME/Datasets/undertone-training/mww}")" || exit 1
+	canon="$(mww_canon_root "${MWW_ROOT-$HOME/Datasets/eridian-training/mww}")" || exit 1
 	home_c="$(cd -P -- "$HOME" && pwd -P)" || _mww_die "MWW_ROOT: cannot canonicalise \$HOME"
 	[[ "$home_c" != "/" ]] || _mww_die "MWW_ROOT: \$HOME resolves to '/'"
 	[[ "$canon" != "/" ]] || _mww_die "MWW_ROOT: resolves to '/'"

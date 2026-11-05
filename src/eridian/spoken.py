@@ -42,7 +42,7 @@ def scrub_wake_word(text: str) -> str:
 
 
 def sanitize_for_tts(text: str) -> str:
-    """Everything undertone must not say aloud: `say` embedded commands (all brackets) and the wake phrase."""
+    """Everything eridian must not say aloud: `say` embedded commands (all brackets) and the wake phrase."""
     # Order matters: strip invisible characters FIRST, or "[<ZWSP>[inpt PHON]"
     # survives the bracket step and is reassembled into a live command after.
     text = _INVISIBLE_RE.sub("", text)

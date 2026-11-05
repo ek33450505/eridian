@@ -1,8 +1,8 @@
 """Record your own "hey rocky" clips for evaluating (and optionally training) the
 wake word model.
 
-Run in your own terminal with the undertone repo venv:
-  ~/Projects/personal/undertone/.venv/bin/python -I training/microwakeword/record_clips.py
+Run in your own terminal with the eridian repo venv:
+  ~/Projects/personal/eridian/.venv/bin/python -I training/microwakeword/record_clips.py
 
 Clips land in <root>/real/positives/<phrase>/NNNN.wav and
 <root>/real/confusables/<phrase>/NNNN.wav (16 kHz mono 16-bit PCM WAV, 4-digit
@@ -27,8 +27,8 @@ CLIP_SAMPLES = 3  # this many full-scale samples counts as clipped
 MIN_PEAK_DBFS = -35.0
 MIN_SPEECH_S = 0.3
 EDGE_FRAMES = 3  # speech this close to a window edge counts as cut off
-SENTINEL = ".undertone-mww-root"
-DEFAULT_ROOT = "~/Datasets/undertone-training/mww"
+SENTINEL = ".eridian-mww-root"
+DEFAULT_ROOT = "~/Datasets/eridian-training/mww"
 
 # Name -> (kind, text shown to the speaker). Positives first.
 PHRASES = {
@@ -51,8 +51,8 @@ TIPS = [
 BANNER = """\
 Recording real clips for the wake word model.
 
-  - Stop undertone first, or the wake word will wake it while you record:
-      ~/Projects/personal/undertone/.venv/bin/undertone stop
+  - Stop eridian first, or the wake word will wake it while you record:
+      ~/Projects/personal/eridian/.venv/bin/eridian stop
   - Vary distance (close / arm's length / across the room) and volume.
   - Confusables ("hey rock", "hey rocco", ...) matter as much as "hey rocky".
   - Keys: Enter = record, r = redo the last take, s = skip phrase, q = quit.

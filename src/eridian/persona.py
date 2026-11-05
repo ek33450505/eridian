@@ -1,9 +1,9 @@
 """Opt-in speech persona for spoken replies.
 
-`UNDERTONE_PERSONA` unset, empty or "off" means no persona; "rocky" appends a
+`ERIDIAN_PERSONA` unset, empty or "off" means no persona; "rocky" appends a
 style block to the channel's instructions. Anything else is an error, so a typo
 fails closed at startup instead of silently dropping the persona.
-`undertone session` resolves it and hands it to the channel in the MCP env.
+`eridian session` resolves it and hands it to the channel in the MCP env.
 """
 
 from __future__ import annotations
@@ -11,13 +11,13 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-PERSONA_ENV = "UNDERTONE_PERSONA"
+PERSONA_ENV = "ERIDIAN_PERSONA"
 ROCKY = "rocky"
 _OFF = ("", "off")
 
 
 class PersonaError(ValueError):
-    """UNDERTONE_PERSONA is set to something unsupported."""
+    """ERIDIAN_PERSONA is set to something unsupported."""
 
 
 def resolve(environ: Mapping[str, str] | None = None) -> str:

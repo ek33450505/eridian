@@ -1,4 +1,4 @@
-"""Prove undertone's audio pipeline runs with the network denied.
+"""Prove eridian's audio pipeline runs with the network denied.
 
 Run inside a network-denying sandbox (see verify-offline.sh):
 
@@ -52,8 +52,8 @@ def check_echo_cancellation(out: str, check, vad_cls) -> None:
     """Prove WebRTC AEC (livekit) runs locally: ERLE >= 20 dB and the VAD stays quiet."""
     import numpy as np
 
-    from undertone import duplex, speaker
-    from undertone.listener import ListenerConfig
+    from eridian import duplex, speaker
+    from eridian.listener import ListenerConfig
 
     text = (
         "The quick brown fox jumps over the lazy dog while the morning sun rises "
@@ -128,9 +128,9 @@ def check_kokoro(out: str, check, *, paths=None) -> None:
         check("Kokoro", False, "espeak-ng not found: brew install espeak-ng")
         return
 
-    from undertone import kokoro, speaker
-    from undertone.cli import _make_wake_factory
-    from undertone.screen import SCREEN_CUTOFF, ScreenedSink
+    from eridian import kokoro, speaker
+    from eridian.cli import _make_wake_factory
+    from eridian.screen import SCREEN_CUTOFF, ScreenedSink
 
     check("Kokoro telemetry off", os.environ.get("ORT_DISABLE_TELEMETRY") == "1", "ORT_DISABLE_TELEMETRY=1")
 
@@ -138,7 +138,7 @@ def check_kokoro(out: str, check, *, paths=None) -> None:
         voice = kokoro.KokoroVoice(paths=paths) if paths else kokoro.KokoroVoice()
         voice.warm_up()
     except kokoro.KokoroUnavailable as exc:
-        check("Kokoro", False, f"{exc}; run `uv run undertone models fetch` first, OUTSIDE the sandbox")
+        check("Kokoro", False, f"{exc}; run `uv run eridian models fetch` first, OUTSIDE the sandbox")
         return
 
     def synth(text: str) -> tuple[list[bytes | None], int, float | None]:
@@ -230,9 +230,9 @@ def main() -> int:
     check("network canary", True, "TCP and DNS both blocked")
 
     try:
-        from undertone.cli import _make_wake_factory
-        from undertone.listener import FRAME_BYTES, Listener
-        from undertone.stt import ModelNotCachedError, ParakeetSTT
+        from eridian.cli import _make_wake_factory
+        from eridian.listener import FRAME_BYTES, Listener
+        from eridian.stt import ModelNotCachedError, ParakeetSTT
         from pysilero_vad import SileroVoiceActivityDetector
     except ImportError as exc:
         print(f"  [FAIL] imports - {exc} (run `uv sync`)")
@@ -264,7 +264,7 @@ def main() -> int:
             now[0] += FRAME_SECONDS
     except ModelNotCachedError as exc:
         print(f"  [FAIL] models - {exc}")
-        print("  Run `uv run undertone models fetch` first, OUTSIDE the sandbox.")
+        print("  Run `uv run eridian models fetch` first, OUTSIDE the sandbox.")
         print("RESULT: FAIL")
         return 1
 

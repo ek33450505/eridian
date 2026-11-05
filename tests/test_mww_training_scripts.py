@@ -371,7 +371,7 @@ class ReportFormattingTest(unittest.TestCase):
         self.assertRegex(lines[2], r"hey_rock\s+false accepts=1/1")
 
 
-MODEL_ROOT = Path("/Users/edkubiak/Datasets/undertone-training/mww")
+MODEL_ROOT = Path("/Users/edkubiak/Datasets/eridian-training/mww")
 
 
 @unittest.skipUnless((MODEL_ROOT / "out" / "hey_rocky.tflite").exists(), "trained model not present")

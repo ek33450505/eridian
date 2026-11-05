@@ -1,12 +1,12 @@
 """Parakeet speech-to-text wrapper: lazy-loaded, offline-first, float32-only.
 
 `parakeet_mlx`/`huggingface_hub` are imported lazily inside functions so
-`undertone hook stop` and other lightweight commands stay fast even when this
+`eridian hook stop` and other lightweight commands stay fast even when this
 module is imported transitively. HF_HUB_OFFLINE is forced to "1" at import
 time of THIS module (before any parakeet/huggingface_hub import happens),
 because parakeet's `from_pretrained` otherwise contacts the Hugging Face Hub
 on every start even with a warm local cache -- that breaks the local-first
-promise. `undertone models fetch` is the one place that explicitly unsets it.
+promise. `eridian models fetch` is the one place that explicitly unsets it.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def is_model_cached(model_id: str = MODEL_ID) -> bool:
 
 
 def fetch_model(model_id: str = MODEL_ID) -> None:
-    """Download `model_id` once, contacting the Hub (used by `undertone models fetch`)."""
+    """Download `model_id` once, contacting the Hub (used by `eridian models fetch`)."""
     previous = os.environ.pop("HF_HUB_OFFLINE", None)
     try:
         from parakeet_mlx import from_pretrained
@@ -66,8 +66,8 @@ class ParakeetSTT:
     def __init__(self, model_id: str = MODEL_ID) -> None:
         if not is_model_cached(model_id):
             raise ModelNotCachedError(
-                f"undertone: model {model_id!r} is not cached locally -- "
-                "run `undertone models fetch` first"
+                f"eridian: model {model_id!r} is not cached locally -- "
+                "run `eridian models fetch` first"
             )
         from parakeet_mlx import from_pretrained
 

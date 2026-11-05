@@ -6,7 +6,7 @@ training environment and downloads the datasets, following the official
 [basic training notebook](https://github.com/kahrendt/microWakeWord/blob/main/notebooks/basic_training_notebook.ipynb).
 
 Everything lands under `MWW_ROOT` (default
-`~/Datasets/undertone-training/mww`), never in this repo. Caches (HF, uv,
+`~/Datasets/eridian-training/mww`), never in this repo. Caches (HF, uv,
 torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
 
 ## Run
@@ -16,7 +16,7 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
 - Idempotent: rerun to resume; finished steps are skipped.
 - Needs `uv`, `git`, `curl`, `unzip`; refuses to start under 60 GB free.
   `MWW_ROOT` must be absolute and strictly under `$HOME` (not `$HOME` itself).
-  `setup.sh` alone creates the root and its `.undertone-mww-root` sentinel,
+  `setup.sh` alone creates the root and its `.eridian-mww-root` sentinel,
   and only for a new or empty dir; a non-empty dir without the sentinel is
   refused, and `train.sh` requires the sentinel. All deletes go through
   `lib.sh` and need it. `setup.sh --check-root` / `train.sh --check-root`
@@ -50,7 +50,7 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
   `dinner_party_eval` is not confirmed to provide, so it is not used.
 - Audio decoding uses `soundfile` and `datasets<4` instead of ffmpeg/torchcodec.
 - `pymicro-features==2.0.2` from PyPI (universal2 wheel) replaces the notebook's
-  macOS fork, which no longer builds with current clang; it matches undertone's
+  macOS fork, which no longer builds with current clang; it matches eridian's
   runtime frontend.
 - `tensorboard>=2.18` is installed explicitly: TF 2.21 no longer bundles it, but
   microWakeWord's training calls `tf.summary`.
@@ -97,8 +97,8 @@ phonetic variants), `negatives` (5000 confusables over 10 phrases, 500 each:
 held-out "hey rocky", false accepts on confusables and speech, and a suggested
 `probability_cutoff`. Rerun it any time:
 
-    ~/Projects/personal/undertone/.venv/bin/python -I \
-        training/microwakeword/smoke_test.py --root ~/Datasets/undertone-training/mww
+    ~/Projects/personal/eridian/.venv/bin/python -I \
+        training/microwakeword/smoke_test.py --root ~/Datasets/eridian-training/mww
 
 Edit `micro.probability_cutoff` in `hey_rocky.json` (higher = fewer false
 accepts, more misses) and rerun. If the speech set is synthetic `say` audio the
@@ -109,11 +109,11 @@ output says so; treat that number as a rough check only.
 Synthetic voices miss how you actually say the phrases. Record real ones and
 train on them:
 
-1. Stop undertone first, or saying the wake word 50 times wakes it:
-   `~/Projects/personal/undertone/.venv/bin/undertone stop`
+1. Stop eridian first, or saying the wake word 50 times wakes it:
+   `~/Projects/personal/eridian/.venv/bin/eridian stop`
 2. Record (about 50 takes per phrase):
 
-       ~/Projects/personal/undertone/.venv/bin/python -I training/microwakeword/record_clips.py
+       ~/Projects/personal/eridian/.venv/bin/python -I training/microwakeword/record_clips.py
 
    Clips land in `$MWW_ROOT/real/positives/hey_rocky/` and
    `$MWW_ROOT/real/confusables/<phrase>/` (hey_rock, hey_rocks, hey_rocco,

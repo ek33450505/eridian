@@ -1287,7 +1287,7 @@ wheels = [
 ]
 
 [[package]]
-name = "undertone"
+name = "eridian"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

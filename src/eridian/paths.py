@@ -1,7 +1,7 @@
-"""Filesystem layout for undertone's runtime state.
+"""Filesystem layout for eridian's runtime state.
 
-All paths are rooted at UNDERTONE_HOME (env override, default ~/.undertone).
-Tests MUST set UNDERTONE_HOME to a temp dir — never touch the real ~/.undertone.
+All paths are rooted at ERIDIAN_HOME (env override, default ~/.eridian).
+Tests MUST set ERIDIAN_HOME to a temp dir — never touch the real ~/.eridian.
 """
 
 from __future__ import annotations
@@ -12,10 +12,15 @@ from pathlib import Path
 HOME_MODE = 0o700
 
 
+def home_path() -> Path:
+    """Return ERIDIAN_HOME (default ~/.eridian) without creating it."""
+    raw = os.environ.get("ERIDIAN_HOME")
+    return Path(raw).expanduser() if raw else Path.home() / ".eridian"
+
+
 def home_dir() -> Path:
-    """Return UNDERTONE_HOME, creating it (mode 0700) if missing."""
-    raw = os.environ.get("UNDERTONE_HOME")
-    path = Path(raw).expanduser() if raw else Path.home() / ".undertone"
+    """Return ERIDIAN_HOME, creating it (mode 0700) if missing."""
+    path = home_path()
     path.mkdir(mode=HOME_MODE, parents=True, exist_ok=True)
     # mkdir's mode is masked by umask; force it explicitly.
     os.chmod(path, HOME_MODE)
@@ -23,7 +28,7 @@ def home_dir() -> Path:
 
 
 def voice_socket_path() -> Path:
-    """Unix socket the `undertone attach` voice process listens on; channel servers connect to it."""
+    """Unix socket the `eridian attach` voice process listens on; channel servers connect to it."""
     return home_dir() / "voice.sock"
 
 
@@ -35,12 +40,12 @@ def log_dir() -> Path:
 
 
 def attach_pid_path() -> Path:
-    """Pidfile of the running `undertone attach` (0600)."""
+    """Pidfile of the running `eridian attach` (0600)."""
     return home_dir() / "attach.pid"
 
 
 def attach_lock_path() -> Path:
-    """flock target that serializes `undertone launch` check-and-spawn."""
+    """flock target that serializes `eridian launch` check-and-spawn."""
     return home_dir() / "attach.lock"
 
 

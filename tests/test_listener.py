@@ -1,4 +1,4 @@
-"""Tests for the undertone.listener state machine.
+"""Tests for the eridian.listener state machine.
 
 The listener is driven by raw audio bytes and three injected callables (wake,
 vad, stt) plus a clock -- no real audio, model, or network ever touches these
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import unittest
 
-from undertone.listener import (
+from eridian.listener import (
     FRAME_BYTES,
     VAD_CHUNK_BYTES,
     Listener,

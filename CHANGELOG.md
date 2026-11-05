@@ -1,8 +1,19 @@
 # Changelog
 
-All notable changes to undertone are documented here, in the style of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No release has been tagged yet; `pyproject.toml` is at 0.1.0.
+All notable changes to eridian (named undertone before 2026-11-05) are documented here, in the style of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No release has been tagged yet; `pyproject.toml` is at 0.1.0.
 
 ## [Unreleased]
+
+### 2026-11-05 — Renamed from undertone to eridian; follow-up window fix
+
+Entries below this one are kept as released, under the old name.
+
+**Changed**
+- The project was renamed from undertone to eridian: package, CLI, MCP server and docs. The `UNDERTONE_*` environment variables and the `~/.undertone` state folder are no longer read. `eridian migrate` moves the old state folder (refuses while attach runs; `--dry-run` to preview).
+
+**Fixed**
+- `eridian attach` no longer opens the no-wake-word follow-up window after an announcement. "Claude finished." fires after every session turn, so room conversation could chain turns into a session without the wake word (seen live 2026-11-05). The window now opens only after the first answer to a turn started by the wake word.
+- `eridian chat` had the same chain: every reply opened the window, so a reply to a no-wake turn opened another. It now follows the same rule.
 
 ### 2026-11-04 — Echo text guard (live test: own voice heard as `you:`)
 

@@ -36,7 +36,7 @@ PIPER_MODEL_URL="https://github.com/rhasspy/piper-sample-generator/releases/down
 # because upstream publishes no checksum. train.sh unpickles this file, so it is
 # verified here and again before every generation run.
 PIPER_MODEL_SHA256="e95ee53770bf598c354a6e6dbfc95ccb259aeeb501d35a86be8a767429ab0ff6"
-# The PyPI universal2 wheel replaces the notebook's macOS fork, which no longer builds with current clang; it is the version pymicro-wakeword pulls in for undertone's runtime.
+# The PyPI universal2 wheel replaces the notebook's macOS fork, which no longer builds with current clang; it is the version pymicro-wakeword pulls in for eridian's runtime.
 PYMICRO_FEATURES_SPEC="pymicro-features==2.0.2"
 AUDIO_METADATA_SPEC="git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f"
 AUDIOSET_URL="https://huggingface.co/datasets/agkphysics/AudioSet/resolve/main/data/bal_train/09.parquet"

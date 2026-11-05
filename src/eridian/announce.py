@@ -1,6 +1,6 @@
-"""Claude Code hook command that tells `undertone attach` to speak a short announcement.
+"""Claude Code hook command that tells `eridian attach` to speak a short announcement.
 
-Usage: python -P -m undertone.announce {stop,stopfailure,permissionrequest} --home HOME --session TOKEN
+Usage: python -P -m eridian.announce {stop,stopfailure,permissionrequest} --home HOME --session TOKEN
 (stdin = the hook payload JSON).
 
 It sends one line to `<HOME>/voice.sock`:

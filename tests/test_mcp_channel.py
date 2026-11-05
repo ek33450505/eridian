@@ -1,4 +1,4 @@
-"""Tests for undertone.mcp_channel: JSON-RPC handling and the voice-socket bridge."""
+"""Tests for eridian.mcp_channel: JSON-RPC handling and the voice-socket bridge."""
 
 import io
 import json
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import mcp_channel, voice_guard
+from eridian import mcp_channel, voice_guard
 
 
 class _FakeVoice:
@@ -76,7 +76,7 @@ class _Pipes:
             socket_path,
             reconnect_s=reconnect_s,
             session_token=token,
-            undertone_home=home,
+            eridian_home=home,
         )
         self.rc: list[int] = []
         self.raw: list[str] = []
@@ -118,7 +118,7 @@ class ChannelTestCase(unittest.TestCase):
         self.sock_path = self.home / "voice.sock"
         if len(str(self.sock_path)) >= 100:
             self.skipTest(f"socket path too long for AF_UNIX: {self.sock_path}")
-        patch = mock.patch.dict(os.environ, {"UNDERTONE_HOME": self._dir})
+        patch = mock.patch.dict(os.environ, {"ERIDIAN_HOME": self._dir})
         patch.start()
         self.addCleanup(patch.stop)
         self.addCleanup(self._rmtree)
@@ -172,7 +172,7 @@ class ProtocolTest(ChannelTestCase):
         self.assertEqual(result["protocolVersion"], "2025-11-25")
         self.assertEqual(result["capabilities"]["experimental"], {"claude/channel": {}})
         self.assertIn("tools", result["capabilities"])
-        self.assertEqual(result["serverInfo"]["name"], "undertone")
+        self.assertEqual(result["serverInfo"]["name"], "eridian")
         self.assertIn("`reply`", result["instructions"])
         self.assertIn("confirm", result["instructions"])
         self.assertNotIn("hey jarvis, confirm", result["instructions"])
@@ -300,7 +300,7 @@ class ReplyToolTest(ChannelTestCase):
         p = self.start()
         result = self._call(p, {"text": "Hello"})
         self.assertTrue(result["isError"])
-        self.assertIn("undertone attach", result["content"][0]["text"])
+        self.assertIn("eridian attach", result["content"][0]["text"])
 
     def test_empty_or_bad_text_is_error(self) -> None:
         p = self.start(with_voice=True)
@@ -492,8 +492,16 @@ class InstructionsTest(unittest.TestCase):
             text = mcp_channel.build_instructions(safe_phrase)
             self.assertIn("use WebSearch: it runs on a voice turn with no confirmation", text)
             self.assertIn("Do not use curl, wget or WebFetch for lookups", text)
-            self.assertIn('ToolSearch "select:mcp__undertone__reply"', text)
+            self.assertIn('ToolSearch "select:mcp__eridian__reply"', text)
             self.assertIn("never answer a voice message in text only", text)
+
+    def test_refusal_string_matches_what_the_guard_emits(self):
+        prefix = voice_guard.DENY_REASON.partition(":")[0]
+        self.assertTrue(prefix)
+        self.assertTrue(voice_guard.HOME_DENY_REASON.startswith(prefix + ":"))
+        for safe_phrase in (False, True):
+            text = mcp_channel.build_instructions(safe_phrase)
+            self.assertIn(f'refused by "{prefix}"', text)
 
 
 class ReadBackTest(unittest.TestCase):
@@ -514,7 +522,7 @@ class ReadBackTest(unittest.TestCase):
             stdout=self.stdout,
             socket_path=self.home / "none.sock",
             session_token=self.token,
-            undertone_home=self.home,
+            eridian_home=self.home,
         )
         self.sent: list[dict] = []
         self.server._send_voice = lambda obj: self.sent.append(obj) or True
@@ -582,7 +590,7 @@ class SafePhraseTest(unittest.TestCase):
             stdout=self.stdout,
             socket_path=self.home / "none.sock",
             session_token=self.token,
-            undertone_home=self.home,
+            eridian_home=self.home,
         )
         self.sent: list[dict] = []
         server._send_voice = lambda obj: self.sent.append(obj) or True
@@ -629,7 +637,7 @@ class SafePhraseTest(unittest.TestCase):
         voice_guard.set_safe_phrase(self.home, self.PHRASE)
         server = mcp_channel.ChannelServer(
             stdin=io.StringIO(), stdout=io.StringIO(), socket_path=self.home / "none.sock",
-            undertone_home=self.home,
+            eridian_home=self.home,
         )
         server._handle_initialize(1, {})
         self.assertFalse(server._safe_phrase)
@@ -644,8 +652,8 @@ class SafePhraseTest(unittest.TestCase):
             voice_guard.SAFE_PHRASE_MARKER,
         )
         text = result["content"][0]["text"]
-        self.assertTrue(text.startswith("Spoken aloud. undertone will accept only the user's safe phrase."))
-        self.assertIn("undertone also read back, in its own voice, before your words: ", text)
+        self.assertTrue(text.startswith("Spoken aloud. eridian will accept only the user's safe phrase."))
+        self.assertIn("eridian also read back, in its own voice, before your words: ", text)
         self.assertIn(self.sent[0]["check"], text)
 
     def test_two_word_confirm_without_phrase_still_fails(self) -> None:
@@ -660,8 +668,8 @@ class SafePhraseTest(unittest.TestCase):
         self.initialize(server)
         result = self.confirm(server, "To delete x, say the wake word, then 'confirm walnut lantern'.")
         text = result["content"][0]["text"]
-        self.assertIn("undertone will accept only 'confirm walnut lantern'.", text)
-        self.assertIn("undertone also read back, in its own voice, before your words: ", text)
+        self.assertIn("eridian will accept only 'confirm walnut lantern'.", text)
+        self.assertIn("eridian also read back, in its own voice, before your words: ", text)
 
     def test_utterance_is_redacted_and_still_grants(self) -> None:
         server = self.make(True)

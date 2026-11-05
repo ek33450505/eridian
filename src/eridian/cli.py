@@ -1,4 +1,4 @@
-"""Command-line entry point: `undertone <command>`."""
+"""Command-line entry point: `eridian <command>`."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from . import paths, persona, wake
 _WAKE_CUE = "/System/Library/Sounds/Tink.aiff"
 _FOLLOW_UP_CUE = "/System/Library/Sounds/Pop.aiff"
 
-# Commands that use the wake word; a bad UNDERTONE_WAKE_MODEL stops them at startup.
+# Commands that use the wake word; a bad ERIDIAN_WAKE_MODEL stops them at startup.
 _WAKE_COMMANDS = frozenset({"attach", "chat", "launch", "listen", "session"})
 
 
@@ -90,19 +90,19 @@ def _too_broad_or_sensitive(r: Path, h: Path) -> bool:
     return len(rel) == 1 and rel[0] in _SENSITIVE_HOME_DIRS
 
 
-def chat_workdir(cwd: Path, home: Path, undertone_home: Path) -> tuple[Path, bool]:
+def chat_workdir(cwd: Path, home: Path, eridian_home: Path) -> tuple[Path, bool]:
     """Pick the (resolved) directory Claude's file tools are confined to.
 
     Home, its ancestors, `/`, dot-directories and Library under home, and the
     top-level Documents/Desktop/Downloads are too broad or sensitive to expose
     to voice-driven file reads, so those fall back to a private workspace under
-    ~/.undertone. Returns (workdir, substituted); raises WorkdirError if the
+    ~/.eridian. Returns (workdir, substituted); raises WorkdirError if the
     workspace path is a symlink.
     """
     resolved = cwd.resolve()
     if not _too_broad_or_sensitive(resolved, home.resolve()):
         return resolved, False
-    workspace = undertone_home / "workspace"
+    workspace = eridian_home / "workspace"
     workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
     if workspace.is_symlink():
         raise WorkdirError(f"{workspace} is a symlink; refusing to use it as the chat workspace")
@@ -143,26 +143,26 @@ class AudioIO:
 
 
 def _say_voices() -> tuple[str, str]:
-    """(reply voice, undertone's own voice) for `say`, with the same defaults build_say_argv uses."""
+    """(reply voice, eridian's own voice) for `say`, with the same defaults build_say_argv uses."""
     return (
-        os.environ.get("UNDERTONE_VOICE") or "Evan (Enhanced)",
-        os.environ.get("UNDERTONE_OWN_VOICE") or "Samantha",
+        os.environ.get("ERIDIAN_VOICE") or "Evan (Enhanced)",
+        os.environ.get("ERIDIAN_OWN_VOICE") or "Samantha",
     )
 
 
 def _say_voice_label() -> str:
     reply, own = _say_voices()
-    return f"say ({reply}; undertone's own voice: {own})"
+    return f"say ({reply}; eridian's own voice: {own})"
 
 
 class OwnVoiceError(Exception):
-    """undertone's own voice is part of Claude's voice: read-backs would be indistinguishable."""
+    """eridian's own voice is part of Claude's voice: read-backs would be indistinguishable."""
 
 
 def _same_say_voice_message(name: str) -> str:
     return (
-        f"undertone's own voice is the same as the reply voice ({name}); "
-        "set UNDERTONE_VOICE or UNDERTONE_OWN_VOICE so they differ"
+        f"eridian's own voice is the same as the reply voice ({name}); "
+        "set ERIDIAN_VOICE or ERIDIAN_OWN_VOICE so they differ"
     )
 
 
@@ -206,19 +206,19 @@ def make_audio_io(
         from .kokoro import KokoroUnavailable
 
         try:
-            espeak = os.environ.get("UNDERTONE_ESPEAK_CMD", "espeak-ng")
+            espeak = os.environ.get("ERIDIAN_ESPEAK_CMD", "espeak-ng")
             if shutil.which(espeak) is None:
                 raise KokoroUnavailable("espeak-ng not found; install it with `brew install espeak-ng`")
             voice = (kokoro_factory or _load_kokoro_voice)()
         except KokoroUnavailable as exc:
-            print(f"undertone: Kokoro voice unavailable ({exc}); using say", file=err, flush=True)
+            print(f"eridian: Kokoro voice unavailable ({exc}); using say", file=err, flush=True)
 
     if voice is not None:
         if voice.own_voice in voice.voice_names:
             # Fail closed: the confirm read-back is only trustworthy if it sounds unlike Claude.
             raise OwnVoiceError(
-                f"undertone's own voice ({voice.own_voice}) is part of the reply voice "
-                f"({voice.voice}); set UNDERTONE_KOKORO_OWN_VOICE or UNDERTONE_KOKORO_VOICE "
+                f"eridian's own voice ({voice.own_voice}) is part of the reply voice "
+                f"({voice.voice}); set ERIDIAN_KOKORO_OWN_VOICE or ERIDIAN_KOKORO_VOICE "
                 "so they differ"
             )
     else:
@@ -235,7 +235,7 @@ def make_audio_io(
 
     def on_error(exc: BaseException) -> None:
         print(
-            f"undertone: the wake-word screen failed ({exc}); speech stays muted until restart",
+            f"eridian: the wake-word screen failed ({exc}); speech stays muted until restart",
             file=err,
             flush=True,
         )
@@ -253,7 +253,7 @@ def make_audio_io(
         talk_over=True,
         engine=engine,
         voice_label=(
-            f"Kokoro ({voice.voice}; undertone's own voice: {voice.own_voice})"
+            f"Kokoro ({voice.voice}; eridian's own voice: {voice.own_voice})"
             if voice
             else _say_voice_label()
         ),
@@ -269,7 +269,7 @@ def banner_line(io: AudioIO) -> str:
 
 
 AUDIO_START_ERROR = (
-    "undertone: cannot open the audio devices for echo cancellation: {exc}. Try --no-aec."
+    "eridian: cannot open the audio devices for echo cancellation: {exc}. Try --no-aec."
 )
 
 
@@ -286,7 +286,7 @@ def _cmd_listen(args: argparse.Namespace) -> int:
     try:
         stt = ParakeetSTT()
     except ModelNotCachedError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
 
     from pysilero_vad import SileroVoiceActivityDetector
@@ -322,7 +322,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     try:
         stt = ParakeetSTT()
     except ModelNotCachedError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
 
     from pysilero_vad import SileroVoiceActivityDetector
@@ -332,7 +332,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     try:
         workdir, substituted = chat_workdir(Path.cwd(), Path.home(), paths.home_dir())
     except WorkdirError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
 
     def brain_factory(resume: str | None) -> brain.ClaudeBrain:
@@ -345,7 +345,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     try:
         io = make_audio_io(args.no_aec, tts=args.tts)
     except OwnVoiceError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
     session = ChatSession(
         wake_factory=_make_wake_factory(),
@@ -361,7 +361,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         talk_over=io.talk_over,
     )
 
-    print(f"undertone chat: working in {workdir}")
+    print(f"eridian chat: working in {workdir}")
     if substituted:
         print(
             f"  ({Path.cwd()} is too broad or too sensitive to expose to "
@@ -390,12 +390,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
 
 def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
-    """MCP config that launches the channel server with the same UNDERTONE_HOME.
+    """MCP config that launches the channel server with the same ERIDIAN_HOME.
 
     The channel gets the resolved wake PHRASE (never the model path): it only needs
     the words for its instructions, and this keeps it from loading the manifest.
     """
-    env = {"UNDERTONE_HOME": str(home), "UNDERTONE_SESSION": token}
+    env = {"ERIDIAN_HOME": str(home), "ERIDIAN_SESSION": token}
     phrase = wake.current()
     if not phrase.is_default:
         env[wake.PHRASE_ENV] = phrase.phrase
@@ -404,10 +404,10 @@ def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
         env[persona.PERSONA_ENV] = persona_name
     return {
         "mcpServers": {
-            "undertone": {
+            "eridian": {
                 "command": executable,
                 # -P: keep the session cwd off sys.path so a hostile checkout can't shadow us.
-                "args": ["-P", "-m", "undertone.cli", "channel"],
+                "args": ["-P", "-m", "eridian.cli", "channel"],
                 "env": env,
             }
         }
@@ -420,14 +420,14 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
 
     def _hook_cmd(event: str) -> str:
         parts = [
-            executable, "-P", "-m", "undertone.voice_guard", event,
+            executable, "-P", "-m", "eridian.voice_guard", event,
             "--home", str(home), "--session", token,
         ]
         return " ".join(shlex.quote(x) for x in parts)
 
     def _announce(event: str) -> dict:
         parts = [
-            executable, "-P", "-m", "undertone.announce", event,
+            executable, "-P", "-m", "eridian.announce", event,
             "--home", str(home), "--session", token,
         ]
         # Async and output-free: an announce hook can never block Claude or decide a permission.
@@ -490,7 +490,7 @@ def voice_guard_settings(executable: str, home: Path, token: str) -> dict:
 def build_session_argv(
     mcp_json: str, settings_json: str, rest: Sequence[str], claude_cmd: str = "claude"
 ) -> list[str]:
-    """argv for an interactive claude session with the undertone channel loaded.
+    """argv for an interactive claude session with the eridian channel loaded.
 
     The reply tool is pre-approved, so a voice-driven turn can speak without a
     permission prompt but nothing else is auto-allowed. The voice guard's hooks
@@ -503,9 +503,9 @@ def build_session_argv(
         "--settings",
         settings_json,
         "--dangerously-load-development-channels",
-        "server:undertone",
+        "server:eridian",
         "--allowedTools",
-        "mcp__undertone__reply",
+        "mcp__eridian__reply",
         *rest,
     ]
 
@@ -529,11 +529,11 @@ def _cmd_session(args: argparse.Namespace) -> int:
 
 
 def _persona_refused() -> bool:
-    """Print the error and return True if UNDERTONE_PERSONA is invalid (voice sessions only)."""
+    """Print the error and return True if ERIDIAN_PERSONA is invalid (voice sessions only)."""
     try:
         persona.resolve()
     except persona.PersonaError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return True
     return False
 
@@ -546,7 +546,7 @@ def _exec_session(rest: list[str], *, warn_no_voice: bool) -> int:
         if arg in _REFUSED_SESSION_FLAGS or arg.startswith("--settings="):
             flag = arg.split("=", 1)[0]
             print(
-                f"undertone: remove {flag}: undertone session sets the voice guard's "
+                f"eridian: remove {flag}: eridian session sets the voice guard's "
                 "settings itself",
                 file=sys.stderr,
             )
@@ -557,11 +557,11 @@ def _exec_session(rest: list[str], *, warn_no_voice: bool) -> int:
     settings_json = json.dumps(voice_guard_settings(sys.executable, home, token))
     if warn_no_voice and not _voice_socket_present(paths.voice_socket_path()):
         print(
-            "undertone: no voice process is listening -- start `undertone attach` "
+            "eridian: no voice process is listening -- start `eridian attach` "
             "in another terminal to talk",
             file=sys.stderr,
         )
-    claude_cmd = os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"
+    claude_cmd = os.environ.get("ERIDIAN_CLAUDE_CMD") or "claude"
     argv = build_session_argv(mcp_json, settings_json, rest, claude_cmd)
     # Replies reach the user through the channel's `reply` tool.
     # Scrub the env vars that --bare / --safe-mode set, since they may disable hooks.
@@ -595,7 +595,7 @@ def launch_mode(
     option's value can precede it (`--model x mcp list`), and a stray prompt that
     happens to equal a subcommand name failing safe to plain claude is harmless.
     """
-    if env.get("UNDERTONE_AUTOLAUNCH") == "0" or not (stdin_tty and stdout_tty):
+    if env.get("ERIDIAN_AUTOLAUNCH") == "0" or not (stdin_tty and stdout_tty):
         return "passthrough"
     for arg in argv:
         if arg in _PASSTHROUGH_FLAGS or arg.startswith("--settings="):
@@ -605,10 +605,10 @@ def launch_mode(
     return "voice"
 
 
-def _pid_is_attach(pid: int) -> bool:
-    """True if pid is alive and its command line is an undertone attach."""
+def _ps_command(pid: int) -> str:
+    """The command line of pid per `ps`, or "" if it cannot be read."""
     try:
-        out = subprocess.run(
+        return subprocess.run(
             ["ps", "-o", "command=", "-p", str(pid)],
             capture_output=True,
             text=True,
@@ -616,15 +616,20 @@ def _pid_is_attach(pid: int) -> bool:
             check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return False
-    # Match tokens, not substrings: `tail -f ~/.undertone/attach.log` must not pass.
+        return ""
+
+
+def _pid_is_attach(pid: int) -> bool:
+    """True if pid is alive and its command line is an eridian attach."""
+    out = _ps_command(pid)
+    # Match tokens, not substrings: `tail -f ~/.eridian/attach.log` must not pass.
     return bool(
-        re.search(r"(?:^|/)undertone attach(?:\s|$)|-m undertone attach(?:\s|$)", out)
+        re.search(r"(?:^|/)eridian attach(?:\s|$)|-m eridian attach(?:\s|$)", out)
     )
 
 
 def _ensure_attach() -> None:
-    """Spawn a background `undertone attach` unless one answers or is still starting.
+    """Spawn a background `eridian attach` unless one answers or is still starting.
 
     flock serializes terminals starting together. The child's pid is written to the
     pidfile at spawn, so a second terminal during the model load sees a live attach
@@ -637,7 +642,7 @@ def _ensure_attach() -> None:
     try:
         _spawn_attach_locked(voice)
     except OSError as exc:
-        print(f"undertone: could not start voice in the background: {exc}", file=sys.stderr)
+        print(f"eridian: could not start voice in the background: {exc}", file=sys.stderr)
 
 
 def _spawn_attach_locked(voice) -> None:
@@ -659,7 +664,7 @@ def _spawn_attach_locked(voice) -> None:
         try:
             os.fchmod(log_fd, 0o600)  # tighten a pre-existing log
             child = subprocess.Popen(
-                [sys.executable, "-m", "undertone", "attach"],
+                [sys.executable, "-m", "eridian", "attach"],
                 stdin=subprocess.DEVNULL,
                 stdout=log_fd,
                 stderr=log_fd,
@@ -670,7 +675,7 @@ def _spawn_attach_locked(voice) -> None:
             os.close(log_fd)
         paths.write_attach_pid(child.pid)
         print(
-            f"undertone: starting voice in the background (log: {log_path})",
+            f"eridian: starting voice in the background (log: {log_path})",
             file=sys.stderr,
         )
     finally:
@@ -687,7 +692,7 @@ def _cmd_launch(args: argparse.Namespace) -> int:
             return 1
         _ensure_attach()
         return _exec_session(rest, warn_no_voice=False)
-    claude_cmd = os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"
+    claude_cmd = os.environ.get("ERIDIAN_CLAUDE_CMD") or "claude"
     os.execvpe(claude_cmd, [claude_cmd, *rest], os.environ)
     return 1  # unreachable: execvpe replaces the process
 
@@ -696,11 +701,11 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     del args
     pid = paths.read_attach_pid()
     if pid is None:
-        print("undertone: no attach pidfile; nothing to stop")
+        print("eridian: no attach pidfile; nothing to stop")
         return 0
     if not _pid_is_attach(pid):
         print(
-            f"undertone: pid {pid} is not an undertone attach (stale pidfile?); "
+            f"eridian: pid {pid} is not an eridian attach (stale pidfile?); "
             "not signalling it",
             file=sys.stderr,
         )
@@ -708,29 +713,29 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:
-        print(f"undertone: could not stop attach (pid {pid}): {exc}", file=sys.stderr)
+        print(f"eridian: could not stop attach (pid {pid}): {exc}", file=sys.stderr)
         return 1
-    print(f"undertone: sent SIGTERM to attach (pid {pid})")
+    print(f"eridian: sent SIGTERM to attach (pid {pid})")
     return 0
 
 
 def _cmd_shell_init(args: argparse.Namespace) -> int:
     del args
     exe = Path(sys.argv[0]).absolute()
-    if exe.name != "undertone":  # e.g. `python -m undertone`: use the venv script
-        exe = Path(sys.executable).absolute().parent / "undertone"
+    if exe.name != "eridian":  # e.g. `python -m eridian`: use the venv script
+        exe = Path(sys.executable).absolute().parent / "eridian"
     fn = f"claude() {{ {shlex.quote(str(exe))} launch -- \"$@\"; }}"
     print(
         "# `command claude` bypasses this function and runs plain claude.\n"
         f"{fn}\n"
         "# cmux redefines claude() at the first prompt (its _cmux_fix_path precmd hook); "
         "re-assert ours once, after it.\n"
-        "_undertone_claude_precmd() {\n"
+        "_eridian_claude_precmd() {\n"
         f"  {fn}\n"
-        "  add-zsh-hook -d precmd _undertone_claude_precmd\n"
+        "  add-zsh-hook -d precmd _eridian_claude_precmd\n"
         "}\n"
         "autoload -Uz add-zsh-hook\n"
-        "add-zsh-hook precmd _undertone_claude_precmd"
+        "add-zsh-hook precmd _eridian_claude_precmd"
     )
     return 0
 
@@ -745,6 +750,149 @@ def _voice_socket_present(sock_path: Path) -> bool:
         return stat.S_ISSOCK(sock_path.stat().st_mode)
     except OSError:
         return False
+
+
+def _symlink_in(path: Path) -> Path | None:
+    """The first component of path (itself included) that is a symlink, else None.
+
+    Walks every component, anchored or relative. A missing component ends the
+    walk (nothing below it exists); any other lstat error propagates as OSError.
+    """
+    probe = Path(path.anchor)
+    parts = path.parts[1:] if path.anchor else path.parts
+    for part in parts:
+        probe = probe / part
+        try:
+            if stat.S_ISLNK(os.lstat(probe).st_mode):
+                return probe
+        except FileNotFoundError:
+            return None
+    return None
+
+
+def _pid_is_legacy_attach(pid: int) -> bool:
+    """True if pid is alive and runs a pre-rename `undertone attach`."""
+    return bool(
+        re.search(
+            r"(?:^|/)undertone attach(?:\s|$)|-m undertone attach(?:\s|$)",
+            _ps_command(pid),
+        )
+    )
+
+
+def _attach_live_in(folder: Path) -> str | None:
+    """Why folder looks like it has a running attach, else None (no connect)."""
+    try:
+        pid = int((folder / "attach.pid").read_text().strip())
+    except (OSError, ValueError):
+        pid = None
+    if pid is not None and (_pid_is_attach(pid) or _pid_is_legacy_attach(pid)):
+        return f"an attach is running (pid {pid}; run `eridian stop` first)"
+    sock = folder / "voice.sock"
+    if _voice_socket_present(sock):
+        return (
+            f"{sock} exists, so an attach may be running; if no attach is "
+            f"running, remove {sock} and retry"
+        )
+    return None
+
+
+def _migrate(source: Path, target: Path, *, dry_run: bool) -> int:
+    """Fail-closed, atomic move of the pre-rename state folder to target.
+
+    Refuses (exit 1, nothing changed) on symlinks, wrong owner, a non-empty
+    target, a running attach, or a cross-filesystem move. The only thing ever
+    removed is an empty target directory.
+    """
+
+    def refuse(msg: str) -> int:
+        print(f"eridian: migrate refused: {msg}", file=sys.stderr)
+        return 1
+
+    if not target.is_absolute():
+        return refuse("ERIDIAN_HOME must be an absolute path")
+    try:
+        src_st = os.lstat(source)
+    except FileNotFoundError:
+        print(f"eridian: {source} does not exist; nothing to migrate")
+        return 0
+    except OSError as exc:
+        return refuse(f"cannot inspect {source}: {exc}")
+    try:
+        for path in (source, target):
+            link = _symlink_in(path)
+            if link is not None:
+                return refuse(f"{link} is a symlink")
+    except OSError as exc:
+        return refuse(f"cannot inspect {path}: {exc}")
+    if not stat.S_ISDIR(src_st.st_mode):
+        return refuse(f"{source} is not a directory")
+    uid = os.getuid()
+    if src_st.st_uid != uid:
+        return refuse(f"{source} is not owned by the current user")
+    try:
+        parent_st = os.lstat(target.parent)
+    except OSError as exc:
+        return refuse(f"cannot inspect {target.parent}: {exc}")
+    if parent_st.st_uid != uid:
+        return refuse(f"{target.parent} is not owned by the current user")
+    if parent_st.st_mode & 0o022:
+        return refuse(f"{target.parent} is group- or world-writable")
+    target_exists = True
+    try:
+        tgt_st = os.lstat(target)
+    except FileNotFoundError:
+        target_exists = False
+        tgt_st = parent_st
+    except OSError as exc:
+        return refuse(f"cannot inspect {target}: {exc}")
+    if target_exists:
+        if not stat.S_ISDIR(tgt_st.st_mode):
+            return refuse(f"{target} exists and is not a directory")
+        if tgt_st.st_uid != uid:
+            return refuse(f"{target} is not owned by the current user")
+    for folder in (source, target) if target_exists else (source,):
+        reason = _attach_live_in(folder)
+        if reason is not None:
+            return refuse(reason)
+    try:
+        if target_exists and any(target.iterdir()):
+            return refuse(f"{target} is not empty")
+    except OSError as exc:
+        return refuse(f"cannot read {target}: {exc}")
+    if src_st.st_dev != tgt_st.st_dev:
+        return refuse(f"{source} and {target} are on different filesystems")
+    if dry_run:
+        print(f"eridian: would move {source} -> {target} (dry run; nothing changed)")
+        return 0
+    try:
+        if target_exists:
+            target.rmdir()
+        os.rename(source, target)
+    except OSError as exc:
+        return refuse(f"could not move {source} -> {target}: {exc}")
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(
+            f"eridian: migrated to {target} but could not set mode 0700: {exc}; "
+            f"fix with chmod 700 {target}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"moved {source} -> {target}")
+    return 0
+
+
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    # The one place that names the pre-rename ~/.undertone folder.
+    return _migrate(
+        Path.home() / ".undertone", paths.home_path(), dry_run=args.dry_run
+    )
 
 
 def _cmd_attach(args: argparse.Namespace) -> int:
@@ -763,16 +911,16 @@ def _cmd_models_fetch(args: argparse.Namespace) -> int:
     del args
     from . import kokoro, stt
 
-    print(f"undertone: fetching {stt.MODEL_ID} (contacts the Hugging Face Hub)...")
+    print(f"eridian: fetching {stt.MODEL_ID} (contacts the Hugging Face Hub)...")
     stt.fetch_model()
     print(
-        "undertone: fetching onnx-community/Kokoro-82M-v1.0-ONNX (Kokoro voice, "
+        "eridian: fetching onnx-community/Kokoro-82M-v1.0-ONNX (Kokoro voice, "
         "about 330 MB; contacts the Hugging Face Hub)..."
     )
     kokoro.fetch_model()
-    print("undertone: models cached")
+    print("eridian: models cached")
     if shutil.which("espeak-ng") is None:
-        print("undertone: the Kokoro voice also needs espeak-ng: brew install espeak-ng")
+        print("eridian: the Kokoro voice also needs espeak-ng: brew install espeak-ng")
     return 0
 
 
@@ -801,7 +949,7 @@ def _cmd_safe_phrase(args: argparse.Namespace) -> int:
         if not sys.stdin.isatty():
             # getpass falls back to an echoed prompt without a TTY, which would print the phrase.
             print(
-                "undertone safe-phrase needs an interactive terminal so your phrase stays hidden.",
+                "eridian safe-phrase needs an interactive terminal so your phrase stays hidden.",
                 file=sys.stderr,
             )
             return 2
@@ -827,7 +975,7 @@ def _cmd_safe_phrase(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 1
     print(
-        "Safe phrase set. Restart `undertone attach` and `undertone session` to use it. "
+        "Safe phrase set. Restart `eridian attach` and `eridian session` to use it. "
         "Voice confirms are now: the wake word, then your safe phrase.\n"
         "Keep it private: anyone who hears it can use it to confirm."
     )
@@ -835,7 +983,7 @@ def _cmd_safe_phrase(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="undertone")
+    parser = argparse.ArgumentParser(prog="eridian")
     sub = parser.add_subparsers(dest="command", required=True)
 
     listen_parser = sub.add_parser(
@@ -873,7 +1021,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tts",
         choices=["kokoro", "say"],
         default="kokoro",
-        help="voice engine: kokoro (default; needs `undertone models fetch` and "
+        help="voice engine: kokoro (default; needs `eridian models fetch` and "
         "espeak-ng) or the macOS say voice",
     )
     chat_parser.set_defaults(func=_cmd_chat)
@@ -896,9 +1044,18 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("claude_args", nargs=argparse.REMAINDER)
     launch_parser.set_defaults(func=_cmd_launch)
 
-    sub.add_parser("stop", help="stop the background `undertone attach`").set_defaults(
+    sub.add_parser("stop", help="stop the background `eridian attach`").set_defaults(
         func=_cmd_stop
     )
+
+    migrate_parser = sub.add_parser(
+        "migrate",
+        help="move the pre-rename ~/.undertone state folder to the eridian home",
+    )
+    migrate_parser.add_argument(
+        "--dry-run", action="store_true", help="run every check, change nothing"
+    )
+    migrate_parser.set_defaults(func=_cmd_migrate)
 
     shell_parser = sub.add_parser(
         "shell-init", help="print shell code that makes `claude` autolaunch voice"
@@ -908,7 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach_parser = sub.add_parser(
         "attach",
-        help="listen for the wake word ('hey jarvis' by default) and send speech to the latest `undertone session`",
+        help="listen for the wake word ('hey jarvis' by default) and send speech to the latest `eridian session`",
     )
     attach_parser.add_argument(
         "--no-beep", action="store_true", help="skip the audible wake/follow-up cues"
@@ -931,7 +1088,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tts",
         choices=["kokoro", "say"],
         default="kokoro",
-        help="voice engine: kokoro (default; needs `undertone models fetch` and "
+        help="voice engine: kokoro (default; needs `eridian models fetch` and "
         "espeak-ng) or the macOS say voice",
     )
     attach_parser.add_argument(
@@ -978,7 +1135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             wake.resolve()
         except wake.WakeWordError as exc:
-            print(f"undertone: {exc}", file=sys.stderr)
+            print(f"eridian: {exc}", file=sys.stderr)
             return 1
     return args.func(args)
 

@@ -1,7 +1,7 @@
 """The Path A voice bridge: mic + speech on one side of a unix socket, a Claude
 Code Channel MCP server (mcp_channel.py) on the other.
 
-`undertone attach` runs this process. "hey jarvis" plus a spoken question is
+`eridian attach` runs this process. "hey jarvis" plus a spoken question is
 transcribed on-device and sent to the attached channel as an `utterance`; the
 channel injects it into Ed's interactive Claude Code session, Claude answers by
 calling the channel's `reply` tool, and the channel sends the text back as a
@@ -15,7 +15,7 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"[,"check":"..."]}
                                                                     (any number; `check` is
                         honoured on a confirm only: what the voice guard blocked,
-                        spoken in undertone's own voice before Claude's words)
+                        spoken in eridian's own voice before Claude's words)
     voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                        (`via` = what opened the turn; the channel lets only "wake"
                         satisfy a confirm phrase)
@@ -40,11 +40,23 @@ an utterance is next sent to the channel -- because a no-wake-word follow-up
 window must never be able to burn a pending confirm challenge. Any announce is
 skipped while the listener is not IDLE or if the same event was spoken within
 ANNOUNCE_REPEAT_S. An announcement queues behind current speech (never stops
-it), bumps the generation, and plays with talk-over off. Only "finished" opens
-the follow-up window (as an `answer` does).
+it), bumps the generation, and plays with talk-over off. No announcement
+(including "finished") ever opens the follow-up window: a session's Stop hook
+fires after every turn, so ambient speech in such a window would chain turns.
 
 Reply `kind` gates the no-wake-word follow-up window: only an `answer` (the
-default when `kind` is missing) opens it, once its speech goes idle. `ack` (an
+default when `kind` is missing) opens it, once its speech goes idle, and only
+as a one-shot credit: when an utterance is sent, its `via` is remembered, and
+the first non-`ack` reply afterwards spends it. Only "wake" / "wake_barge_in"
+credit a window; an answer to a `follow_up` or `talk_over` turn, a second or
+unprompted answer, one landing after an announcement or barge-in, or one with
+no known origin opens none, so ambient audio can never chain windows. The
+protocol carries no turn ids, so the bridge grants a window only when exactly
+one utterance is outstanding (sent, not yet answered; reset by "finished", a
+detach or a new hello) and the credit is under REPLY_WINDOW_CREDIT_TTL_S old;
+any ambiguity fails closed (no window). A reset on Stop can let the answer to a
+still-queued follow_up spend a wake credit sent right after it (one short
+window, no chaining, no grant); closing that needs turn ids in the protocol. `ack` (an
 early "running the tests now") never does, and neither does `confirm` -- a
 spoken confirmation prompt must not be answerable by ambient audio (a video
 saying "yes") inside an open mic window, so it needs a fresh wake word. An
@@ -63,7 +75,7 @@ has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
 if nothing is left it is dropped instead of sent.
 
 Echo text guard: a `talk_over` or `follow_up` turn (never a wake turn) whose
-transcript mostly repeats what undertone itself just said (replies, read-backs,
+transcript mostly repeats what eridian itself just said (replies, read-backs,
 announcements; numbers compared as digits, so "ninety three" matches "93") is
 dropped and printed as `[dropped: echo of own speech]`, because a live speaker
 leaks more than the offline AEC check shows. It only drops: it never changes
@@ -77,7 +89,7 @@ SELF_WAKE_GUARD_S after we stopped, may be our own voice tripping the detector
 that turn is tagged `wake_barge_in` and can never grant a confirmation; only a
 wake word heard after a full second of silence can.
 While a confirmation is pending, a `wake_barge_in` turn is held, not sent (it
-could not grant, and sending it would use up the challenge): undertone says so
+could not grant, and sending it would use up the challenge): eridian says so
 and the user repeats the wake word after a moment.
 
 Unknown types and malformed lines are ignored; a failure in one connection never
@@ -95,7 +107,7 @@ serializes writers on that one socket and is bounded).
 
 Test seams: every collaborator (`wake_factory`, `vad`, `stt`, `clock`,
 `player_factory`, `socket_path`, `cue`, `out`) is injected; tests/test_voice.py
-uses fakes plus a real unix socket in a temp UNDERTONE_HOME -- no mic, speaker,
+uses fakes plus a real unix socket in a temp ERIDIAN_HOME -- no mic, speaker,
 or real `claude`.
 """
 
@@ -127,7 +139,7 @@ from . import voice_guard
 from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
-NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
+NO_SESSION_SPEECH = "No Claude session is attached. Start one with eridian session."
 WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
 WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
@@ -145,6 +157,8 @@ ANNOUNCE_LEVELS = {
     "off": frozenset(),
 }
 ANNOUNCE_REPEAT_S = 3.0  # the same event is not spoken twice within this
+WAKE_TURN_VIAS = ("wake", "wake_barge_in")  # turns whose answer may open the no-wake window
+REPLY_WINDOW_CREDIT_TTL_S = 600.0  # a window credit older than this is void (ack-ed long work still fits)
 
 _BACKLOG = 32  # above MAX_CONNECTIONS so the cap, not the kernel queue, is the limit
 MAX_CONNECTIONS = 16
@@ -157,7 +171,7 @@ MAX_CHECK_CHARS = 600  # a confirm reply's read-back is ~400 chars at most
 SELF_WAKE_GUARD_S = 1.0
 _SELF_WAKE_GUARD_MAX_S = 10.0
 # Text guard for turns with no wake word (talk_over, follow_up): the transcript
-# is compared with what undertone itself said. A turn is checked only if it
+# is compared with what eridian itself said. A turn is checked only if it
 # opened while we were speaking or within ECHO_GUARD_S after the player went
 # idle: the 6 s follow-up window opens right at idle, so its first words are
 # the room's tail of our last sentence (reverb, output latency, AEC residue);
@@ -252,7 +266,10 @@ class VoiceBridge:
         self._no_talk_over_gen = -1  # gen whose speech (confirm) talk-over must not cut
         self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
         self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
-        self._turn_via = ""  # main thread: what opened the current turn
+        self._turn_via = ""  # main thread: what opened the current turn (tagging / echo filter only)
+        self._reply_origin = ""  # session lock: via of the sole outstanding utterance; one-shot credit for one answer
+        self._reply_origin_at = 0.0  # session lock: self._clock() when the credit was set
+        self._outstanding = 0  # session lock: utterances sent and not yet answered
         self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._spoken_log: collections.deque[tuple[float, str]] = collections.deque(maxlen=24)  # session lock: (time, text) of everything we said
         self._echo_hist = ""  # main thread: spoken text a non-wake turn is checked against
@@ -300,7 +317,7 @@ class VoiceBridge:
         if existing is not None and not stat.S_ISSOCK(existing.st_mode):
             # Never unlink something we didn't create.
             print(
-                f"undertone: refusing to start -- {path} exists and is not a "
+                f"eridian: refusing to start -- {path} exists and is not a "
                 f"socket (mode {stat.filemode(existing.st_mode)})",
                 file=sys.stderr,
             )
@@ -308,7 +325,7 @@ class VoiceBridge:
 
         if existing is not None:
             if _server_answers(path):
-                print(f"undertone: another attach is already running at {path}", file=sys.stderr)
+                print(f"eridian: another attach is already running at {path}", file=sys.stderr)
                 return 1
             path.unlink()  # stale socket from a crashed/killed attach
 
@@ -328,13 +345,13 @@ class VoiceBridge:
         except OSError as exc:
             server.close()
             self._unlink_socket()
-            print(f"undertone: cannot listen on {path}: {exc}", file=sys.stderr)
+            print(f"eridian: cannot listen on {path}: {exc}", file=sys.stderr)
             return 1
         self._server = server
 
         for name, target in (
-            ("undertone-voice-accept", self._accept_loop),
-            ("undertone-voice-speech", self._speech_watcher),
+            ("eridian-voice-accept", self._accept_loop),
+            ("eridian-voice-speech", self._speech_watcher),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
@@ -450,10 +467,11 @@ class VoiceBridge:
             self._gen += 1
             gen = self._gen
             self._no_talk_over_gen = gen  # short: heard in full; the wake word still barges in
+            self._reply_origin = ""  # an answer landing after an announcement opens no window
             self._spoken_log.append((self._clock(), template))
             self._player.enqueue(template)  # queues behind current speech; never stop()
         self._print(f"[announce: {event}]\n")
-        self._speech_q.put((gen, "answer" if event == "finished" else "announce"))
+        self._speech_q.put((gen, False))  # an announcement never opens a window
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
@@ -522,19 +540,27 @@ class VoiceBridge:
             with _bounded(self._lock):
                 self._gen += 1
                 conn = self._conn
+                # Before the send: the reply can race the lock below. The
+                # credit is bound only when exactly one turn is outstanding.
+                self._outstanding += 1
+                self._reply_origin = via if self._outstanding == 1 else ""
+                self._reply_origin_at = self._clock()
             if conn is not None and conn.send(
-                {"type": "utterance", "text": text, "via": self._turn_via}
+                {"type": "utterance", "text": text, "via": via}
             ):
                 with _bounded(self._lock):
                     self._confirm_pending = False
                 return
+            with _bounded(self._lock):
+                self._outstanding = max(0, self._outstanding - 1)  # a failed send is not a turn
+                self._reply_origin = ""
             self._print("[no Claude session attached]\n")
             self._note_spoken(NO_SESSION_SPEECH)
             self._player.enqueue(NO_SESSION_SPEECH)
         # wake_no_speech / dropped_empty: nothing to do
 
     def _note_spoken(self, text: str) -> None:
-        """Remember something undertone said, for the echo text guard. Session lock NOT held."""
+        """Remember something eridian said, for the echo text guard. Session lock NOT held."""
         with _bounded(self._lock):
             self._spoken_log.append((self._clock(), text))
 
@@ -558,6 +584,7 @@ class VoiceBridge:
                 # `busy` can lag the stop; keep talk-over off for the next gen
                 self._no_talk_over_gen = self._gen + 1
             self._gen += 1
+            self._reply_origin = ""
         self._player.stop()
         self._print("[interrupted]\n")
 
@@ -602,7 +629,7 @@ class VoiceBridge:
                     conn.close()
                     continue
                 reader = threading.Thread(
-                    target=self._reader, args=(conn,), name="undertone-voice-reader", daemon=True
+                    target=self._reader, args=(conn,), name="eridian-voice-reader", daemon=True
                 )
                 self._threads.append(reader)
                 reader.start()
@@ -698,16 +725,22 @@ class VoiceBridge:
 
     def _on_announce_line(self, event: object, session: object) -> None:
         """Reader thread: validate and hand off; never speaks or touches the player."""
-        if not isinstance(event, str) or event not in self._announce:
+        if not isinstance(event, str) or event not in ANNOUNCE_TEMPLATES:
             return
         if not isinstance(session, str) or not TOKEN_RE.fullmatch(session):
             return
         with _bounded(self._lock):
             conn = self._conn
             expected = conn.session if conn is not None else ""
-        if not expected or not hmac.compare_digest(session, expected):
-            return
-        self._control.put(("announce", event))
+            if not expected or not hmac.compare_digest(session, expected):
+                return
+            if event == "finished":
+                # The Stop hook fired: Claude's turn ended, so nothing is
+                # outstanding and no credit survives -- whether or not the
+                # level speaks it, and before any skip rule can drop it.
+                self._outstanding, self._reply_origin = 0, ""
+        if event in self._announce:
+            self._control.put(("announce", event))
 
     def _attach(self, conn: _Conn, pid: int, cwd: str, session: str = "") -> None:
         conn.pid, conn.cwd, conn.hello, conn.session = pid, cwd, True, session
@@ -715,6 +748,7 @@ class VoiceBridge:
             old, self._conn = self._conn, conn
             if old is not conn:  # the flags belong to the previous session
                 self._answered = self._confirm_pending = False
+                self._outstanding, self._reply_origin = 0, ""
         if old is not None and old is not conn:
             old.send({"type": "detached"})
             old.close()
@@ -727,6 +761,7 @@ class VoiceBridge:
             was_current = self._conn is conn
             if was_current:
                 self._conn = None
+                self._outstanding, self._reply_origin = 0, ""
             closed = self._closed
         if was_current and not closed:
             self._print("[detached]\n")
@@ -738,7 +773,7 @@ class VoiceBridge:
             if conn is not self._conn:
                 return  # a replaced / never-hello'd connection has no voice
         if check is not None:
-            self._print(f"undertone: {check}\n")
+            self._print(f"eridian: {check}\n")
         self._print(f"claude: {text}\n")
         with _bounded(self._chunk_lock):
             self._chunker.reset()
@@ -759,13 +794,24 @@ class VoiceBridge:
                 self._spoken_gen, self._spoken_text = gen, ""
             self._spoken_text += " ".join(check_sentences + sentences) + " "
             self._spoken_log.append((self._clock(), " ".join(check_sentences + sentences)))
+            # One-shot credit bound when the utterance was sent: only the first
+            # answer to a wake-word turn opens a window. ack keeps the credit;
+            # every other kind (answer, confirm, unknown) spends it, fail closed.
+            opens_window = (
+                kind == "answer"
+                and self._reply_origin in WAKE_TURN_VIAS
+                and self._clock() - self._reply_origin_at <= REPLY_WINDOW_CREDIT_TTL_S
+            )
+            if kind != "ack":
+                self._reply_origin = ""
+                self._outstanding = max(0, self._outstanding - 1)
             for sentence in check_sentences:
                 self._player.enqueue(sentence, own=True)
             for sentence in sentences:
                 self._player.enqueue(sentence)
         if kind == "confirm":
             self._print(f'[confirmation needed: when I finish, say "{wake.current().phrase}" and the phrase]\n')
-        self._speech_q.put((gen, kind))
+        self._speech_q.put((gen, opens_window))
 
     # ---- speech watcher thread -----------------------------------------
 
@@ -774,22 +820,22 @@ class VoiceBridge:
             item = self._speech_q.get()
             if item is None:
                 return
-            gen, kind = item
+            gen, opens_window = item
             while not self._closed:
                 if self._player.wait_idle(_POLL_S):
-                    # Only an answer opens the open-mic window (see module doc).
-                    if kind == "answer":
+                    # Only an answer to a wake-word turn opens the open-mic window.
+                    if opens_window:
                         self._control.put(("reply_done", gen))
                     break
 
 
 def self_wake_guard_from_env(environ=os.environ, err: TextIO = sys.stderr) -> float:
-    """Guard window from UNDERTONE_SELF_WAKE_GUARD_S (seconds).
+    """Guard window from ERIDIAN_SELF_WAKE_GUARD_S (seconds).
 
     For AirPlay or other high-latency outputs, set 3. Values below the default
     would weaken the guard, so 1.0 is a hard floor; the cap is 10.0.
     """
-    name = "UNDERTONE_SELF_WAKE_GUARD_S"
+    name = "ERIDIAN_SELF_WAKE_GUARD_S"
     raw = environ.get(name, "")
     if raw == "":
         return SELF_WAKE_GUARD_S
@@ -799,7 +845,7 @@ def self_wake_guard_from_env(environ=os.environ, err: TextIO = sys.stderr) -> fl
         value = math.nan
     if not math.isfinite(value) or value < SELF_WAKE_GUARD_S:
         print(
-            f"undertone: ignoring {name}={raw!r}; "
+            f"eridian: ignoring {name}={raw!r}; "
             f"using {SELF_WAKE_GUARD_S} (minimum {SELF_WAKE_GUARD_S})",
             file=err,
         )
@@ -827,7 +873,7 @@ def run_attach(
     tts: str = "kokoro",
     announce: str = "all",
 ) -> int:
-    """The real wiring behind `undertone attach` (real mic; not unit-tested)."""
+    """The real wiring behind `eridian attach` (real mic; not unit-tested)."""
     # Lazy imports for the same reason as cli._cmd_chat: keep `--help` fast and
     # the heavy audio/model deps out of import time. cli is imported lazily too
     # (it imports this module).
@@ -839,7 +885,7 @@ def run_attach(
     try:
         stt = ParakeetSTT()
     except ModelNotCachedError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
 
     from pysilero_vad import SileroVoiceActivityDetector
@@ -850,7 +896,7 @@ def run_attach(
     try:
         io = cli.make_audio_io(no_aec, tts=tts)
     except cli.OwnVoiceError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
@@ -869,7 +915,7 @@ def run_attach(
     pid = os.getpid()
 
     def _on_sigterm(signum: int, frame: object) -> None:
-        # `undertone stop` sends SIGTERM; unwind through the finally below so the
+        # `eridian stop` sends SIGTERM; unwind through the finally below so the
         # socket and pidfile are removed.
         raise KeyboardInterrupt
 
@@ -881,8 +927,8 @@ def run_attach(
         print(cli.banner_line(io))
         paths.write_attach_pid(pid)
         print(
-            f"undertone attach: listening for '{wake.current().phrase}'. Start a Claude session with "
-            "`undertone session` in another terminal. Ctrl-C to quit.",
+            f"eridian attach: listening for '{wake.current().phrase}'. Start a Claude session with "
+            "`eridian session` in another terminal. Ctrl-C to quit.",
             flush=True,
         )
         try:

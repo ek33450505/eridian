@@ -1,7 +1,7 @@
-# Q1: Desktop app for undertone? (2026-10-02)
+# Q1: Desktop app for eridian? (2026-10-02)
 
 ## Recommendation
-- Do (b) first, scoped small: a signed menu-bar helper .app (Swift, LSUIElement) that owns the mic TCC grant, spawns/supervises `undertone attach` as a child, shows state, mute, start/stop. A stable bundle identity is the real win: TCC is granted once to the bundle and survives `uv` / Python upgrades, instead of to "Terminal" or a bare python binary.
+- Do (b) first, scoped small: a signed menu-bar helper .app (Swift, LSUIElement) that owns the mic TCC grant, spawns/supervises `eridian attach` as a child, shows state, mute, start/stop. A stable bundle identity is the real win: TCC is granted once to the bundle and survives `uv` / Python upgrades, instead of to "Terminal" or a bare python binary.
 - Reject (a) alone: a launchd-started bare Python has no UI to host the mic prompt, gets /dev/null as stdin, and is its own TCC subject (a per-binary row that changes whenever the interpreter path changes). It works only if the grant already exists.
 - Reject (d) for now: bundling Python + MLX + onnxruntime + Metal shaders means signing every nested .so/.dylib, hardened-runtime entitlements (disable-library-validation, allow-unsigned-executable-memory), a large bundle and an update story. Cost far exceeds benefit for a single-user tool.
 - (c) is viable but second choice: cast-desktop is an observability app with a different lifecycle. Coupling an always-on mic daemon to a dev dashboard that gets quit/rebuilt is a poor fit. Keep it as a later read-only status panel fed by the same socket.
@@ -25,14 +25,14 @@
 - Tauri: needs Info.plist NSMicrophoneUsageDescription merged in + entitlements.plist with com.apple.security.device.audio-input wired in tauri.conf.json; externalBin sidecars are re-signed with the app's entitlements (several projects' PRs below). cast-desktop currently has no mic key (grep of tauri.conf.json found none).
 
 ## First spike for (b), ~1 h
-Build: ~60-line Swift LSUIElement app, Info.plist with NSMicrophoneUsageDescription, ad-hoc signed. It does `Process()` launch of `uv run undertone attach` (absolute paths, own process group) and shows a menu-bar item with Start/Stop and the child's alive/dead state. Skip UI states for now.
+Build: ~60-line Swift LSUIElement app, Info.plist with NSMicrophoneUsageDescription, ad-hoc signed. It does `Process()` launch of `uv run eridian attach` (absolute paths, own process group) and shows a menu-bar item with Start/Stop and the child's alive/dead state. Skip UI states for now.
 Go/no-go measurements (all must pass):
-1. Launch helper from Finder (not terminal); `undertone attach` triggers exactly one mic prompt naming the helper; after Allow, `tccutil`/System Settings lists the helper, not Terminal/python.
+1. Launch helper from Finder (not terminal); `eridian attach` triggers exactly one mic prompt naming the helper; after Allow, `tccutil`/System Settings lists the helper, not Terminal/python.
 2. Quit Terminal entirely; mic still captures (RMS of frames > noise floor).
 3. Reboot/relogin via LaunchAgent for the helper: mic works with no new prompt.
 4. kill -9 the child: restarted <5 s. `uv` upgrade of Python does not re-prompt.
 Fail -> fall back to disclaim approach or (a) with pre-granted terminal.
-Note: undertone's existing unix socket (voice.py:236-246, 0600) is the Claude MCP channel; I found no mute/status control surface in voice.py/cli.py (grep), so a state/mute API is new work (small JSON line protocol on a second 0600 socket). Push-to-talk global hotkey needs Input Monitoring or Accessibility permission, another TCC row for the helper; defer past spike.
+Note: eridian's existing unix socket (voice.py:236-246, 0600) is the Claude MCP channel; I found no mute/status control surface in voice.py/cli.py (grep), so a state/mute API is new work (small JSON line protocol on a second 0600 socket). Push-to-talk global hotkey needs Input Monitoring or Accessibility permission, another TCC row for the helper; defer past spike.
 
 ## Sources
 - https://github.com/microsoft/vscode/issues/307364 (responsible process, silent denial without usage key; disclaim) - fetched
@@ -46,13 +46,13 @@ Note: undertone's existing unix socket (voice.py:236-246, 0600) is the Claude MC
 - https://stupidtech.io/2025/03/15/how-to-make-a-python-script-into-a-macos-app-with-py2app-code-sign-notarize/ - snippet only
 - https://github.com/r3dbars/transcripted/pull/1771 (AirPods wake mic restart) - snippet only
 - https://github.com/omnesis-dev/Omnesis/pull/215 , https://github.com/griffinwork40/agent-afk/pull/1666 (launchd KeepAlive/ThrottleInterval) - snippets only
-- Local: /Users/edkubiak/Projects/personal/cast-desktop/CLAUDE.md; undertone src/undertone/voice.py:236-246
+- Local: /Users/edkubiak/Projects/personal/cast-desktop/CLAUDE.md; eridian src/eridian/voice.py:236-246
 
 ## Not verified
 - No Apple primary doc fetched on responsible-process rules (only third-party issues); no hands-on test of any option; no audio run.
 - MLX/onnxruntime bundle size, metallib bundling and notarization behavior: searches returned nothing specific; size estimate is a guess.
-- Whether `sounddevice`/PortAudio survives AirPods connect/sleep-wake without stream rebuild in undertone (not tested; not read in audio.py/duplex.py).
+- Whether `sounddevice`/PortAudio survives AirPods connect/sleep-wake without stream rebuild in eridian (not tested; not read in audio.py/duplex.py).
 - Whether a bare `uv run` child inherits attribution under a non-notarized ad-hoc-signed helper on macOS 26 (spike item 1).
 - cast-desktop's tauri.conf.json mic setup only grep-checked; src-tauri plist not examined in depth.
 - Global-hotkey permission requirement (Input Monitoring vs Accessibility) not researched.
-- No check that undertone lacks an existing status/mute API beyond a keyword grep.
+- No check that eridian lacks an existing status/mute API beyond a keyword grep.

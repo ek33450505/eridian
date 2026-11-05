@@ -1,4 +1,4 @@
-"""Tests for undertone.stt -- offline-first env var and missing-model handling.
+"""Tests for eridian.stt -- offline-first env var and missing-model handling.
 
 Never imports the real parakeet_mlx/huggingface_hub model-loading path: the
 "missing model" test mocks `is_model_cached`, and the offline-env test runs
@@ -15,7 +15,7 @@ from unittest import mock
 
 import numpy as np
 
-from undertone.stt import SAMPLE_RATE, ModelNotCachedError, ParakeetSTT
+from eridian.stt import SAMPLE_RATE, ModelNotCachedError, ParakeetSTT
 
 
 class HfHubOfflineDefaultTest(unittest.TestCase):
@@ -25,7 +25,7 @@ class HfHubOfflineDefaultTest(unittest.TestCase):
                 sys.executable,
                 "-c",
                 "import os; os.environ.pop('HF_HUB_OFFLINE', None); "
-                "import undertone.stt; "
+                "import eridian.stt; "
                 "print(os.environ.get('HF_HUB_OFFLINE'))",
             ],
             capture_output=True,
@@ -40,7 +40,7 @@ class HfHubOfflineDefaultTest(unittest.TestCase):
                 sys.executable,
                 "-c",
                 "import os; os.environ['HF_HUB_OFFLINE'] = '0'; "
-                "import undertone.stt; "
+                "import eridian.stt; "
                 "print(os.environ.get('HF_HUB_OFFLINE'))",
             ],
             capture_output=True,
@@ -52,15 +52,15 @@ class HfHubOfflineDefaultTest(unittest.TestCase):
 
 class MissingModelTest(unittest.TestCase):
     def test_uncached_model_raises_clear_error_without_loading(self) -> None:
-        with mock.patch("undertone.stt.is_model_cached", return_value=False):
+        with mock.patch("eridian.stt.is_model_cached", return_value=False):
             with self.assertRaises(ModelNotCachedError) as ctx:
                 ParakeetSTT()
-        self.assertIn("undertone models fetch", str(ctx.exception))
+        self.assertIn("eridian models fetch", str(ctx.exception))
 
     def test_cached_model_proceeds_to_load(self) -> None:
         fake_model = mock.Mock()
         fake_model.generate.return_value = [mock.Mock(text="")]
-        with mock.patch("undertone.stt.is_model_cached", return_value=True):
+        with mock.patch("eridian.stt.is_model_cached", return_value=True):
             with mock.patch(
                 "parakeet_mlx.from_pretrained", return_value=fake_model
             ) as mock_from_pretrained:
@@ -74,7 +74,7 @@ class WarmUpTest(unittest.TestCase):
     def test_model_is_warmed_up_once_during_init_before_any_real_call(self) -> None:
         fake_model = mock.Mock()
         fake_model.generate.return_value = [mock.Mock(text="")]
-        with mock.patch("undertone.stt.is_model_cached", return_value=True):
+        with mock.patch("eridian.stt.is_model_cached", return_value=True):
             with mock.patch("parakeet_mlx.from_pretrained", return_value=fake_model):
                 with mock.patch("parakeet_mlx.audio.get_logmel") as mock_get_logmel:
                     stt = ParakeetSTT()

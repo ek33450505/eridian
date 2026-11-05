@@ -1,6 +1,6 @@
-"""Tests for undertone.voice_guard: bash classifier, state machine, hook entrypoint.
+"""Tests for eridian.voice_guard: bash classifier, state machine, hook entrypoint.
 
-Every test uses a throwaway temp dir as the undertone home; no mic, speakers or
+Every test uses a throwaway temp dir as the eridian home; no mic, speakers or
 real claude are involved.
 """
 
@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import voice_guard as vg
+from eridian import voice_guard as vg
 
 TOKEN = "0123456789abcdef0123456789abcdef"
 T0 = 1_000_000.0
@@ -189,7 +189,7 @@ GATED_BASH = [
 
 
 def voice_prompt(text: str) -> str:
-    return f'<channel source="undertone" input="voice">\n{text}\n</channel>'
+    return f'<channel source="eridian" input="voice">\n{text}\n</channel>'
 
 
 def run_main(argv, payload="", home=None):
@@ -216,7 +216,7 @@ class GuardTestCase(unittest.TestCase):
         decision = json.loads(out)["hookSpecificOutput"]
         self.assertEqual(decision["hookEventName"], "PreToolUse")
         self.assertEqual(decision["permissionDecision"], "deny")
-        self.assertIn("undertone voice guard", decision["permissionDecisionReason"])
+        self.assertIn("eridian voice guard", decision["permissionDecisionReason"])
 
     def assertAllowed(self, tool, tool_input=None):
         rc, out, _ = self.pre(tool, tool_input)
@@ -247,7 +247,7 @@ class BashClassifierTests(unittest.TestCase):
 
 class GateReasonTests(unittest.TestCase):
     def test_ungated(self):
-        for tool in ("Read", "Grep", "mcp__undertone__reply"):
+        for tool in ("Read", "Grep", "mcp__eridian__reply"):
             with self.subTest(tool=tool):
                 self.assertIsNone(vg.gate_reason(tool, {}))
 
@@ -334,7 +334,7 @@ class StateMachineTests(GuardTestCase):
     def test_reordered_channel_attributes_count_as_voice(self):
         vg.record_voice(self.home, TOKEN, "hello")
         self.stop()
-        self.hook("userpromptsubmit", {"prompt": '<channel input="voice" source="undertone">\nhi\n</channel>'})
+        self.hook("userpromptsubmit", {"prompt": '<channel input="voice" source="eridian">\nhi\n</channel>'})
         self.assertDenied("Write")
 
     def test_slash_command_counts_as_typed(self):
@@ -665,7 +665,7 @@ class FailClosedTests(GuardTestCase):
                 for plain in (json.dumps({"prompt": "typed"}), "garbage"):
                     self.assertEqual(self.hook("userpromptsubmit", plain, token=tok)[:2], (0, ""))
         # raw marker with JSON-escaped quotes, unparseable as a whole
-        raw = '{"prompt": "<channel source=\\"undertone\\" input=\\"voice\\">hi", broken'
+        raw = '{"prompt": "<channel source=\\"eridian\\" input=\\"voice\\">hi", broken'
         self.assertEqual(self.hook("userpromptsubmit", raw, token="badtoken")[0], 2)
 
     def test_symlinked_state_exits_2(self):
@@ -769,7 +769,7 @@ class SubprocessEntryTests(GuardTestCase):
     def test_module_entry_prints_deny(self):
         vg.record_voice(self.home, TOKEN, "write me a file")
         proc = subprocess.run(
-            [sys.executable, "-P", "-m", "undertone.voice_guard", "pretooluse",
+            [sys.executable, "-P", "-m", "eridian.voice_guard", "pretooluse",
              "--home", self.home, "--session", TOKEN],
             input=json.dumps({"tool_name": "Write", "tool_input": {}}),
             capture_output=True, text=True, timeout=30,
@@ -830,10 +830,10 @@ class DescribeCallTests(unittest.TestCase):
         ("Bash", {"command": "a 1; b 2\nc 3; d 4; e 5"},
          "the shell commands a with other arguments, then b with other arguments, "
          "then c with other arguments, and 2 more commands"),
-        ("Bash", {"command": "echo 'unclosed"}, "a shell command undertone could not read"),
-        ("Bash", {"command": ";;"}, "a shell command undertone could not read"),
-        ("Bash", {"command": 5}, "a shell command undertone could not read"),
-        ("Bash", None, "a shell command undertone could not read"),
+        ("Bash", {"command": "echo 'unclosed"}, "a shell command eridian could not read"),
+        ("Bash", {"command": ";;"}, "a shell command eridian could not read"),
+        ("Bash", {"command": 5}, "a shell command eridian could not read"),
+        ("Bash", None, "a shell command eridian could not read"),
         ("Write", {"file_path": "/Users/ed/notes/todo.md"}, "write a file named todo.md outside your home folder"),
         ("Write", {"file_path": "/p/src/todo.md"}, "write a file named todo.md in this project"),
         ("Write", {"file_path": "todo.md"}, "write a file named todo.md in this project"),
@@ -1144,7 +1144,7 @@ class BlockedStateTests(GuardTestCase):
         state = vg.load_state(self.home, TOKEN)
         self.assertEqual(state["blocked_more"], 1)
         self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 5),
-                         "undertone blocked: a; and b; and c, and 1 more blocked call.")
+                         "eridian blocked: a; and b; and c, and 1 more blocked call.")
         vg.record_blocked(self.home, TOKEN, "d", now=T0 + 6)
         self.assertIn("and 2 more blocked calls.", vg.read_back(self.home, TOKEN, now=T0 + 7))
 
@@ -1175,15 +1175,15 @@ class BlockedStateTests(GuardTestCase):
     def test_read_back(self):
         self.assertEqual(vg.read_back(self.home, TOKEN, now=T0), vg.NOTHING_BLOCKED)
         vg.record_blocked(self.home, TOKEN, "a", now=T0)
-        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 1), "undertone blocked: a.")
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 1), "eridian blocked: a.")
         vg.record_blocked(self.home, TOKEN, "b", now=T0 + 2)
-        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 3), "undertone blocked: a; and b.")
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 3), "eridian blocked: a; and b.")
 
     def test_read_back_ttl(self):
         vg.record_blocked(self.home, TOKEN, "old", now=T0)
         vg.record_blocked(self.home, TOKEN, "new", now=T0 + 200)
         at = T0 + vg.CHALLENGE_TTL_S + 1
-        self.assertEqual(vg.read_back(self.home, TOKEN, now=at), "undertone blocked: new.")
+        self.assertEqual(vg.read_back(self.home, TOKEN, now=at), "eridian blocked: new.")
         self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 + 200 + vg.CHALLENGE_TTL_S + 1),
                          vg.NOTHING_BLOCKED)
         self.assertEqual(vg.read_back(self.home, TOKEN, now=T0 - 5), vg.NOTHING_BLOCKED)
@@ -1469,7 +1469,7 @@ class TouchesHomeTests(unittest.TestCase):
             ("LS home", "LS", {"path": h}, None),
             ("cat file", "Bash", {"command": f"cat {h}/safe_phrase.json"}, self.project),
             ("safe_phrase word", "Bash", {"command": "cat safe_phrase.json"}, self.project),
-            ("cat tilde", "Bash", {"command": "cat ~/.undertone/x"}, self.project),
+            ("cat tilde", "Bash", {"command": "cat ~/.eridian/x"}, self.project),
             ("grep -r in parent", "Bash", {"command": "grep -r foo ."}, self.parent),
             ("grep -r no path in parent", "Bash", {"command": "grep -rn foo"}, self.parent),
             ("dotdot token", "Bash", {"command": "cat ../.state/x"}, self.project),
@@ -1491,7 +1491,7 @@ class TouchesHomeTests(unittest.TestCase):
             ("cat README", "Bash", {"command": "cat README.md"}, self.project),
             ("ls src", "Bash", {"command": "ls src && git status"}, self.project),
             ("other tool", "Write", {"file_path": f"{self.h}/x"}, self.project),
-            ("mcp", "mcp__undertone__reply", {}, self.project),
+            ("mcp", "mcp__eridian__reply", {}, self.project),
         ]
         for name, tool, inp, cwd in cases:
             with self.subTest(name):
@@ -1562,7 +1562,7 @@ class IdentityHomeTests(unittest.TestCase):
         Path(proj_file).write_text("x")
         self.assertIsNone(self.decide("Read", {"file_path": self.sibling + "/f"}))
         self.assertIsNone(self.decide("Read", {"file_path": proj_file}))
-        self.assertIsNone(self.decide("Bash", {"command": "grep -n safe_phrase src/undertone/cli.py"}))
+        self.assertIsNone(self.decide("Bash", {"command": "grep -n safe_phrase src/eridian/cli.py"}))
         self.assertIsNone(self.decide("Bash", {"command": "ls .."}))
 
     def test_renamed_file_aliases(self):

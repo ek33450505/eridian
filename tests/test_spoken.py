@@ -1,9 +1,9 @@
-"""Tests for undertone.spoken: markdown stripping and the TTS/terminal sanitizers."""
+"""Tests for eridian.spoken: markdown stripping and the TTS/terminal sanitizers."""
 
 import time
 import unittest
 
-from undertone.spoken import (
+from eridian.spoken import (
     MAX_HEARD_TOKENS,
     echo_score,
     is_echo,

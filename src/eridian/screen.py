@@ -1,6 +1,6 @@
 """Acoustic self-screen: never play audio our own wake detector would fire on.
 
-Threat: undertone's wake detector stays live while replies play. If our own
+Threat: eridian's wake detector stays live while replies play. If our own
 speech fires it, the listener opens a `via: "wake"` turn, and only "wake" turns
 can grant a voice confirmation -- so a self-trigger is a trusted turn the user
 never asked for.

@@ -1,6 +1,6 @@
-"""Tests for undertone.player.SpeechQueue and RenderedSpeechQueue.
+"""Tests for eridian.player.SpeechQueue and RenderedSpeechQueue.
 
-UNDERTONE_SAY_CMD always points at a stub script; these tests never run real `say`.
+ERIDIAN_SAY_CMD always points at a stub script; these tests never run real `say`.
 """
 
 import os
@@ -13,9 +13,9 @@ from pathlib import Path
 import wave
 from unittest import mock
 
-from undertone import player
-from undertone import speaker
-from undertone.player import KokoroRenderer, RenderedSpeechQueue, SayRenderer, SpeechQueue
+from eridian import player
+from eridian import speaker
+from eridian.player import KokoroRenderer, RenderedSpeechQueue, SayRenderer, SpeechQueue
 
 _RECORDING_STUB = """#!/bin/sh
 echo "$@" >> "$STUB_LOG_FILE"
@@ -38,11 +38,11 @@ class SpeechQueueTest(unittest.TestCase):
         self._env = mock.patch.dict(
             os.environ,
             {
-                "UNDERTONE_HOME": str(self._path / "home"),
+                "ERIDIAN_HOME": str(self._path / "home"),
                 "STUB_LOG_FILE": str(self._log),
                 "STUB_PID_FILE": str(self._pids),
-                "UNDERTONE_SAY_CMD": self._stub("recording.sh", _RECORDING_STUB),
-                "UNDERTONE_VOICE": "",
+                "ERIDIAN_SAY_CMD": self._stub("recording.sh", _RECORDING_STUB),
+                "ERIDIAN_VOICE": "",
             },
         )
         self._env.start()
@@ -66,7 +66,7 @@ class SpeechQueueTest(unittest.TestCase):
         return q
 
     def _use_sleepy(self) -> None:
-        os.environ["UNDERTONE_SAY_CMD"] = self._stub("sleepy.sh", _SLEEPY_STUB)
+        os.environ["ERIDIAN_SAY_CMD"] = self._stub("sleepy.sh", _SLEEPY_STUB)
 
     def _lines(self) -> list[str]:
         return self._log.read_text().splitlines() if self._log.exists() else []
@@ -109,8 +109,8 @@ class SpeechQueueTest(unittest.TestCase):
         self.assertEqual(self._lines(), ["-- first"])
 
     def test_own_voice_reaches_build_say_argv_in_order(self) -> None:
-        os.environ["UNDERTONE_VOICE"] = "Evan"
-        os.environ["UNDERTONE_OWN_VOICE"] = "Fred"
+        os.environ["ERIDIAN_VOICE"] = "Evan"
+        os.environ["ERIDIAN_OWN_VOICE"] = "Fred"
         q = self._queue()
         q.enqueue("plain")
         q.enqueue("mine", own=True)
@@ -127,7 +127,7 @@ class SpeechQueueTest(unittest.TestCase):
         q.enqueue("old")
         self.assertTrue(self._wait_for(lambda: self._lines() == ["-- old"]))
         q.stop()
-        os.environ["UNDERTONE_SAY_CMD"] = self._stub("recording.sh", _RECORDING_STUB)
+        os.environ["ERIDIAN_SAY_CMD"] = self._stub("recording.sh", _RECORDING_STUB)
         q.enqueue("fresh")
         self.assertTrue(q.wait_idle(5.0))
         self.assertEqual(self._lines(), ["-- old", "-- fresh"])
@@ -263,13 +263,13 @@ class RenderedSpeechQueueTest(unittest.TestCase):
         self._env = mock.patch.dict(
             os.environ,
             {
-                "UNDERTONE_HOME": str(self._path / "home"),
+                "ERIDIAN_HOME": str(self._path / "home"),
                 "STUB_LOG_FILE": str(self._log),
                 "STUB_PID_FILE": str(self._pids),
                 "STUB_OUT_FILE": str(self._outs),
                 "STUB_WAV": str(self._wav),
-                "UNDERTONE_SAY_CMD": self._stub("render.sh", _RENDER_STUB),
-                "UNDERTONE_VOICE": "",
+                "ERIDIAN_SAY_CMD": self._stub("render.sh", _RENDER_STUB),
+                "ERIDIAN_VOICE": "",
             },
         )
         self._env.start()
@@ -303,8 +303,8 @@ class RenderedSpeechQueueTest(unittest.TestCase):
         return False
 
     def test_say_renderer_passes_own_voice_to_say(self) -> None:
-        os.environ["UNDERTONE_VOICE"] = "Evan"
-        os.environ["UNDERTONE_OWN_VOICE"] = "Fred"
+        os.environ["ERIDIAN_VOICE"] = "Evan"
+        os.environ["ERIDIAN_OWN_VOICE"] = "Fred"
         q = self._queue()
         q.enqueue("plain")
         q.enqueue("mine", own=True)
@@ -385,7 +385,7 @@ class RenderedSpeechQueueTest(unittest.TestCase):
         self.assertFalse(os.path.exists(render_dir))
 
     def test_stop_kills_sleepy_render_and_plays_nothing(self) -> None:
-        os.environ["UNDERTONE_SAY_CMD"] = self._stub("sleepy.sh", _SLEEPY_RENDER_STUB)
+        os.environ["ERIDIAN_SAY_CMD"] = self._stub("sleepy.sh", _SLEEPY_RENDER_STUB)
         q = self._queue()
         q.enqueue("first")
         q.enqueue("second")
@@ -445,7 +445,7 @@ class RenderedSpeechQueueTest(unittest.TestCase):
         self.assertTrue(self._wait_for(lambda: not q.busy))
 
     def test_busy_true_while_rendering(self) -> None:
-        os.environ["UNDERTONE_SAY_CMD"] = self._stub("sleepy.sh", _SLEEPY_RENDER_STUB)
+        os.environ["ERIDIAN_SAY_CMD"] = self._stub("sleepy.sh", _SLEEPY_RENDER_STUB)
         q = self._queue()
         q.enqueue("a")
         self.assertTrue(self._wait_for(self._pids.exists))

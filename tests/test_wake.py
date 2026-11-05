@@ -1,4 +1,4 @@
-"""Tests for undertone.wake: the configurable wake word and every surface that reads it."""
+"""Tests for eridian.wake: the configurable wake word and every surface that reads it."""
 
 import contextlib
 import io
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import cli, listener, mcp_channel, speaker, spoken, voice_guard, wake
+from eridian import cli, listener, mcp_channel, speaker, spoken, voice_guard, wake
 
 
 def write_manifest(directory: str, phrase: str = "Hey Rocky", **overrides) -> Path:
@@ -40,13 +40,13 @@ def fresh_dir(base: str, name: str) -> str:
 
 
 class WakeTestCase(unittest.TestCase):
-    """Isolates the env: no inherited wake config, UNDERTONE_HOME in a tempdir."""
+    """Isolates the env: no inherited wake config, ERIDIAN_HOME in a tempdir."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         env = {k: v for k, v in os.environ.items() if k not in (wake.MODEL_ENV, wake.PHRASE_ENV)}
-        env["UNDERTONE_HOME"] = self._tmp.name
+        env["ERIDIAN_HOME"] = self._tmp.name
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -334,10 +334,10 @@ class SurfacesTest(WakeTestCase):
 
     def test_channel_mcp_config_passes_phrase_not_model(self) -> None:
         home = Path(self._tmp.name)
-        env = cli.channel_mcp_config("py", home, "tok")["mcpServers"]["undertone"]["env"]
+        env = cli.channel_mcp_config("py", home, "tok")["mcpServers"]["eridian"]["env"]
         self.assertNotIn(wake.PHRASE_ENV, env)
         path = self.use_rocky()
-        env = cli.channel_mcp_config("py", home, "tok")["mcpServers"]["undertone"]["env"]
+        env = cli.channel_mcp_config("py", home, "tok")["mcpServers"]["eridian"]["env"]
         self.assertEqual(env[wake.PHRASE_ENV], "hey rocky")
         self.assertNotIn(str(path), json.dumps(env))
 

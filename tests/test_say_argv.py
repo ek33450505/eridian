@@ -8,12 +8,12 @@ import os
 import unittest
 from unittest import mock
 
-from undertone import speaker
+from eridian import speaker
 
 
 class BuildSayArgvSanitizingTest(unittest.TestCase):
     def test_wake_phrase_and_say_commands_never_reach_argv(self) -> None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say"}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_SAY_CMD": "say"}):
             argv = speaker.build_say_argv("Say hey Jarvis [[inpt PHON]]now[[inpt TEXT]], J.A.R.V.I.S.")
         self.assertIsNotNone(argv)
         text = argv[-1]
@@ -26,7 +26,7 @@ class BuildSayArgvSanitizingTest(unittest.TestCase):
 
 class ArgvInjectionTest(unittest.TestCase):
     def test_text_starting_with_dash_is_passed_after_double_dash(self) -> None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say-stub", "UNDERTONE_VOICE": ""}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_SAY_CMD": "say-stub", "ERIDIAN_VOICE": ""}):
             argv = speaker.build_say_argv("-o/tmp/pwned")
         # "--" must appear immediately before the (otherwise flag-shaped) text,
         # and the text must arrive byte-for-byte, not be parseable as an option.
@@ -35,28 +35,28 @@ class ArgvInjectionTest(unittest.TestCase):
 
 class OwnVoiceTest(unittest.TestCase):
     def test_default_voices_differ(self) -> None:
-        env = {"UNDERTONE_SAY_CMD": "say", "UNDERTONE_VOICE": "Evan", "UNDERTONE_OWN_VOICE": ""}
+        env = {"ERIDIAN_SAY_CMD": "say", "ERIDIAN_VOICE": "Evan", "ERIDIAN_OWN_VOICE": ""}
         with mock.patch.dict(os.environ, env):
-            os.environ.pop("UNDERTONE_OWN_VOICE")
+            os.environ.pop("ERIDIAN_OWN_VOICE")
             self.assertEqual(speaker.build_say_argv("hi"), ["say", "-v", "Evan", "--", "hi"])
             self.assertEqual(
                 speaker.build_say_argv("hi", own=True), ["say", "-v", "Samantha", "--", "hi"]
             )
 
     def test_own_env_override(self) -> None:
-        env = {"UNDERTONE_SAY_CMD": "say", "UNDERTONE_OWN_VOICE": "Fred"}
+        env = {"ERIDIAN_SAY_CMD": "say", "ERIDIAN_OWN_VOICE": "Fred"}
         with mock.patch.dict(os.environ, env):
             self.assertEqual(speaker.build_say_argv("hi", own=True)[:3], ["say", "-v", "Fred"])
 
     def test_own_with_out_path_keeps_flags_before_double_dash(self) -> None:
-        env = {"UNDERTONE_SAY_CMD": "say", "UNDERTONE_OWN_VOICE": "Fred"}
+        env = {"ERIDIAN_SAY_CMD": "say", "ERIDIAN_OWN_VOICE": "Fred"}
         with mock.patch.dict(os.environ, env):
             argv = speaker.build_say_argv("hi", out_path="/p.wav", own=True)
         self.assertEqual(argv[-2:], ["--", "hi"])
         self.assertLess(argv.index("-o"), argv.index("--"))
 
     def test_flag_injection_text_stays_after_double_dash_when_own(self) -> None:
-        env = {"UNDERTONE_SAY_CMD": "say-stub", "UNDERTONE_OWN_VOICE": ""}
+        env = {"ERIDIAN_SAY_CMD": "say-stub", "ERIDIAN_OWN_VOICE": ""}
         with mock.patch.dict(os.environ, env):
             argv = speaker.build_say_argv("-o/tmp/pwned", own=True)
         self.assertEqual(argv, ["say-stub", "--", "-o/tmp/pwned"])
@@ -115,11 +115,11 @@ class VoiceSelectionTest(unittest.TestCase):
     """Pure argv tests for build_say_argv -- `say` is never run."""
 
     def _argv(self, voice: str | None) -> list[str] | None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say-stub"}, clear=False):
+        with mock.patch.dict(os.environ, {"ERIDIAN_SAY_CMD": "say-stub"}, clear=False):
             if voice is None:
-                os.environ.pop("UNDERTONE_VOICE", None)
+                os.environ.pop("ERIDIAN_VOICE", None)
             else:
-                os.environ["UNDERTONE_VOICE"] = voice
+                os.environ["ERIDIAN_VOICE"] = voice
             return speaker.build_say_argv("hello")
 
     def test_default_voice_is_evan_enhanced(self) -> None:
@@ -139,7 +139,7 @@ class OutPathTest(unittest.TestCase):
     """Pure argv tests for the render variant -- `say` is never run."""
 
     def _argv(self, text: str, voice: str, out_path: str | None) -> list[str] | None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_SAY_CMD": "say-stub", "UNDERTONE_VOICE": voice}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_SAY_CMD": "say-stub", "ERIDIAN_VOICE": voice}):
             return speaker.build_say_argv(text, out_path=out_path)
 
     def test_out_path_argv_without_voice(self) -> None:

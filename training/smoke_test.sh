@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-IMAGE_NAME="undertone-oww:latest"
+IMAGE_NAME="eridian-oww:latest"
 
 echo "=== Building Docker image: $IMAGE_NAME ==="
 docker build -t "$IMAGE_NAME" "$SCRIPT_DIR"
@@ -58,7 +58,7 @@ os.makedirs(output_dir, exist_ok=True)
 try:
     print(f"Generating samples to {output_dir}...")
     generate_samples(
-        text=["hey undertone"],
+        text=["hey eridian"],
         output_dir=output_dir,
         max_samples=10,
         batch_size=5,

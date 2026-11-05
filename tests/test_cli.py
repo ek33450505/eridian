@@ -1,4 +1,4 @@
-"""Smoke tests for undertone.cli."""
+"""Smoke tests for eridian.cli."""
 
 import contextlib
 import io
@@ -13,14 +13,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import cli, paths, voice_guard
+from eridian import cli, paths, voice_guard
 
 
 class CliTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self._env_patch = mock.patch.dict(
-            os.environ, {"UNDERTONE_HOME": self._tmp.name}, clear=False
+            os.environ, {"ERIDIAN_HOME": self._tmp.name}, clear=False
         )
         self._env_patch.start()
 
@@ -49,7 +49,7 @@ class RetiredCommandsTest(CliTestCase):
         self.assertEqual(
             sorted(sub.choices),
             [
-                "attach", "channel", "chat", "launch", "listen", "models",
+                "attach", "channel", "chat", "launch", "listen", "migrate", "models",
                 "safe-phrase", "session", "shell-init", "stop",
             ],
         )
@@ -167,14 +167,14 @@ class ChatWorkdirTest(unittest.TestCase):
         self.root = Path(self._tmp.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
-        self.undertone_home = self.root / "undertone"
-        self.workspace = self.undertone_home / "workspace"
+        self.eridian_home = self.root / "eridian"
+        self.workspace = self.eridian_home / "workspace"
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
     def _workdir(self, cwd: Path) -> tuple[Path, bool]:
-        return cli.chat_workdir(cwd, self.home, self.undertone_home)
+        return cli.chat_workdir(cwd, self.home, self.eridian_home)
 
     def _assert_substituted(self, cwd: Path) -> None:
         workdir, substituted = self._workdir(cwd)
@@ -186,7 +186,7 @@ class ChatWorkdirTest(unittest.TestCase):
         workdir, substituted = self._workdir(cwd)
         self.assertFalse(substituted, f"{cwd} should be allowed")
         self.assertEqual(workdir, cwd.resolve())
-        self.assertFalse(self.undertone_home.exists())
+        self.assertFalse(self.eridian_home.exists())
 
     def test_a_home_itself(self) -> None:
         self._assert_substituted(self.home)
@@ -215,7 +215,7 @@ class ChatWorkdirTest(unittest.TestCase):
             sub.mkdir(parents=True)
             self._assert_allowed(sub)  # first: no workspace created yet
             self._assert_substituted(self.home / name)
-            shutil.rmtree(self.undertone_home)
+            shutil.rmtree(self.eridian_home)
 
     def test_symlink_to_home_is_substituted(self) -> None:
         link = self.root / "homelink"
@@ -239,7 +239,7 @@ class ChatWorkdirTest(unittest.TestCase):
     def test_workspace_symlink_is_refused(self) -> None:
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
-        self.undertone_home.mkdir()
+        self.eridian_home.mkdir()
         self.workspace.symlink_to(elsewhere)
         with self.assertRaises(cli.WorkdirError):
             self._workdir(self.home)
@@ -259,9 +259,9 @@ class SessionHelpersTest(CliTestCase):
                 "--settings",
                 "{set}",
                 "--dangerously-load-development-channels",
-                "server:undertone",
+                "server:eridian",
                 "--allowedTools",
-                "mcp__undertone__reply",
+                "mcp__eridian__reply",
                 "--model",
                 "opus",
             ],
@@ -277,10 +277,10 @@ class SessionHelpersTest(CliTestCase):
             cfg,
             {
                 "mcpServers": {
-                    "undertone": {
+                    "eridian": {
                         "command": "/py",
-                        "args": ["-P", "-m", "undertone.cli", "channel"],
-                        "env": {"UNDERTONE_HOME": "/home/u", "UNDERTONE_SESSION": self.TOK},
+                        "args": ["-P", "-m", "eridian.cli", "channel"],
+                        "env": {"ERIDIAN_HOME": "/home/u", "ERIDIAN_SESSION": self.TOK},
                     }
                 }
             },
@@ -312,7 +312,7 @@ class SessionHelpersTest(CliTestCase):
             self.assertIn(self.TOK, argv)
             self.assertNotIn("exit 2", hooks[event][0]["hooks"][0]["command"])
         self.assertEqual(len(hooks["Stop"][0]["hooks"]), 2)
-        self.assertIn("undertone.voice_guard", hooks["Stop"][0]["hooks"][0]["command"])
+        self.assertIn("eridian.voice_guard", hooks["Stop"][0]["hooks"][0]["command"])
         for event, hook in (("Stop", "stop"), ("StopFailure", "stopfailure"), ("PermissionRequest", "permissionrequest")):
             handler = hooks[event][0]["hooks"][-1]
             self.assertIs(handler["async"], True)
@@ -320,7 +320,7 @@ class SessionHelpersTest(CliTestCase):
             self.assertNotIn("exit 2", handler["command"])
             self.assertEqual(
                 shlex.split(handler["command"]),
-                ["/py", "-P", "-m", "undertone.announce", hook,
+                ["/py", "-P", "-m", "eridian.announce", hook,
                  "--home", "/h o/me", "--session", self.TOK],
             )
         self.assertEqual(hooks["PermissionRequest"][0]["matcher"], "*")
@@ -330,7 +330,7 @@ class SessionHelpersTest(CliTestCase):
         start = hooks["SessionStart"][0]["hooks"][0]["command"]
         self.assertEqual(
             shlex.split(start),
-            ["/py", "-P", "-m", "undertone.voice_guard", "sessionstart",
+            ["/py", "-P", "-m", "eridian.voice_guard", "sessionstart",
              "--home", "/h o/me", "--session", self.TOK],
         )
 
@@ -338,7 +338,7 @@ class SessionHelpersTest(CliTestCase):
         with mock.patch.object(cli.os, "execvpe") as execvpe, mock.patch.dict(
             os.environ,
             {
-                "UNDERTONE_CLAUDE_CMD": "fakeclaude",
+                "ERIDIAN_CLAUDE_CMD": "fakeclaude",
                 "CLAUDE_CODE_SIMPLE": "1",
                 "CLAUDE_CODE_SAFE_MODE": "1",
             },
@@ -350,10 +350,10 @@ class SessionHelpersTest(CliTestCase):
         self.assertEqual(cmd, "fakeclaude")
         mcp = json.loads(argv[argv.index("--mcp-config") + 1])
         settings = json.loads(argv[argv.index("--settings") + 1])
-        envcfg = mcp["mcpServers"]["undertone"]["env"]
-        tok = envcfg["UNDERTONE_SESSION"]
+        envcfg = mcp["mcpServers"]["eridian"]["env"]
+        tok = envcfg["ERIDIAN_SESSION"]
         self.assertRegex(tok, voice_guard.TOKEN_RE)
-        self.assertEqual(envcfg["UNDERTONE_HOME"], self._tmp.name)
+        self.assertEqual(envcfg["ERIDIAN_HOME"], self._tmp.name)
         for entries in settings["hooks"].values():
             for handler in entries[0]["hooks"]:
                 self.assertIn(tok, shlex.split(handler["command"]))
@@ -362,9 +362,9 @@ class SessionHelpersTest(CliTestCase):
         self.assertNotIn("CLAUDE_CODE_SIMPLE", env)
         self.assertNotIn("CLAUDE_CODE_SAFE_MODE", env)
         self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
-        self.assertEqual(env["UNDERTONE_HOME"], self._tmp.name)
-        self.assertNotIn("UNDERTONE_SPEAK", env)
-        self.assertIn("undertone attach", err.getvalue())
+        self.assertEqual(env["ERIDIAN_HOME"], self._tmp.name)
+        self.assertNotIn("ERIDIAN_SPEAK", env)
+        self.assertIn("eridian attach", err.getvalue())
 
     def test_session_refuses_flags_that_defeat_the_guard(self) -> None:
         for flags in (["--settings", "x"], ["--settings=x"], ["--bare"], ["--safe-mode"]):
@@ -420,7 +420,7 @@ class SessionHelpersTest(CliTestCase):
 
     def test_cmd_attach_passes_announce(self) -> None:
         args = cli.build_parser().parse_args(["attach", "--announce", "permission"])
-        with mock.patch("undertone.voice.run_attach", return_value=0) as run:
+        with mock.patch("eridian.voice.run_attach", return_value=0) as run:
             self.assertEqual(cli._cmd_attach(args), 0)
         self.assertEqual(run.call_args.kwargs["announce"], "permission")
 
@@ -455,8 +455,8 @@ class FakeEngine:
 
 class MakeAudioIoTest(unittest.TestCase):
     def test_aec_on_builds_rendered_queue_on_the_engine(self) -> None:
-        from undertone.player import RenderedSpeechQueue
-        from undertone.screen import ScreenedSink
+        from eridian.player import RenderedSpeechQueue
+        from eridian.screen import ScreenedSink
 
         engine = FakeEngine()
         io_ = cli.make_audio_io(
@@ -506,7 +506,7 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertIn("Voice: say (", cli.banner_line(io_))
 
     def test_no_aec_uses_say_queue_without_engine(self) -> None:
-        from undertone.player import SpeechQueue
+        from eridian.player import SpeechQueue
 
         def factory():
             raise AssertionError("engine must not be built with --no-aec")
@@ -543,7 +543,7 @@ class MakeAudioIoTest(unittest.TestCase):
             )
 
     def test_kokoro_path_shares_one_voice_across_players(self) -> None:
-        from undertone.player import KokoroRenderer
+        from eridian.player import KokoroRenderer
 
         voice = mock.Mock(voice="am_michael", own_voice="af_heart", voice_names=["am_michael"])
         factory = mock.Mock(return_value=voice)
@@ -559,16 +559,16 @@ class MakeAudioIoTest(unittest.TestCase):
                 q.close()
         factory.assert_called_once_with()
         self.assertEqual(
-            io_.voice_label, "Kokoro (am_michael; undertone's own voice: af_heart)"
+            io_.voice_label, "Kokoro (am_michael; eridian's own voice: af_heart)"
         )
         self.assertIn(
-            "Voice: Kokoro (am_michael; undertone's own voice: af_heart).", cli.banner_line(io_)
+            "Voice: Kokoro (am_michael; eridian's own voice: af_heart).", cli.banner_line(io_)
         )
         self.assertEqual(err.getvalue(), "")
 
     def test_kokoro_unavailable_falls_back_to_say_with_one_line(self) -> None:
-        from undertone.kokoro import KokoroUnavailable
-        from undertone.player import SayRenderer
+        from eridian.kokoro import KokoroUnavailable
+        from eridian.player import SayRenderer
 
         err = io.StringIO()
         io_ = self._kokoro_io(factory=mock.Mock(side_effect=KokoroUnavailable("x")), err=err)
@@ -583,7 +583,7 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertTrue(io_.voice_label.startswith("say ("))
 
     def test_missing_espeak_falls_back_without_loading_the_voice(self) -> None:
-        from undertone.player import SayRenderer
+        from eridian.player import SayRenderer
 
         factory = mock.Mock()
         err = io.StringIO()
@@ -621,7 +621,7 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertTrue(io_.voice_label.startswith("say ("))
 
     def test_no_aec_keeps_say_queue_even_with_kokoro_tts(self) -> None:
-        from undertone.player import SpeechQueue
+        from eridian.player import SpeechQueue
 
         factory = mock.Mock()
         io_ = cli.make_audio_io(True, tts="kokoro", kokoro_factory=factory)
@@ -634,25 +634,25 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertTrue(io_.voice_label.startswith("say ("))
         self.assertIn("Voice: say (", cli.banner_line(io_))
 
-    def test_voice_label_honors_undertone_voice(self) -> None:
-        env = {"UNDERTONE_VOICE": "Daniel", "UNDERTONE_OWN_VOICE": ""}
+    def test_voice_label_honors_eridian_voice(self) -> None:
+        env = {"ERIDIAN_VOICE": "Daniel", "ERIDIAN_OWN_VOICE": ""}
         with mock.patch.dict(os.environ, env):
             io_ = cli.make_audio_io(True)
-        self.assertEqual(io_.voice_label, "say (Daniel; undertone's own voice: Samantha)")
+        self.assertEqual(io_.voice_label, "say (Daniel; eridian's own voice: Samantha)")
 
     def test_say_label_default_and_own_override(self) -> None:
-        env = {"UNDERTONE_VOICE": "", "UNDERTONE_OWN_VOICE": ""}
+        env = {"ERIDIAN_VOICE": "", "ERIDIAN_OWN_VOICE": ""}
         with mock.patch.dict(os.environ, env):
             err = io.StringIO()
             io_ = cli.make_audio_io(True, err=err)
             self.assertEqual(
-                io_.voice_label, "say (Evan (Enhanced); undertone's own voice: Samantha)"
+                io_.voice_label, "say (Evan (Enhanced); eridian's own voice: Samantha)"
             )
             self.assertEqual(err.getvalue(), "")
-            os.environ["UNDERTONE_OWN_VOICE"] = "Fred"
+            os.environ["ERIDIAN_OWN_VOICE"] = "Fred"
             self.assertEqual(
                 cli.make_audio_io(True, err=err).voice_label,
-                "say (Evan (Enhanced); undertone's own voice: Fred)",
+                "say (Evan (Enhanced); eridian's own voice: Fred)",
             )
             self.assertEqual(err.getvalue(), "")
 
@@ -677,18 +677,18 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
     def test_same_own_voice_refuses_for_say_fallback(self) -> None:
-        env = {"UNDERTONE_VOICE": "Samantha", "UNDERTONE_OWN_VOICE": "Samantha"}
+        env = {"ERIDIAN_VOICE": "Samantha", "ERIDIAN_OWN_VOICE": "Samantha"}
         with mock.patch.dict(os.environ, env), self.assertRaises(cli.OwnVoiceError) as ctx:
             self._kokoro_io(factory=mock.Mock(), tts="say")
         self.assertIn("Samantha", str(ctx.exception))
 
     def test_same_own_voice_refuses_on_no_aec_path(self) -> None:
-        env = {"UNDERTONE_VOICE": "Samantha", "UNDERTONE_OWN_VOICE": ""}
+        env = {"ERIDIAN_VOICE": "Samantha", "ERIDIAN_OWN_VOICE": ""}
         with mock.patch.dict(os.environ, env), self.assertRaises(cli.OwnVoiceError):
             cli.make_audio_io(True, err=io.StringIO())
 
     def test_default_say_voices_do_not_refuse(self) -> None:
-        env = {k: v for k, v in os.environ.items() if k not in ("UNDERTONE_VOICE", "UNDERTONE_OWN_VOICE")}
+        env = {k: v for k, v in os.environ.items() if k not in ("ERIDIAN_VOICE", "ERIDIAN_OWN_VOICE")}
         with mock.patch.dict(os.environ, env, clear=True):
             cli.make_audio_io(True, err=io.StringIO())
 
@@ -701,7 +701,7 @@ class MakeAudioIoTest(unittest.TestCase):
                 parser.parse_args([cmd, "--tts", "foo"])
 
     def test_models_fetch_calls_both_fetchers_in_order(self) -> None:
-        from undertone import kokoro, stt
+        from eridian import kokoro, stt
 
         calls: list[str] = []
         out = io.StringIO()
@@ -718,7 +718,7 @@ class MakeAudioIoTest(unittest.TestCase):
         self.assertIn("brew install espeak-ng", out.getvalue())
 
     def test_models_fetch_omits_espeak_hint_when_installed(self) -> None:
-        from undertone import kokoro, stt
+        from eridian import kokoro, stt
 
         out = io.StringIO()
         with (
@@ -742,7 +742,7 @@ class LaunchModeTest(unittest.TestCase):
 
     def test_passthrough_cases(self) -> None:
         cases = {
-            "optout": ([], {"UNDERTONE_AUTOLAUNCH": "0"}, True, True),
+            "optout": ([], {"ERIDIAN_AUTOLAUNCH": "0"}, True, True),
             "stdin not tty": ([], {}, False, True),
             "stdout not tty": ([], {}, True, False),
             "print": (["-p", "hi"], {}, True, True),
@@ -763,13 +763,13 @@ class LaunchModeTest(unittest.TestCase):
                 self.assertEqual(self._mode(argv, env, stdin, stdout), "passthrough")
 
     def test_autolaunch_other_value_still_voice(self) -> None:
-        self.assertEqual(self._mode([], {"UNDERTONE_AUTOLAUNCH": "1"}), "voice")
+        self.assertEqual(self._mode([], {"ERIDIAN_AUTOLAUNCH": "1"}), "voice")
 
 
 class LaunchCommandTest(CliTestCase):
     def test_passthrough_execs_plain_claude(self) -> None:
         with (
-            mock.patch.dict(os.environ, {"UNDERTONE_CLAUDE_CMD": "fakeclaude"}),
+            mock.patch.dict(os.environ, {"ERIDIAN_CLAUDE_CMD": "fakeclaude"}),
             mock.patch.object(cli.os, "execvpe") as execvpe,
             mock.patch.object(cli, "_ensure_attach") as ensure,
         ):
@@ -792,7 +792,7 @@ class LaunchCommandTest(CliTestCase):
 
 class EnsureAttachTest(CliTestCase):
     def test_spawns_detached_attach_with_log_and_pidfile(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         child = mock.Mock(pid=4242)
         err = io.StringIO()
@@ -803,7 +803,7 @@ class EnsureAttachTest(CliTestCase):
         ):
             cli._ensure_attach()
         argv = popen.call_args.args[0]
-        self.assertEqual(argv, [sys.executable, "-m", "undertone", "attach"])
+        self.assertEqual(argv, [sys.executable, "-m", "eridian", "attach"])
         kwargs = popen.call_args.kwargs
         self.assertTrue(kwargs["start_new_session"])
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
@@ -815,7 +815,7 @@ class EnsureAttachTest(CliTestCase):
         self.assertIn(str(log), err.getvalue())
 
     def test_no_spawn_when_socket_answers(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         with (
             mock.patch.object(voice, "_server_answers", return_value=True),
@@ -825,7 +825,7 @@ class EnsureAttachTest(CliTestCase):
         popen.assert_not_called()
 
     def test_no_spawn_while_previous_attach_still_loading(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         paths.write_attach_pid(777)
         with (
@@ -845,7 +845,7 @@ class EnsureAttachTest(CliTestCase):
         self.assertEqual(target.read_text(), "keep")
 
     def test_preexisting_loose_log_is_tightened(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         log = paths.attach_log_path()
         log.write_text("old\n")
@@ -859,7 +859,7 @@ class EnsureAttachTest(CliTestCase):
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
     def test_symlinked_log_warns_and_does_not_raise(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         target = Path(self._tmp.name) / "victim"
         target.write_text("keep")
@@ -876,7 +876,7 @@ class EnsureAttachTest(CliTestCase):
         self.assertEqual(target.read_text(), "keep")
 
     def test_popen_failure_warns_and_does_not_raise(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         err = io.StringIO()
         with (
@@ -888,7 +888,7 @@ class EnsureAttachTest(CliTestCase):
         self.assertIn("boom", err.getvalue())
 
     def test_spawn_takes_the_flock(self) -> None:
-        from undertone import voice
+        from eridian import voice
 
         modes = []
         real_flock = cli.fcntl.flock
@@ -940,14 +940,14 @@ class StopCommandTest(CliTestCase):
         with mock.patch.object(
             cli.subprocess,
             "run",
-            return_value=ps("/x/python -m undertone attach\n"),
+            return_value=ps("/x/python -m eridian attach\n"),
         ):
             self.assertTrue(cli._pid_is_attach(1))
 
     def test_pid_is_attach_rejects_lookalike_command_lines(self) -> None:
         for command in (
-            "tail -f /Users/x/.undertone/attach.log\n",
-            "vim undertone-attach-notes\n",
+            "tail -f /Users/x/.eridian/attach.log\n",
+            "vim eridian-attach-notes\n",
         ):
             with self.subTest(command=command):
                 with mock.patch.object(
@@ -955,8 +955,8 @@ class StopCommandTest(CliTestCase):
                 ):
                     self.assertFalse(cli._pid_is_attach(1))
         for command in (
-            "/x/.venv/bin/python /x/.venv/bin/undertone attach --no-beep\n",
-            "/x/python -m undertone attach\n",
+            "/x/.venv/bin/python /x/.venv/bin/eridian attach --no-beep\n",
+            "/x/python -m eridian attach\n",
         ):
             with self.subTest(command=command):
                 with mock.patch.object(
@@ -974,17 +974,17 @@ class StopCommandTest(CliTestCase):
 
 class ShellInitTest(CliTestCase):
     def test_zsh_function_uses_absolute_executable(self) -> None:
-        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/undertone", "shell-init", "zsh"]):
+        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/eridian", "shell-init", "zsh"]):
             rc, out = self._run("shell-init", "zsh")
         self.assertEqual(rc, 0)
-        self.assertIn('claude() { /opt/v/bin/undertone launch -- "$@"; }', out)
+        self.assertIn('claude() { /opt/v/bin/eridian launch -- "$@"; }', out)
         self.assertIn("command claude", out)
-        self.assertIn("add-zsh-hook precmd _undertone_claude_precmd", out)
-        self.assertIn("add-zsh-hook -d precmd _undertone_claude_precmd", out)
+        self.assertIn("add-zsh-hook precmd _eridian_claude_precmd", out)
+        self.assertIn("add-zsh-hook -d precmd _eridian_claude_precmd", out)
 
     @unittest.skipUnless(shutil.which("zsh"), "zsh not installed")
     def test_function_survives_cmux_redefining_claude_at_first_prompt(self) -> None:
-        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/undertone", "shell-init", "zsh"]):
+        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/eridian", "shell-init", "zsh"]):
             _, init = self._run("shell-init", "zsh")
         script = (
             "autoload -Uz add-zsh-hook\n"
@@ -1002,10 +1002,10 @@ class ShellInitTest(CliTestCase):
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "UNDERTONE_HOME": self._tmp.name},
+            env={**os.environ, "ERIDIAN_HOME": self._tmp.name},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("undertone launch", proc.stdout)
+        self.assertIn("eridian launch", proc.stdout)
         self.assertNotIn("_cmux_claude_wrapper_command", proc.stdout)
 
     def test_only_zsh(self) -> None:

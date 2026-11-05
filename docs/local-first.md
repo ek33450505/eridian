@@ -1,29 +1,29 @@
 # Local-First: Where Your Data Goes
 
-This is the deep version of the README's lead section. undertone's promise is: **no audio leaves the Mac, and there are no API keys and no cloud STT/TTS fallbacks.**
+This is the deep version of the README's lead section. eridian's promise is: **no audio leaves the Mac, and there are no API keys and no cloud STT/TTS fallbacks.**
 
 ## Data-Flow Table
 
 | Stays on your Mac | Goes to Anthropic | Never exists |
 |---|---|---|
-| Mic audio; wake word (pymicro-wakeword); VAD (Silero, 32 ms chunks); STT (parakeet-mlx, float32 in memory); TTS (Kokoro-82M via onnxruntime, rendered in memory; or macOS `say`, rendered to a private temp file that is deleted after reading); G2P for Kokoro (espeak-ng CLI, GPL-3.0, subprocess only); AEC (livekit WebRTC AudioProcessingModule, local-only); all models | The transcribed text of each turn, plus normal Claude Code traffic: the contents of files Claude reads (working directory only) and its WebSearch queries, which run server-side | API keys of undertone's own (it uses however your `claude` is logged in); audio uploads; cloud STT/TTS fallbacks |
+| Mic audio; wake word (pymicro-wakeword); VAD (Silero, 32 ms chunks); STT (parakeet-mlx, float32 in memory); TTS (Kokoro-82M via onnxruntime, rendered in memory; or macOS `say`, rendered to a private temp file that is deleted after reading); G2P for Kokoro (espeak-ng CLI, GPL-3.0, subprocess only); AEC (livekit WebRTC AudioProcessingModule, local-only); all models | The transcribed text of each turn, plus normal Claude Code traffic: the contents of files Claude reads (working directory only) and its WebSearch queries, which run server-side | API keys of eridian's own (it uses however your `claude` is logged in); audio uploads; cloud STT/TTS fallbacks |
 
 ## Every Network Touchpoint, Listed Honestly
 
-### 1. **`undertone models fetch`**
+### 1. **`eridian models fetch`**
 A one-time Hugging Face download includes:
 - `mlx-community/parakeet-tdt-0.6b-v3` (STT, ~2.5 GB): model file 2,508,288,736 bytes (`model.safetensors`)
-- `onnx-community/Kokoro-82M-v1.0-ONNX` (TTS, pinned revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, Phase 4b): fp32 `onnx/model.onnx`, tokenizer, and voice files. Each is checked against a SHA-256 pinned in `src/undertone/kokoro.py` whenever it loads from the cache
+- `onnx-community/Kokoro-82M-v1.0-ONNX` (TTS, pinned revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, Phase 4b): fp32 `onnx/model.onnx`, tokenizer, and voice files. Each is checked against a SHA-256 pinned in `src/eridian/kokoro.py` whenever it loads from the cache
 
 In normal operation, `stt.py` does `os.environ.setdefault("HF_HUB_OFFLINE", "1")` at import time, before parakeet is imported. `kokoro.py` does the same before importing onnxruntime. That keeps the Hub offline on every start, unless you set `HF_HUB_OFFLINE` yourself. Without that flag, `from_pretrained` contacts the Hub on every startup even with a warm local cache (discovered in Phase 0).
 
 The `fetch_model()` function temporarily lifts the offline flag ONLY for the one-time download; loading never contacts the Hub again. At runtime, the model is loaded with `local_files_only=True`.
 
 ### 2. **The `claude` Child** (Path B) and **Claude Code Session** (Path A)
-In Path B, the persistent `claude -p` process in `undertone chat` connects to api.anthropic.com. In Path A, a running Claude Code session receives voice transcripts via the MCP channel. Both authenticate however your `claude` already does; undertone adds no key of its own. Transcribed text and anything Claude reads from your files leave here.
+In Path B, the persistent `claude -p` process in `eridian chat` connects to api.anthropic.com. In Path A, a running Claude Code session receives voice transcripts via the MCP channel. Both authenticate however your `claude` already does; eridian adds no key of its own. Transcribed text and anything Claude reads from your files leave here.
 
 ### 2b. **onnxruntime Telemetry (Phase 4b)**
-onnxruntime 1.30's macOS wheel embeds Microsoft's 1DS telemetry client (`mobile.events.data.microsoft.com`). `src/undertone/kokoro.py` FORCES `ORT_DISABLE_TELEMETRY=1` before onnxruntime is imported and calls `onnxruntime.disable_telemetry_events()`. With the variable set, ORT no longer even initializes its telemetry device ID. The force-disable is verified in the offline check.
+onnxruntime 1.30's macOS wheel embeds Microsoft's 1DS telemetry client (`mobile.events.data.microsoft.com`). `src/eridian/kokoro.py` FORCES `ORT_DISABLE_TELEMETRY=1` before onnxruntime is imported and calls `onnxruntime.disable_telemetry_events()`. With the variable set, ORT no longer even initializes its telemetry device ID. The force-disable is verified in the offline check.
 
 ### 3. **Optional: `training/` Docker Image**
 The Docker image `training/Dockerfile` (optional — the default "hey jarvis" is pretrained):
@@ -31,10 +31,10 @@ The Docker image `training/Dockerfile` (optional — the default "hey jarvis" is
 - At **build time:** wgets checkpoints for embedding and melspectrogram models from GitHub
 - During **training:** downloads datasets and phonemizer data
 
-This only happens if you build or run the image. undertone's core (`undertone chat`) does not download any training data.
+This only happens if you build or run the image. eridian's core (`eridian chat`) does not download any training data.
 
 ### 4. **Nothing Else**
-undertone itself has no telemetry, no update checks and no fallback services. Traffic from the `claude` child is Claude Code's own (including any telemetry it sends), and Claude Code's settings govern it.
+eridian itself has no telemetry, no update checks and no fallback services. Traffic from the `claude` child is Claude Code's own (including any telemetry it sends), and Claude Code's settings govern it.
 
 ## Verify It Yourself
 
@@ -47,7 +47,7 @@ Run `bash scripts/verify-offline.sh`.
 3. Inside that sandbox, feeds the real wake word detector, VAD, and STT through `Listener` with a simulated clock
 4. Calls `say -o` to render a reply to an AIFF file
 5. **Echo cancellation check (Phase 4):** Simulates room echo on the rendered reply and runs it through the real `AudioProcessingModule` (WebRTC AEC3). Asserts ERLE ≥ 20 dB and that residual speech is too short to trigger talk-over.
-6. **Kokoro check (Phase 4b):** Asserts that importing `undertone.kokoro` forced `ORT_DISABLE_TELEMETRY=1`, then renders a fixed sentence from the local model cache (espeak-ng → onnxruntime), reports the time to first audio, and writes it to `<out>-kokoro.wav` (16 kHz mono 16-bit).
+6. **Kokoro check (Phase 4b):** Asserts that importing `eridian.kokoro` forced `ORT_DISABLE_TELEMETRY=1`, then renders a fixed sentence from the local model cache (espeak-ng → onnxruntime), reports the time to first audio, and writes it to `<out>-kokoro.wav` (16 kHz mono 16-bit).
 7. **Kokoro self-screen check (Phase 4b):** Renders "hey jarvice" (a homophone that passes the text scrub) and an ordinary sentence with Kokoro. A fresh `ScreenedSink` with the real wake detector must block the first and play the second.
 8. Asserts:
    - Network canary fails (TCP to 1.1.1.1 and DNS lookup both blocked)
@@ -71,23 +71,23 @@ MLX (the ML framework) and macOS `say` are macOS-only; Docker can't run them.
 **Platform note:**
 Apple has deprecated `sandbox-exec`. It is still present and working on macOS 26.6, verified 2026-10-01; older versions are untested.
 
-### (b) Live Connection Check During `undertone chat`
-While running `undertone chat`:
+### (b) Live Connection Check During `eridian chat`
+While running `eridian chat`:
 
 ```bash
-# Find the PIDs. `uv run` starts a uv process and then undertone's Python
+# Find the PIDs. `uv run` starts a uv process and then eridian's Python
 # process, and both match. -n picks the newest one, which is the Python process.
-undertone_pid=$(pgrep -nf 'undertone chat')
-children=$(pgrep -d, -P "$undertone_pid")   # the claude child, plus any say/afplay in flight
+eridian_pid=$(pgrep -nf 'eridian chat')
+children=$(pgrep -d, -P "$eridian_pid")   # the claude child, plus any say/afplay in flight
 
 # Show open sockets for each
-lsof -a -i -n -P -p "$undertone_pid"   # undertone Python process: expect no output
+lsof -a -i -n -P -p "$eridian_pid"   # eridian Python process: expect no output
 lsof -a -i -n -P -p "$children"        # children: expect only :443 to Anthropic
-nettop -p "$undertone_pid"             # optional: live per-process traffic
+nettop -p "$eridian_pid"             # optional: live per-process traffic
 ```
 
 **Measured on M4 Max (2026-10-01):**
-- undertone Python process: **zero sockets**
+- eridian Python process: **zero sockets**
 - `claude` child: TCP :443 to 160.79.104.10 and 2607:6bc0::10 only
 
 **Verify the IP owner:**
@@ -111,13 +111,13 @@ Your terminal app needs microphone permission (macOS → System Settings → Pri
 
 ### Audio Buffering and Storage
 - Audio is buffered in RAM only after the wake word fires, during the 6-second follow-up window, or during talk-over playback
-- TTS audio is rendered into a transient temp directory (mode 0700) created with `tempfile.mkdtemp(prefix="undertone-tts-")`, validated for format (1 channel, 16-bit, 16 kHz), read into the playback buffer, and immediately unlinked. The directory is deleted when `RenderedSpeechQueue` closes.
+- TTS audio is rendered into a transient temp directory (mode 0700) created with `tempfile.mkdtemp(prefix="eridian-tts-")`, validated for format (1 channel, 16-bit, 16 kHz), read into the playback buffer, and immediately unlinked. The directory is deleted when `RenderedSpeechQueue` closes.
 - Playback audio buffers in RAM (~32 KB/s of speech); replies up to 64 KB of text can buffer ~10 MB in memory at most
 - Nothing else is recorded to disk
-- The session ID is stored in `~/.undertone/chat_session` (mode 0600) for `--resume`
+- The session ID is stored in `~/.eridian/chat_session` (mode 0600) for `--resume`
 
 ### Claude Code Logs
-The `claude` child's stderr goes to `~/.undertone/logs/brain.log` (mode 0600). Claude Code keeps its own transcripts under `~/.claude/projects/` as usual.
+The `claude` child's stderr goes to `~/.eridian/logs/brain.log` (mode 0600). Claude Code keeps its own transcripts under `~/.claude/projects/` as usual.
 
 ### File Reads
 When Claude uses Read/Glob/Grep, it sees only files under the working directory (enforced by `--restricted` and `--tools Read,Grep,Glob,WebSearch`).

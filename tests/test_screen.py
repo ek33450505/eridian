@@ -1,8 +1,8 @@
-"""Tests for undertone.screen.ScreenedSink (no audio devices)."""
+"""Tests for eridian.screen.ScreenedSink (no audio devices)."""
 
 import unittest
 
-from undertone.screen import HISTORY_S, LOOKAHEAD_S, ScreenedSink
+from eridian.screen import HISTORY_S, LOOKAHEAD_S, ScreenedSink
 
 MARK = b"\x01\x00" * 160
 A = b"\x02\x00" * 160
