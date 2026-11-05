@@ -671,9 +671,18 @@ def _cmd_shell_init(args: argparse.Namespace) -> int:
     exe = Path(sys.argv[0]).absolute()
     if exe.name != "undertone":  # e.g. `python -m undertone`: use the venv script
         exe = Path(sys.executable).absolute().parent / "undertone"
+    fn = f"claude() {{ {shlex.quote(str(exe))} launch -- \"$@\"; }}"
     print(
         "# `command claude` bypasses this function and runs plain claude.\n"
-        f"claude() {{ {shlex.quote(str(exe))} launch -- \"$@\"; }}"
+        f"{fn}\n"
+        "# cmux redefines claude() at the first prompt (its _cmux_fix_path precmd hook); "
+        "re-assert ours once, after it.\n"
+        "_undertone_claude_precmd() {\n"
+        f"  {fn}\n"
+        "  add-zsh-hook -d precmd _undertone_claude_precmd\n"
+        "}\n"
+        "autoload -Uz add-zsh-hook\n"
+        "add-zsh-hook precmd _undertone_claude_precmd"
     )
     return 0
 

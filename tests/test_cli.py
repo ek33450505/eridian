@@ -973,6 +973,34 @@ class ShellInitTest(CliTestCase):
         self.assertEqual(rc, 0)
         self.assertIn('claude() { /opt/v/bin/undertone launch -- "$@"; }', out)
         self.assertIn("command claude", out)
+        self.assertIn("add-zsh-hook precmd _undertone_claude_precmd", out)
+        self.assertIn("add-zsh-hook -d precmd _undertone_claude_precmd", out)
+
+    @unittest.skipUnless(shutil.which("zsh"), "zsh not installed")
+    def test_function_survives_cmux_redefining_claude_at_first_prompt(self) -> None:
+        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/undertone", "shell-init", "zsh"]):
+            _, init = self._run("shell-init", "zsh")
+        script = (
+            "autoload -Uz add-zsh-hook\n"
+            "_cmux_fix_path() {\n"
+            "  claude() { _cmux_claude_wrapper_command \"$@\"; }\n"
+            "  add-zsh-hook -d precmd _cmux_fix_path\n"
+            "}\n"
+            "add-zsh-hook precmd _cmux_fix_path\n"  # cmux loads before .zshrc
+            f"{init}\n"
+            "for f in $precmd_functions; do $f; done\n"
+            "whence -f claude\n"
+        )
+        proc = subprocess.run(
+            ["zsh", "-f", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "UNDERTONE_HOME": self._tmp.name},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("undertone launch", proc.stdout)
+        self.assertNotIn("_cmux_claude_wrapper_command", proc.stdout)
 
     def test_only_zsh(self) -> None:
         with (
