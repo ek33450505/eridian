@@ -32,6 +32,10 @@ NOTEBOOK_URL="https://raw.githubusercontent.com/kahrendt/microWakeWord/main/note
 MWW_REPO="https://github.com/kahrendt/microWakeWord"
 PIPER_REPO="https://github.com/kahrendt/piper-sample-generator"
 PIPER_MODEL_URL="https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt"
+# Trust-on-first-use: hashed from the official rhasspy v2.0.0 release on 2026-11-04,
+# because upstream publishes no checksum. train.sh unpickles this file, so it is
+# verified here and again before every generation run.
+PIPER_MODEL_SHA256="e95ee53770bf598c354a6e6dbfc95ccb259aeeb501d35a86be8a767429ab0ff6"
 # The PyPI universal2 wheel replaces the notebook's macOS fork, which no longer builds with current clang; it is the version pymicro-wakeword pulls in for undertone's runtime.
 PYMICRO_FEATURES_SPEC="pymicro-features==2.0.2"
 AUDIO_METADATA_SPEC="git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f"
@@ -179,7 +183,15 @@ else
 fi
 log "piper-sample-generator commit: $(git -C "$PIPER_DIR" rev-parse HEAD)"
 mkdir -p "$PIPER_DIR/models"
-fetch "$PIPER_MODEL_URL" "$PIPER_DIR/models/en_US-libritts_r-medium.pt"
+PIPER_MODEL="$PIPER_DIR/models/en_US-libritts_r-medium.pt"
+fetch "$PIPER_MODEL_URL" "$PIPER_MODEL"
+# Checked on every run, including when the file was already present.
+piper_sum="$(shasum -a 256 "$PIPER_MODEL")" || die "cannot hash $PIPER_MODEL"
+if [[ "${piper_sum%% *}" != "$PIPER_MODEL_SHA256" ]]; then
+	safe_rm_subdir "piper-sample-generator/models/en_US-libritts_r-medium.pt"
+	die "piper model sha256 mismatch (got ${piper_sum%% *}); removed it, rerun to refetch"
+fi
+log "piper model sha256 ok"
 
 if [[ -e "$MWW_ROOT/.done-pip-piper" ]]; then
 	log "skip piper pip install (marker exists)"

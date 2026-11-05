@@ -58,6 +58,11 @@ die() {
 	exit 1
 }
 
+# Any unhandled failure (set -e) is logged with the command, status and line;
+# -E carries the trap into functions and subshells.
+set -E
+trap 'log "ERROR: command failed (exit $?) at line $LINENO: $BASH_COMMAND"' ERR
+
 # --- args -----------------------------------------------------------------
 FROM="${STEPS[0]}"
 EXPLICIT=0
@@ -94,13 +99,20 @@ done
 [[ -d "$MWW_ROOT/microWakeWord" ]] || die "microWakeWord clone missing; run setup.sh first"
 [[ -s "$PIPER_DIR/models/en_US-libritts_r-medium.pt" ]] || die "piper model missing; run setup.sh first"
 [[ -e "$MWW_ROOT/negative_datasets/.done-speech.zip" ]] || die "negative datasets missing; run setup.sh first"
+# Keep in sync with setup.sh (trust-on-first-use from the rhasspy v2.0.0 release,
+# 2026-11-04). gen() unpickles this file, so refuse any other content.
+PIPER_MODEL_SHA256="e95ee53770bf598c354a6e6dbfc95ccb259aeeb501d35a86be8a767429ab0ff6"
+piper_sum="$(shasum -a 256 "$PIPER_DIR/models/en_US-libritts_r-medium.pt")" || die "cannot hash piper model"
+[[ "${piper_sum%% *}" == "$PIPER_MODEL_SHA256" ]] || die "piper model sha256 mismatch (got ${piper_sum%% *}); rerun setup.sh"
 log "MWW_ROOT=$MWW_ROOT from=$FROM"
 
 # The notebook uses cwd-relative paths; keep them.
 cd "$MWW_ROOT"
 
 count_wavs() {
-	find "$1" -maxdepth 1 -name '*.wav' 2>/dev/null | wc -l | tr -d ' '
+	# find exits 1 on a missing dir and pipefail would carry that through,
+	# silently killing the script under set -e; a missing dir counts as 0.
+	{ find "$1" -maxdepth 1 -name '*.wav' 2>/dev/null || true; } | wc -l | tr -d ' '
 }
 
 # gen <name> <text> <count> <dir>: piper generate_samples.py, exactly the
@@ -115,7 +127,10 @@ gen() {
 	fi
 	log "generate $count x '$text' -> $dir/$name"
 	safe_rm_subdir "${dir#"$MWW_ROOT/"}/$name"
-	"$PY" "$PIPER_DIR/generate_samples.py" "$text" \
+	# torch >= 2.6 defaults torch.load to weights_only=True, which rejects piper's
+	# pickled checkpoint. Ed approved the full unpickle on 2026-11-04 for this
+	# hash-pinned file only: set on this one command, never exported.
+	TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "$PY" "$PIPER_DIR/generate_samples.py" "$text" \
 		--max-samples "$count" \
 		--batch-size "$PIPER_BATCH" \
 		--output-dir "$dir/$name" 2>&1 | tee -a "$LOG"
