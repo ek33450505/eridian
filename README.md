@@ -254,6 +254,7 @@ Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word 
 - `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
 - `UNDERTONE_WAKE_MODEL` — absolute path to a microWakeWord manifest json (a custom wake word, e.g. "hey rocky"); replaces "hey jarvis" everywhere. Unset uses the builtin. A missing or invalid manifest stops startup with an error; see [Custom wake word](#custom-wake-word)
 - `UNDERTONE_WAKE_PHRASE` (set by `undertone session`) — the resolved wake phrase passed to the channel via MCP config; internal use only
+- `UNDERTONE_PERSONA` — `rocky` makes spoken replies use a short-sentence, no-article alien-engineer style (confirm prompts, commands, paths and numbers stay plain: an instruction to Claude, not a code guarantee; the voice guard enforces confirms in code either way); unset or `off` means no persona; any other value makes `undertone session` and voice-mode `undertone launch` stop with an error (passthrough `claude` ignores it)
 - `UNDERTONE_AUTOLAUNCH` — set to `0` to make `undertone launch` (and the `shell-init` function) run plain `claude`
 - `UNDERTONE_SESSION` (set by `undertone session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Daniel"`); empty string uses system voice

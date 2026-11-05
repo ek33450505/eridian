@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from . import paths, wake
+from . import paths, persona, wake
 
 
 _WAKE_CUE = "/System/Library/Sounds/Tink.aiff"
@@ -399,6 +399,9 @@ def channel_mcp_config(executable: str, home: Path, token: str) -> dict:
     phrase = wake.current()
     if not phrase.is_default:
         env[wake.PHRASE_ENV] = phrase.phrase
+    persona_name = persona.resolve()
+    if persona_name:
+        env[persona.PERSONA_ENV] = persona_name
     return {
         "mcpServers": {
             "undertone": {
@@ -525,8 +528,20 @@ def _cmd_session(args: argparse.Namespace) -> int:
     return _exec_session(rest, warn_no_voice=True)
 
 
+def _persona_refused() -> bool:
+    """Print the error and return True if UNDERTONE_PERSONA is invalid (voice sessions only)."""
+    try:
+        persona.resolve()
+    except persona.PersonaError as exc:
+        print(f"undertone: {exc}", file=sys.stderr)
+        return True
+    return False
+
+
 def _exec_session(rest: list[str], *, warn_no_voice: bool) -> int:
-    """Exec claude wired to the voice channel; returns only on a refused flag."""
+    """Exec claude wired to the voice channel; returns only on a refused flag or bad persona."""
+    if _persona_refused():
+        return 1
     for arg in rest:
         if arg in _REFUSED_SESSION_FLAGS or arg.startswith("--settings="):
             flag = arg.split("=", 1)[0]
@@ -668,6 +683,8 @@ def _cmd_launch(args: argparse.Namespace) -> int:
         rest = rest[1:]
     mode = launch_mode(rest, os.environ, sys.stdin.isatty(), sys.stdout.isatty())
     if mode == "voice":
+        if _persona_refused():  # before spawning attach; passthrough ignores the persona
+            return 1
         _ensure_attach()
         return _exec_session(rest, warn_no_voice=False)
     claude_cmd = os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"

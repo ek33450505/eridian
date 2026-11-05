@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import paths, voice_guard, wake
+from . import persona as persona_mod
 
 SERVER_NAME = "undertone"
 SERVER_VERSION = "0.1.0"
@@ -129,10 +130,13 @@ _INSTR_TAIL_COMMON = (
 )
 
 
-def build_instructions(safe_phrase: bool, wake_word: wake.WakeWord = wake.DEFAULT) -> str:
+def build_instructions(
+    safe_phrase: bool, wake_word: wake.WakeWord = wake.DEFAULT, persona: str = ""
+) -> str:
     """The MCP `instructions` string; `safe_phrase` swaps the two-word confirm material.
 
-    `wake_word` supplies the phrase and the assistant name the text refers to.
+    `wake_word` supplies the phrase and the assistant name the text refers to;
+    `persona` ("rocky") appends the speech-style block, "" leaves the text unchanged.
     """
     read_only = (
         "These MCP tools are read-only and run on a voice turn with no confirmation, so "
@@ -149,11 +153,16 @@ def build_instructions(safe_phrase: bool, wake_word: wake.WakeWord = wake.DEFAUL
     else:
         quoted = wake_word.phrase
         avoid_name = f'Avoid saying your own name ("{wake_word.name}") too, for the same reason. '
-    return (
+    text = (
         text.replace("{quoted}", quoted)
         .replace("{avoid_name}", avoid_name)
         .replace("{phrase}", wake_word.phrase)
     )
+    if persona not in ("", persona_mod.ROCKY):
+        raise ValueError(f"unknown persona: {persona!r}")
+    if persona == persona_mod.ROCKY:
+        text += " " + persona_mod.ROCKY_BLOCK
+    return text
 
 
 def _build(safe_phrase: bool, read_only: str, refusal: str) -> str:
@@ -414,7 +423,9 @@ class ChannelServer:
                 "protocolVersion": version,
                 "capabilities": {"experimental": {"claude/channel": {}}, "tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": build_instructions(self._safe_phrase, wake.current_phrase_only()),
+                "instructions": build_instructions(
+                    self._safe_phrase, wake.current_phrase_only(), persona_mod.resolve()
+                ),
             },
         )
 
@@ -536,6 +547,11 @@ def main() -> int:
     try:
         wake.resolve_phrase_only()  # fail closed: a bad UNDERTONE_WAKE_PHRASE must not yield wrong instructions
     except wake.WakeWordError as exc:
+        print(f"undertone channel: {exc}", file=sys.stderr)
+        return 1
+    try:
+        persona_mod.resolve()  # fail closed likewise: a bad UNDERTONE_PERSONA must not drop the persona silently
+    except persona_mod.PersonaError as exc:
         print(f"undertone channel: {exc}", file=sys.stderr)
         return 1
     return ChannelServer(
