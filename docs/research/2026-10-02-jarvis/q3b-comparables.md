@@ -1,9 +1,9 @@
-# Q3b: Comparable voice assistants - features undertone lacks
+# Q3b: Comparable voice assistants - features eridian lacks
 Date: 2026-10-02. Method: WebSearch/WebFetch only; no installs. Many fetches returned thin README summaries, see section 5.
 
 ## 1. Project survey
 
-| Project | Repo / URL | License | Notable features relevant to undertone |
+| Project | Repo / URL | License | Notable features relevant to eridian |
 |---|---|---|---|
 | VoiceMode (mbailey) | https://github.com/mbailey/voicemode | MIT | Claude Code plugin + MCP server; local Whisper + Kokoro; silence detection; LiveKit transport; search snippets also list: soundfonts (tones on tool use), TTS/audio hook notifications ("spoken feedback when Claude writes files, runs commands"), voice handoff between Claude Code agents. v8.12.0p0 (2026-07-21, per aggregator). Pull-style: Claude calls a converse tool, so it speaks only when the agent decides to. |
 | Claude Code /voice | https://code.claude.com/docs/en/voice-dictation | Proprietary (built in) | Dictation only, no spoken replies. Hold-space push-to-talk or tap-to-send; rebindable `voice:pushToTalk`; project name and git branch fed as recognition hints; `autoSubmit`; Esc/Ctrl+C cancels; dictates into agent-view peek replies to background sessions. Cloud STT, claude.ai account only, no SSH. |
@@ -20,24 +20,24 @@ Date: 2026-10-02. Method: WebSearch/WebFetch only; no installs. Many fetches ret
 | Serenade | https://github.com/serenadeai/serenade | Apache-2.0 (main), MIT (VS Code ext) | Speech-to-code engine; original stalled ~3 yrs, community fork https://github.com/sombrafam/serenade. |
 | macOS Voice Control | https://support.apple.com/guide/mac-help/use-voice-control-commands-mh40719/mac | Proprietary | Dictation mode vs command mode; "show numbers"/grid overlays; custom commands ("make this speakable"). Eyes-free UI control, no agent awareness. |
 | JARVIS (adewaskar) | https://github.com/adewaskar/jarvis | MIT | "Hey Jarvis" + Claude Agent SDK brain, Three.js holographic UI, MCP tools, browser STT/TTS or ElevenLabs. |
-| Local Python Jarvises | https://github.com/atuldhull/jarvis , https://github.com/yasir24s/jarvis , https://github.com/MichelleBudri/my-jarvis | not checked | atuldhull: Silero VAD + LiveKit barge-in, Whisper/Piper/Ollama. yasir24s: speaker recognition, arc-reactor HUD. my-jarvis: timers/weather roadmap. All pursue the offline-LLM brain (on hold for undertone). |
+| Local Python Jarvises | https://github.com/atuldhull/jarvis , https://github.com/yasir24s/jarvis , https://github.com/MichelleBudri/my-jarvis | not checked | atuldhull: Silero VAD + LiveKit barge-in, Whisper/Piper/Ollama. yasir24s: speaker recognition, arc-reactor HUD. my-jarvis: timers/weather roadmap. All pursue the offline-LLM brain (on hold for eridian). |
 | localvoxtral issue #735 | https://github.com/T0mSIlver/localvoxtral/issues/735 | n/a (issue) | Survey (2026-09-26) stating: no existing tool routes spoken names to multiple live agent sessions; Amp "Puck" acts on the viewed thread; Claude Code /voice limited to peeked session. |
 
-## 2. Candidate features for undertone
+## 2. Candidate features for eridian
 
 Effort in sessions (1 session = one focused coding session incl. tests/review). Local-first: Y/N.
 
 | # | Feature | Who has it | Value | Why | Effort | Local-first |
 |---|---|---|---|---|---|---|
-| 1 | Proactive speech on Stop / Notification (agent_completed, permission_prompt, idle_prompt, agent_needs_input) | Superwhisper plugin, teatree, claude-code-tts, VoiceMode hooks, HA announce | High | Biggest hands-free gap: undertone is reactive; user must look to learn Claude finished or is blocked. Hook payload carries session_id/message so it plugs into the existing MCP channel and TTS. Pair with the existing wake-word-only confirm path. | 1-2 | Y (hooks + local Kokoro) |
+| 1 | Proactive speech on Stop / Notification (agent_completed, permission_prompt, idle_prompt, agent_needs_input) | Superwhisper plugin, teatree, claude-code-tts, VoiceMode hooks, HA announce | High | Biggest hands-free gap: eridian is reactive; user must look to learn Claude finished or is blocked. Hook payload carries session_id/message so it plugs into the existing MCP channel and TTS. Pair with the existing wake-word-only confirm path. | 1-2 | Y (hooks + local Kokoro) |
 | 2 | Spoken short summary of last result (Stop payload last_assistant_message, truncated, scrubbed via existing speech choke point) | teatree (600 chars), claude-code-tts | High | "Read me what it did" without screen; reuses scrub + sentence streaming. Needs a summarizer or head-truncation policy. | 1 | Y if truncation; a cheap local summary needs an LLM (on hold) so use truncation or ask Claude to emit a spoken summary line |
 | 3 | Push-to-talk hotkey (global, works while terminal unfocused) | Claude Code /voice, Handy, Superwhisper | High | Noisy room, open office, or a false-wake lockout; deterministic start with no wake word and no self-trigger risk. Global hotkey on macOS needs Accessibility/Input Monitoring permission. | 1-2 | Y |
-| 4 | Multi-session routing by voice ("tell the api session ...", "which sessions are waiting?") | none ships it per localvoxtral #735; Claude Code agent view is the manual analog; VoiceMode has agent handoff | Med-High | undertone is "latest session wins"; with several sessions a wrong target is a real risk. Needs session registry + name aliases (cwd/branch) + disambiguation. | 2-3 | Y |
+| 4 | Multi-session routing by voice ("tell the api session ...", "which sessions are waiting?") | none ships it per localvoxtral #735; Claude Code agent view is the manual analog; VoiceMode has agent handoff | Med-High | eridian is "latest session wins"; with several sessions a wrong target is a real risk. Needs session registry + name aliases (cwd/branch) + disambiguation. | 2-3 | Y |
 | 5 | Status/cost spoken summaries ("how many sessions are working?", "what did that cost?") | none found doing this by voice; agent view shows state visually | Med | Nice but depends on a stable cost source; session state is derivable from hook events (feature 1). Cost data source not verified. | 1-2 | Y |
 | 6 | Headphones/AirPods mode (route in/out to BT device, relax AEC/self-screen when headset detected, handle HFP 16 kHz sample-rate drop) | none of the surveyed projects documents it | Med | Headsets remove echo so talk-over is cleaner, but AirPods switching to HFP degrades output quality and may break device selection; real gotcha on macOS. Needs hardware testing. | 1-2 | Y |
-| 7 | Transcript/conversation history (searchable log of heard + spoken turns, replay "what did you say?") | VoiceMode (audio saving/logging), HA conversation history | Med | Recover a missed spoken answer; debug STT. Privacy: store locally with retention limit; undertone SECURITY posture needs a decision on retention. | 1 | Y |
+| 7 | Transcript/conversation history (searchable log of heard + spoken turns, replay "what did you say?") | VoiceMode (audio saving/logging), HA conversation history | Med | Recover a missed spoken answer; debug STT. Privacy: store locally with retention limit; eridian SECURITY posture needs a decision on retention. | 1 | Y |
 | 8 | Repeat last / "say that again" and stop/silence-all command | HA ("stop" wake word only while speaking/timer), Alexa-style | Med | Cheap and frequently needed; likely partly covered by barge-in. | 0.5 | Y |
-| 9 | Dictation-into-editor / free-form dictation mode with coding vocabulary hints (project and branch names) | Claude Code /voice, Wispr Flow, Superwhisper, Talon | Low-Med | Claude Code already injects project/branch hints for its own /voice; undertone injects into the same prompt so marginal gain is custom vocabulary biasing for Parakeet (feasibility not verified). | 1-2 | Y |
+| 9 | Dictation-into-editor / free-form dictation mode with coding vocabulary hints (project and branch names) | Claude Code /voice, Wispr Flow, Superwhisper, Talon | Low-Med | Claude Code already injects project/branch hints for its own /voice; eridian injects into the same prompt so marginal gain is custom vocabulary biasing for Parakeet (feasibility not verified). | 1-2 | Y |
 | 10 | Menu-bar status presence (listening/thinking/speaking/muted, mute toggle) | Superwhisper overlay, HA companion, Jarvis HUDs | Med | Trust signal for an always-listening mic; also a manual mute/PTT surface. Needs a macOS menu-bar shim (rumps or Swift). | 2 | Y |
 | 11 | Soundfont earcons (short tones for tool use/done/needs input) | VoiceMode soundfonts | Low-Med | Quieter than speech for frequent events; trivial once feature 1 exists. | 0.5 | Y |
 | 12 | Timers/reminders | HA, OVOS, my-jarvis | Low | Off-mission for a Claude Code voice layer. | 1 | Y |
@@ -47,7 +47,7 @@ Effort in sessions (1 session = one focused coding session incl. tests/review). 
 
 ## 3. Top 5 picks
 
-1. Proactive speech from Notification/Stop hooks (feature 1). Highest value, and every comparable that targets Claude Code ships some form (Superwhisper, teatree, VoiceMode). Notification matcher types are confirmed in the hooks docs. Route through the existing speech choke point so scrub and self-screen apply. Open decision: how a hook (separate process) reaches the running undertone daemon (unix socket or the MCP channel).
+1. Proactive speech from Notification/Stop hooks (feature 1). Highest value, and every comparable that targets Claude Code ships some form (Superwhisper, teatree, VoiceMode). Notification matcher types are confirmed in the hooks docs. Route through the existing speech choke point so scrub and self-screen apply. Open decision: how a hook (separate process) reaches the running eridian daemon (unix socket or the MCP channel).
 2. Push-to-talk hotkey (feature 3). Table stakes in Claude Code /voice and Handy; solves noisy-room and false-wake cases without the wake-word path, and gives a clean "I am addressing you" signal.
 3. Hook-driven answer loop: when feature 1 announces "needs permission/answer", open the follow-up window immediately and keep voice-confirm wake-word-only (Superwhisper's "agent done, answer by voice" loop, HA continued conversation). Small increment on pick 1.
 4. Multi-session routing and "what is waiting?" status (features 4+5). Differentiator: localvoxtral #735 reports no tool does spoken-name routing. Builds on session_id carried by hooks; start with "status of sessions" plus "switch to <name>" before arbitrary dictation by name.
@@ -80,5 +80,5 @@ From search results only (snippets, not fetched):
 - Talon licensing nuance (proprietary core, MIT community set) from a search summary and EULA link only.
 - Speaker identification coverage in yasir24s/jarvis: README claim only; see Q3a.
 - Cost-data source for feature 5, Parakeet vocabulary biasing for feature 9, AirPods HFP behavior on macOS for feature 6, and global-hotkey permission needs: not researched.
-- No project's undertone-comparable echo cancellation or self-screen was found; absence is "not found", not "proven absent".
+- No project's eridian-comparable echo cancellation or self-screen was found; absence is "not found", not "proven absent".
 - Not covered: Amp Puck, opencode, herdr, cmux voice details beyond the localvoxtral issue summary.

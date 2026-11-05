@@ -10,7 +10,7 @@ Date: 2026-10-02. Method: WebSearch/WebFetch only (sandbox blocked `gh api` TLS 
 
 ## 2. osascript / JXA + TCC (bridge type 2)
 - Scriptable with dictionaries: Calendar, Reminders, Notes, Mail, Messages (send/chats; individual messages NOT exposed, apple-bridge README confirms), Contacts, Music, Finder, Safari, System Events (UI scripting needs Accessibility). Home/HomeKit has no AppleScript; Focus has no AppleScript API (use Shortcuts).
-- TCC Automation: each controlled app needs a (client -> target app) grant. The prompt names the *responsible process*, i.e. the GUI app that launched the chain (Terminal/iTerm/Claude desktop host), not osascript. Sources: Michael Tsai, steipete, anthropics/claude-code#98783. Child processes inherit the responsible process, so for Ed the grant lands on whichever terminal/app hosts the Claude Code session (and the undertone daemon if it is a separate launchd job, it needs its own grants).
+- TCC Automation: each controlled app needs a (client -> target app) grant. The prompt names the *responsible process*, i.e. the GUI app that launched the chain (Terminal/iTerm/Claude desktop host), not osascript. Sources: Michael Tsai, steipete, anthropics/claude-code#98783. Child processes inherit the responsible process, so for Ed the grant lands on whichever terminal/app hosts the Claude Code session (and the eridian daemon if it is a separate launchd job, it needs its own grants).
 - Error -1743 = not authorized. Grants live in System Settings > Privacy & Security > Automation; reset with `tccutil reset AppleEvents`. Reading `chat.db`/Mail/Notes SQLite needs Full Disk Access for the same responsible process.
 - Claude Code specifics: an issue found (rjwalters/loom#6367) says spawned Claude sessions may get a clean tool denial for osascript instead of a TCC prompt; Claude Code's own permission rules can gate `osascript` Bash calls. [Claude Code behaviour not tested locally]
 - Risk: osascript is arbitrary code (do shell script, keystroke). Prefer wrapping in an MCP server with fixed verbs.
@@ -53,7 +53,7 @@ Date: 2026-10-02. Method: WebSearch/WebFetch only (sandbox blocked `gh api` TLS 
 1. **Reminders + Calendar read/add via EventKit MCP (che-ical-mcp, MIT).** High voice value ("what's next", "remind me ..."), no Automation prompts (EventKit TCC only), mostly self-authored data, undo exists. Start with write limited to reminders; calendar create without attendees.
 2. **Music via `shortcuts run` wrappers or pedrocid/music-mcp.** Pure local, no sensitive data in, no third-party text; playback is the most natural voice command. Shortcuts wrappers give a fixed allowlist with no new server code.
 3. **Home scenes via pre-authored Shortcuts (`shortcuts run "Good Night"`)** instead of HomeClaw (entitlement/Developer account overhead). Allowlist scenes only; keep locks/garage out.
-Defer Mail and Messages: high injection exposure and irreversible sends. If added later, read-only first (or draft-only like orchard-mcp) and require the voice confirmation gate already built in undertone for sends.
+Defer Mail and Messages: high injection exposure and irreversible sends. If added later, read-only first (or draft-only like orchard-mcp) and require the voice confirmation gate already built in eridian for sends.
 
 ## Cross-cutting notes
 - Many "MCP servers" are one-person repos with <30 stars; vet code before granting FDA. FDA + Automation grants go to the responsible process (the terminal hosting Claude Code), widening that app's reach for everything it launches.
@@ -87,6 +87,6 @@ Defer Mail and Messages: high injection exposure and irreversible sends. If adde
 - Whether `shortcuts run` accepts stdin text and prints output to stdout (docs imply pipe-as-text; unrun).
 - Per-shortcut permission prompt behaviour when run headless from CLI; Focus-setting action headless.
 - Whether Claude Code's sandbox/permissions block osascript prompts for Ed's setup (osascript is blocked in this research sandbox; not tested on Ed's host).
-- Which process (terminal vs undertone daemon) will hold TCC grants in Ed's deployment.
+- Which process (terminal vs eridian daemon) will hold TCC grants in Ed's deployment.
 - EventKit servers' behaviour on macOS 26 (Tahoe) beyond che-ical-mcp's notarization claim.
 - Any Notes-specific or Focus-specific MCP server.

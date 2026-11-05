@@ -10,7 +10,7 @@
 #   steps: positives negatives features yaml train install smoke
 #
 # Env overrides:
-#   MWW_ROOT         install root, strictly under $HOME (default: $HOME/Datasets/undertone-training/mww)
+#   MWW_ROOT         install root, strictly under $HOME (default: $HOME/Datasets/eridian-training/mww)
 #                    `train.sh --check-root` validates it and exits
 #   PIPER_BATCH      piper batch size (default: 50, sized for MPS)
 #   POSITIVE_COUNT   "hey rocky" samples (default: 5000)
@@ -340,8 +340,8 @@ step_install() {
 }
 
 step_smoke() {
-	local upy="${UNDERTONE_PY:-$HOME/Projects/personal/undertone/.venv/bin/python}"
-	[[ -x "$upy" ]] || die "undertone venv python not found: $upy"
+	local upy="${ERIDIAN_PY:-$HOME/Projects/personal/eridian/.venv/bin/python}"
+	[[ -x "$upy" ]] || die "eridian venv python not found: $upy"
 	"$upy" -I "$HERE/smoke_test.py" --root "$MWW_ROOT" 2>&1 | tee -a "$LOG"
 }
 

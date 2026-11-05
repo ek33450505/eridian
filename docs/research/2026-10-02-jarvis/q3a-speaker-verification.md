@@ -1,7 +1,7 @@
-# Q3a: On-device speaker verification for undertone (2026-10-02)
+# Q3a: On-device speaker verification for eridian (2026-10-02)
 
 ## Recommendation
-Use **WeSpeaker CAM++ (VoxCeleb, 7.18M params) or ResNet34-LM as ONNX, run on the onnxruntime undertone already ships**; fbank frontend (80-mel Kaldi fbank + mean-norm) computed in numpy or via sherpa-onnx's extractor.
+Use **WeSpeaker CAM++ (VoxCeleb, 7.18M params) or ResNet34-LM as ONNX, run on the onnxruntime eridian already ships**; fbank frontend (80-mel Kaldi fbank + mean-norm) computed in numpy or via sherpa-onnx's extractor.
 - Export path: sherpa-onnx `speaker-recongition-models` release (sic) ships `wespeaker_en_voxceleb_CAM++.onnx` (~28 MB) and `wespeaker_en_voxceleb_resnet34.onnx` (~26 MB); WeSpeaker HF repos also carry ONNX. No PyTorch.
 - Fallback: MLX port `mlx-community/wespeaker-voxceleb-resnet34-LM` (MIT, 25 MB npz, 6.6M params) if ONNX frontend is a pain.
 - License caveat: weights are CC-BY-4.0 (inherit VoxCeleb's license). Permissive (attribution required, commercial OK) but NOT MIT/Apache/BSD strictly. Needs a NOTICE entry. The MLX port is labelled MIT, which is probably inaccurate for derived CC-BY weights; do not rely on that label.
@@ -27,7 +27,7 @@ Latency: no per-utterance CPU numbers found. Models are ~7M params; sherpa-onnx 
 ## Enrollment design sketch
 - Enroll 8-10 utterances (~30-60 s total speech) of varied content incl. "hey jarvis" and the confirm-phrase vocabulary; record in the real mic/room.
 - Embed each, L2-normalise, store mean centroid (+ keep individual embeddings for a max-of-k or mean-of-top-k score). Store as a local file, mode 0600, never the raw audio unless user opts in.
-- Score = cosine(utterance embedding, centroid). Re-enrol UX: `undertone enroll-voice`, with a `--verify` self-test.
+- Score = cosine(utterance embedding, centroid). Re-enrol UX: `eridian enroll-voice`, with a `--verify` self-test.
 - Optionally embed the wake-word segment + the phrase portion only (that is what carries the confirmation), skipping VAD-padded silence.
 
 ## Threshold / short utterances
@@ -36,7 +36,7 @@ Latency: no per-utterance CPU numbers found. Models are ~7M params; sherpa-onnx 
 - Use score-normalisation only if you gather a cohort; skip for v1.
 
 ## Spoofing
-- Speaker embeddings are NOT anti-spoofing. Replay and modern TTS/voice clones pass ASV at high rates. Kokoro's output is a different synthetic voice, so it would likely score low against the owner (that is a useful property for undertone's own-speech case, but must be measured, and does not hold against voice-cloned TTS of the owner).
+- Speaker embeddings are NOT anti-spoofing. Replay and modern TTS/voice clones pass ASV at high rates. Kokoro's output is a different synthetic voice, so it would likely score low against the owner (that is a useful property for eridian's own-speech case, but must be measured, and does not hold against voice-cloned TTS of the owner).
 - It helps self-wake: our own speaker output should fail owner match; a cheap extra guard on top of existing `wake_barge_in` logic.
 - Anti-spoofing: AASIST (clovaai) code MIT, EER 0.83% / AASIST-L 0.99% (85k params) on ASVspoof2019 LA; weights/data licence (ASVspoof2019 / VCTK) not verified; PyTorch only, no ONNX found; poor generalisation out-of-domain is widely reported (not verified here). Defer; v1 = ASV + wake + random phrase.
 
@@ -67,7 +67,7 @@ Go: FAR<=0.1% at FRR<=15% on 2 s owner audio, TTS/replay max below threshold, p9
 - https://huggingface.co/pyannote/embedding (MIT gated, 2.8%, verified)
 - https://github.com/clovaai/aasist (MIT, via search snippet)
 - https://k2-fsa.github.io/sherpa/onnx/speaker-identification/ (sherpa model files; sizes via search snippet)
-- Repo: src/undertone/voice.py:16-46,335-370; pyproject.toml:14
+- Repo: src/eridian/voice.py:16-46,335-370; pyproject.toml:14
 
 ## Not verified
 - Any CPU latency on Apple Silicon; sherpa-onnx wheel on Python 3.14; exact ONNX input spec (fbank params) per model.

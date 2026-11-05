@@ -2,9 +2,9 @@
 
 ## Why It's Optional
 
-The default "hey jarvis" wake phrase ships pretrained in pymicro-wakeword (built-in model, Apache-2.0 licensed code). **No training is required** to use undertone.
+The default "hey jarvis" wake phrase ships pretrained in pymicro-wakeword (built-in model, Apache-2.0 licensed code). **No training is required** to use eridian.
 
-If you want to train a custom phrase (e.g., "hey undertone", "alexa", "hey claude"), the `training/` Docker image provides an optional environment for that work.
+If you want to train a custom phrase (e.g., "hey eridian", "alexa", "hey claude"), the `training/` Docker image provides an optional environment for that work.
 
 ## What the Image Is
 
@@ -26,7 +26,7 @@ A Docker image for training custom wake-word models using openWakeWord 0.6.0 on 
 ### Build the Image
 
 ```bash
-docker build -t undertone-oww:latest training/
+docker build -t eridian-oww:latest training/
 ```
 
 **Time:** 5–10 minutes (first build; subsequent builds use layer cache)
@@ -40,7 +40,7 @@ bash training/smoke_test.sh
 This script will:
 1. Build the image if not present
 2. Test Python imports (torch, piper-phonemize, audiomentations, datasets, etc.)
-3. Generate 10 synthetic audio clips with text "hey undertone"
+3. Generate 10 synthetic audio clips with text "hey eridian"
 4. Verify all 10 .wav files were created
 
 **Expected result:** ~30–60 seconds, exit code 0, 10 .wav files in `/tmp/smoke_test/` inside the container.
@@ -52,7 +52,7 @@ Example from Ed's machine (2026-10-01):
 | Item | Location | Size |
 |---|---|---|
 | Negative features (adversarial background) | `~/Datasets/openwakeword/` | ~17 GB |
-| Training work directory | `~/Datasets/undertone-training/` | varies |
+| Training work directory | `~/Datasets/eridian-training/` | varies |
 | Docker TTS model | (downloaded at build, cached in image) | ~600 MB |
 | Feature models (embedding + melspectrogram) | (downloaded at build, cached in image) | ~50 MB |
 
@@ -60,9 +60,9 @@ Mount your data directory at `/work/data` and output directory at `/work/models`
 
 ```bash
 docker run --rm -it \
-  -v ~/Datasets/undertone-training:/work/data \
-  -v ~/Datasets/undertone-training/models:/work/models \
-  undertone-oww:latest \
+  -v ~/Datasets/eridian-training:/work/data \
+  -v ~/Datasets/eridian-training/models:/work/models \
+  eridian-oww:latest \
   bash
 ```
 
@@ -78,7 +78,7 @@ Inside the container:
 
 CC BY-NC-SA 4.0 permits non-commercial use, such as a personal assistant, and forbids commercial use. It also requires attribution and share-alike. Read the license text before using a trained model anywhere beyond personal use.
 
-This applies only to models you train with this image. undertone's default "hey jarvis" model comes from pymicro-wakeword, not openWakeWord.
+This applies only to models you train with this image. eridian's default "hey jarvis" model comes from pymicro-wakeword, not openWakeWord.
 
 ## Network
 
@@ -91,7 +91,7 @@ This image is the only part of the repo that downloads training data. It does so
 
 **During training:** datasets and phonemizer data are downloaded, as your training script specifies.
 
-undertone's runtime (`undertone chat`, `listen`, `serve`) never downloads training data.
+eridian's runtime (`eridian chat`, `listen`, `serve`) never downloads training data.
 
 ## Known Nits
 
@@ -109,14 +109,14 @@ Earlier versions had models in `/opt/openwakeword/resources/models/` (flat), but
 
 ## Custom Model Integration: Bring Your Own
 
-A custom wake phrase trained in this image remains separate from undertone's default. To use it:
+A custom wake phrase trained in this image remains separate from eridian's default. To use it:
 
 1. Export the trained model as ONNX (openWakeWord handles this)
-2. Wire it into undertone. **This is not integrated, and it isn't on the current roadmap.** Phase 4 only mentions an optional second-stage verifier model, if "hey jarvis" turns out to false-accept.
+2. Wire it into eridian. **This is not integrated, and it isn't on the current roadmap.** Phase 4 only mentions an optional second-stage verifier model, if "hey jarvis" turns out to false-accept.
 
-Currently, undertone uses pymicro-wakeword's built-in "Hey Jarvis" model. A custom model would need:
-- Integration point in `undertone/cli.py:_make_wake_factory()`
+Currently, eridian uses pymicro-wakeword's built-in "Hey Jarvis" model. A custom model would need:
+- Integration point in `eridian/cli.py:_make_wake_factory()`
 - ONNX runtime setup (currently only pymicro-wakeword is loaded)
 - Model path configuration (via env var or config file)
 
-The training image works today. Wiring a trained model into undertone is not yet planned.
+The training image works today. Wiring a trained model into eridian is not yet planned.

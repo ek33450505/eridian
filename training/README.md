@@ -1,6 +1,6 @@
 # OpenWakeWord Training Docker Image
 
-A Docker image for training custom wake-word models (optional — undertone's default "hey jarvis" ships pretrained with pymicro-wakeword) using [openWakeWord](https://github.com/dscripka/openWakeWord) v0.6.0 on CPU (ARM64/aarch64 architecture).
+A Docker image for training custom wake-word models (optional — eridian's default "hey jarvis" ships pretrained with pymicro-wakeword) using [openWakeWord](https://github.com/dscripka/openWakeWord) v0.6.0 on CPU (ARM64/aarch64 architecture).
 
 ## What This Is
 
@@ -14,7 +14,7 @@ The image is optimized for ARM64 (linux/aarch64) and runs on machines with no GP
 ## Building
 
 ```bash
-docker build -t undertone-oww:latest training/
+docker build -t eridian-oww:latest training/
 ```
 
 **Build time:** ~5-10 minutes (first build; subsequent builds use layer caching)
@@ -31,7 +31,7 @@ bash training/smoke_test.sh
 This will:
 1. Build the image if not present
 2. Test Python imports (torch, piper-phonemize, audiomentations, datasets, etc.)
-3. Generate 10 synthetic audio clips with text "hey undertone"
+3. Generate 10 synthetic audio clips with text "hey eridian"
 4. Verify all 10 .wav files were created
 
 Expected output: ~30-60 seconds, exit code 0, 10 .wav files in `/tmp/smoke_test/` inside the container.
@@ -42,7 +42,7 @@ Expected output: ~30-60 seconds, exit code 0, 10 .wav files in `/tmp/smoke_test/
 docker run --rm -it \
   -v /path/to/training/data:/work/data \
   -v /path/to/output/models:/work/models \
-  undertone-oww:latest \
+  eridian-oww:latest \
   bash
 ```
 
