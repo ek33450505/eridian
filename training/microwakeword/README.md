@@ -43,7 +43,8 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
   notebook's `bal_train09.tar` URL no longer resolves.
 - 5000 "hey rocky" positives (notebook: 1000), plus phonetic variants and
   confusable negatives ("hey ricky", "rocky road", ...) as an extra feature set.
-- `negative_class_weight` 30 (notebook: 20).
+- `negative_class_weight` 60 (notebook: 20), to push down false wakes on
+  near-miss phrases.
 - `minimization_metric` is null, as in the notebook. The alternative,
   `ambient_false_positives_per_hour`, needs a `validation_ambient` split that
   `dinner_party_eval` is not confirmed to provide, so it is not used.
@@ -59,8 +60,9 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
     bash training/microwakeword/train.sh
 
 Run `setup.sh` first. Steps, in order: `positives` (5000 "hey rocky" plus
-phonetic variants), `negatives` (about 2000 confusables such as "hey ricky",
-"rocky road"), `features`, `yaml`, `train`, `install`, `smoke`.
+phonetic variants), `negatives` (5000 confusables over 10 phrases, 500 each:
+"hey ricky", "hey rock", "hey rocks", "hey rocket", "hey rocco", "hey lucky",
+"rocky road", ...), `features`, `yaml`, `train`, `install`, `smoke`.
 
 - Resume: finished steps are skipped on rerun. `train.sh --from <step>` forces
   that step and every later one (e.g. `--from train` after editing
@@ -70,8 +72,21 @@ phonetic variants), `negatives` (about 2000 confusables such as "hey ricky",
 - `hey_rocky.json` is written only if missing, so a tuned cutoff survives
   reruns; `--force-manifest` rewrites it.
 - Tunables (env): `MWW_ROOT`, `PIPER_BATCH` (default 50), `POSITIVE_COUNT`,
-  `VARIANT_COUNT`, `CONFUSABLE_COUNT`, `HELDOUT` (held-out clips per set,
-  default 20).
+  `VARIANT_COUNT`, `CONFUSABLE_COUNT` (default 5000), `HELDOUT` (held-out
+  clips per set, default 20), `REAL_CLIPS`, `REAL_REPEAT`, `REAL_HELDOUT`
+  (see "Your own clips").
+- The default manifest uses `sliding_window_size` 10 (not 5). Inference runs
+  every 30 ms (stride 3 x 10 ms), so 5 more window slots add about 150 ms of
+  wake latency. In an offline sweep on 2026-11-05 over synthetic training-set
+  clips (`smoke_test.py` now prints this sweep), the larger window kept 20/20
+  held-out positives and cut false wakes (hey rock 58/60 to 21/60, hey rocco
+  7/60 to 0, hey lucky 2/60 to 0). `--force-manifest` resets a hand-tuned
+  cutoff and window.
+- Retrain v2: `bash training/microwakeword/train.sh --from negatives` for the
+  first v2 run, which never used real clips. Whenever `REAL_CLIPS` changed since
+  the last run (on to off included), use `--from positives` instead so stale
+  `real_*` copies are dropped; it is cheap because existing generated clips are
+  reused.
 - Log: `$MWW_ROOT/logs/train.log`.
 - Outputs: `$MWW_ROOT/out/hey_rocky.tflite` and `hey_rocky.json`.
 - Held-out clips for the smoke test: `$MWW_ROOT/heldout/`.
@@ -88,3 +103,32 @@ held-out "hey rocky", false accepts on confusables and speech, and a suggested
 Edit `micro.probability_cutoff` in `hey_rocky.json` (higher = fewer false
 accepts, more misses) and rerun. If the speech set is synthetic `say` audio the
 output says so; treat that number as a rough check only.
+
+### Your own clips
+
+Synthetic voices miss how you actually say the phrases. Record real ones and
+train on them:
+
+1. Stop undertone first, or saying the wake word 50 times wakes it:
+   `~/Projects/personal/undertone/.venv/bin/undertone stop`
+2. Record (about 50 takes per phrase):
+
+       ~/Projects/personal/undertone/.venv/bin/python -I training/microwakeword/record_clips.py
+
+   Clips land in `$MWW_ROOT/real/positives/hey_rocky/` and
+   `$MWW_ROOT/real/confusables/<phrase>/` (hey_rock, hey_rocks, hey_rocco,
+   hey_rocket, hey_lucky) as 16 kHz mono int16 `NNNN.wav`.
+3. Evaluate with `smoke_test.py`: it reports your held-out real clips and a
+   sliding-window sweep. The first `REAL_HELDOUT` (default 10) clips of each
+   phrase are eval-only; `train.sh` never copies them.
+4. Train with them:
+
+       REAL_CLIPS=1 bash training/microwakeword/train.sh --from positives
+
+   Each non-held-out clip is added `REAL_REPEAT` times (default 10; augmentation
+   randomises every copy). Changing `REAL_CLIPS` needs `--from positives` so
+   positives and confusables are rebuilt. With `REAL_CLIPS=1`, a kind with no
+   usable clips only warns (e.g. positives recorded, confusables not);
+   `train.sh` stops with a pointer to `record_clips.py` only if neither kind
+   has any. Without `--from`, finished steps are skipped and real clips are not
+   added (it warns).

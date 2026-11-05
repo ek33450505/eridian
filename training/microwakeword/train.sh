@@ -15,8 +15,15 @@
 #   PIPER_BATCH      piper batch size (default: 50, sized for MPS)
 #   POSITIVE_COUNT   "hey rocky" samples (default: 5000)
 #   VARIANT_COUNT    samples per phonetic variant (default: 500)
-#   CONFUSABLE_COUNT total confusable samples (default: 2000)
+#   CONFUSABLE_COUNT total confusable samples, split evenly over the 10 phrases
+#                    (default: 5000, i.e. 500 each)
 #   HELDOUT          clips per set kept out of training for smoke_test.py (default: 20)
+#   REAL_CLIPS       1 = also train on your own recordings from $MWW_ROOT/real/
+#                    (record_clips.py); changing it needs --from positives (default: 0)
+#   REAL_REPEAT      copies of each real training clip (augmentation randomises
+#                    each copy) (default: 10)
+#   REAL_HELDOUT     first N real clips of each phrase dir stay eval-only for
+#                    smoke_test.py and are never copied (default: 10)
 #
 # Data licensing: see README.md; the model is for non-commercial personal use.
 set -euo pipefail
@@ -29,8 +36,11 @@ mww_init train "$@"
 PIPER_BATCH="${PIPER_BATCH:-50}"
 POSITIVE_COUNT="${POSITIVE_COUNT:-5000}"
 VARIANT_COUNT="${VARIANT_COUNT:-500}"
-CONFUSABLE_COUNT="${CONFUSABLE_COUNT:-2000}"
+CONFUSABLE_COUNT="${CONFUSABLE_COUNT:-5000}"
 HELDOUT="${HELDOUT:-20}"
+REAL_CLIPS="${REAL_CLIPS:-0}"
+REAL_REPEAT="${REAL_REPEAT:-10}"
+REAL_HELDOUT="${REAL_HELDOUT:-10}"
 
 PY="$MWW_ROOT/venv/bin/python"
 PIPER_DIR="$MWW_ROOT/piper-sample-generator"
@@ -44,7 +54,7 @@ POSITIVE_VARIANTS=("hey_rah_kee|hey rah-kee" "hey_rock_ee|hey rock-ee")
 CONFUSABLES=(
 	"hey_ricky|hey ricky" "hey_rocco|hey rocco" "hey_lucky|hey lucky"
 	"rocky_road|rocky road" "hey_rock|hey rock" "hey_jockey|hey jockey"
-	"hi_rocky|hi rocky" "rocky|rocky"
+	"hi_rocky|hi rocky" "rocky|rocky" "hey_rocks|hey rocks" "hey_rocket|hey rocket"
 )
 
 mkdir -p "$MWW_ROOT/logs" "$OUT"
@@ -62,6 +72,15 @@ die() {
 # -E carries the trap into functions and subshells.
 set -E
 trap 'log "ERROR: command failed (exit $?) at line $LINENO: $BASH_COMMAND"' ERR
+
+[[ "$REAL_CLIPS" == 0 || "$REAL_CLIPS" == 1 ]] || die "REAL_CLIPS must be 0 or 1 (got '$REAL_CLIPS')"
+[[ "$REAL_REPEAT" =~ ^[0-9]{1,9}$ ]] || die "REAL_REPEAT must be a non-negative integer of at most 9 digits (got '$REAL_REPEAT')"
+[[ "$REAL_HELDOUT" =~ ^[0-9]{1,9}$ ]] || die "REAL_HELDOUT must be a non-negative integer of at most 9 digits (got '$REAL_HELDOUT')"
+# Base-10 normalise: "010" would otherwise be octal 8 in (( )), while
+# smoke_test.py reads int("010") = 10, and the two sides must agree.
+REAL_REPEAT=$((10#$REAL_REPEAT))
+REAL_HELDOUT=$((10#$REAL_HELDOUT))
+((REAL_REPEAT >= 1)) || die "REAL_REPEAT must be at least 1 (got '$REAL_REPEAT')"
 
 # --- args -----------------------------------------------------------------
 FROM="${STEPS[0]}"
@@ -81,7 +100,7 @@ while (($# > 0)); do
 		shift
 		;;
 	-h | --help)
-		sed -n '2,22p' "${BASH_SOURCE[0]}"
+		sed -n '2,28p' "${BASH_SOURCE[0]}"
 		exit 0
 		;;
 	*) die "unknown argument: $1" ;;
@@ -104,7 +123,10 @@ done
 PIPER_MODEL_SHA256="e95ee53770bf598c354a6e6dbfc95ccb259aeeb501d35a86be8a767429ab0ff6"
 piper_sum="$(shasum -a 256 "$PIPER_DIR/models/en_US-libritts_r-medium.pt")" || die "cannot hash piper model"
 [[ "${piper_sum%% *}" == "$PIPER_MODEL_SHA256" ]] || die "piper model sha256 mismatch (got ${piper_sum%% *}); rerun setup.sh"
-log "MWW_ROOT=$MWW_ROOT from=$FROM"
+log "MWW_ROOT=$MWW_ROOT from=$FROM REAL_CLIPS=$REAL_CLIPS REAL_REPEAT=$REAL_REPEAT REAL_HELDOUT=$REAL_HELDOUT"
+if ((REAL_CLIPS == 1 && EXPLICIT == 0)) && [[ -e "$MWW_ROOT/.done-train-positives" ]]; then
+	log "WARN: REAL_CLIPS=1 without --from, and positives are already built: real clips will NOT be added; use --from positives"
+fi
 
 # The notebook uses cwd-relative paths; keep them.
 cd "$MWW_ROOT"
@@ -161,6 +183,42 @@ merge() {
 	log "merged $(count_wavs "$dest") clips -> $dest ($(count_wavs "$held") held out)"
 }
 
+# add_real_clips <kind> <dest>: copy the user's recordings from
+# $MWW_ROOT/real/<kind>/<name>/NNNN.wav into <dest> REAL_REPEAT times each, as
+# real_<name>_<NNNN>_r<k>.wav. The first REAL_HELDOUT clips (sorted) of each
+# phrase dir are eval-only for smoke_test.py and are never copied. Sets REAL_ADDED
+# to the number of source clips used; an empty set only warns (the caller dies if
+# neither kind contributed anything).
+add_real_clips() {
+	local kind="$1" dest="$2" root="$MWW_ROOT/real/$1"
+	local d n f stem k idx src=0
+	REAL_ADDED=0
+	if [[ ! -d "$root" ]]; then
+		log "WARN: REAL_CLIPS=1 but $root is missing; no real $kind added (run record_clips.py)"
+		return 0
+	fi
+	for d in "$root"/*/; do
+		[[ -d "$d" ]] || continue
+		n="$(basename "$d")"
+		idx=0
+		while IFS= read -r f; do
+			idx=$((idx + 1))
+			((idx > REAL_HELDOUT)) || continue
+			stem="$(basename "$f" .wav)"
+			for ((k = 1; k <= REAL_REPEAT; k++)); do
+				cp "$f" "$dest/real_${n}_${stem}_r${k}.wav"
+			done
+			src=$((src + 1))
+		done < <(find "$d" -maxdepth 1 -name '*.wav' | LC_ALL=C sort)
+	done
+	REAL_ADDED=$src
+	if ((src == 0)); then
+		log "WARN: no usable real $kind clips in $root (after $REAL_HELDOUT held out per phrase); run record_clips.py"
+		return 0
+	fi
+	log "real $kind: $src clips x $REAL_REPEAT copies -> $dest ($REAL_HELDOUT held out per phrase)"
+}
+
 # --- steps ----------------------------------------------------------------
 step_positives() {
 	gen hey_rocky "hey rocky" "$POSITIVE_COUNT" "$MWW_ROOT/gen/positives"
@@ -169,10 +227,14 @@ step_positives() {
 		gen "${v%%|*}" "${v#*|}" "$VARIANT_COUNT" "$MWW_ROOT/gen/positives"
 	done
 	merge "$MWW_ROOT/gen/positives" "$MWW_ROOT/positives" "$MWW_ROOT/heldout/positives" hey_rocky
+	if ((REAL_CLIPS == 1)); then
+		add_real_clips positives "$MWW_ROOT/positives"
+	fi
 }
 
 step_negatives() {
 	local per=$((CONFUSABLE_COUNT / ${#CONFUSABLES[@]}))
+	local real_pos
 	local c
 	for c in "${CONFUSABLES[@]}"; do
 		gen "${c%%|*}" "${c#*|}" "$per" "$MWW_ROOT/gen/confusables"
@@ -199,6 +261,13 @@ step_negatives() {
 			fi
 		done < <(find "$MWW_ROOT/gen/confusables/$n" -maxdepth 1 -name '*.wav' | sort)
 	done
+	if ((REAL_CLIPS == 1)); then
+		add_real_clips confusables "$MWW_ROOT/confusables"
+		real_pos="$({ find "$MWW_ROOT/positives" -maxdepth 1 -name 'real_*.wav' 2>/dev/null || true; } | wc -l | tr -d ' ')"
+		if ((REAL_ADDED == 0 && real_pos == 0)); then
+			die "REAL_CLIPS=1 but there are no usable real clips of either kind; run record_clips.py"
+		fi
+	fi
 	log "confusables: $(count_wavs "$MWW_ROOT/confusables") train, $(count_wavs "$MWW_ROOT/heldout/confusables") held out"
 }
 
@@ -259,7 +328,12 @@ step_install() {
 	if [[ -e "$OUT/hey_rocky.json" && "$FORCE_MANIFEST" -eq 0 ]]; then
 		log "kept existing $OUT/hey_rocky.json (use --force-manifest to rewrite)"
 	else
-		printf '%s\n' '{"type":"micro","wake_word":"Hey Rocky","author":"Ed Kubiak","model":"hey_rocky.tflite","trained_languages":["en"],"version":2,"micro":{"probability_cutoff":0.97,"feature_step_size":10,"sliding_window_size":5,"tensor_arena_size":22860,"minimum_esphome_version":"2024.7.0"}}' \
+		# sliding_window_size 10 (not 5): the 2026-11-05 offline sweep kept 20/20
+		# held-out positives and cut false wakes on synthetic training-set clips
+		# (hey_rock 58/60 -> 21/60, hey_rocco 7/60 -> 0, hey_lucky 2/60 -> 0).
+		# Cost: inference runs every 30 ms (stride 3 x 10 ms), so 5 more window
+		# slots add ~150 ms to the wake latency.
+		printf '%s\n' '{"type":"micro","wake_word":"Hey Rocky","author":"Ed Kubiak","model":"hey_rocky.tflite","trained_languages":["en"],"version":2,"micro":{"probability_cutoff":0.97,"feature_step_size":10,"sliding_window_size":10,"tensor_arena_size":22860,"minimum_esphome_version":"2024.7.0"}}' \
 			>"$OUT/hey_rocky.json"
 	fi
 	log "installed $OUT/hey_rocky.tflite and hey_rocky.json"

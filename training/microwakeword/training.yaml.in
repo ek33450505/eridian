@@ -1,5 +1,5 @@
 # Rendered by train.sh (step: yaml); @MWW_ROOT@ is substituted.
-# Notebook defaults except negative_class_weight (30 vs 20) and the extra
+# Notebook defaults except negative_class_weight (60 vs 20) and the extra
 # confusable negative feature set. minimization_metric is null (as in the
 # notebook); "ambient_false_positives_per_hour" needs a validation_ambient split
 # that dinner_party_eval is not confirmed to provide.
@@ -48,7 +48,7 @@ features:
 
 training_steps: [10000]
 positive_class_weight: [1]
-negative_class_weight: [30]
+negative_class_weight: [60]
 learning_rates: [0.001]
 batch_size: 128
 time_mask_max_size: [0]
