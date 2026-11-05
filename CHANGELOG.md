@@ -13,6 +13,7 @@ Entries below this one are kept as released, under the old name.
 
 **Fixed**
 - `eridian attach` no longer opens the no-wake-word follow-up window after an announcement. "Claude finished." fires after every session turn, so room conversation could chain turns into a session without the wake word (seen live 2026-11-05). The window now opens only after the first answer to a turn started by the wake word.
+- `eridian chat` had the same chain: every reply opened the window, so a reply to a no-wake turn opened another. It now follows the same rule.
 
 ### 2026-11-04 — Echo text guard (live test: own voice heard as `you:`)
 

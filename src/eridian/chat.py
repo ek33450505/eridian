@@ -8,6 +8,15 @@ one hands-free loop:
         -> SPEAKING (sentences queued) -> follow-up window (LISTENING, no
         wake word needed, `follow_up_s`) -> IDLE
 
+The follow-up window is a privacy boundary: it opens ONLY after the first
+spoken answer to a turn the wake word started (wake or wake barge-in), once
+per wake. The answer to a turn begun inside that window (follow_up) or by
+talk-over never opens another, so ambient speech cannot chain turns without
+the wake word. Each utterance carries the origin of its turn (set by the
+listener event that preceded it) through the brain turn to its `reply_done`;
+an unknown origin opens nothing. The worker serves turns one at a time, so no
+outstanding-turn counter is needed.
+
 The wake word stays live while Claude thinks and speaks (the listener is IDLE
 then), which is what makes barge-in work: saying it again stops the speech,
 interrupts the turn, and opens a fresh listening turn. With `talk_over=True`
@@ -111,6 +120,9 @@ class ChatSession:
         self._spoken_gen = -1  # gen that _spoken_text belongs to (under _lock)
         self._spoken_text = ""  # sentences enqueued in that gen, for the echo filter
         self._talk_over_turn = False  # main thread: the open turn began as talk-over
+        self._via: str | None = None  # main thread: what began the open turn
+        self._wake_id = 0  # main thread: bumped per wake; ids the wake turn
+        self._windowed_wake = -1  # main thread: wake id whose window was opened
         self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._in_flight = 0  # utterances submitted but not yet fully served
         self._turn: _Turn | None = None
@@ -175,25 +187,32 @@ class ChatSession:
     def _drain_control(self) -> None:
         while True:
             try:
-                kind, gen = self._control.get_nowait()
+                kind, gen, origin = self._control.get_nowait()
             except queue.Empty:
                 return
             if (
                 kind == "reply_done"
                 and self._follow_up_s > 0
+                and origin is not None
+                and origin[0] == "wake"
+                and origin[1] != self._windowed_wake
                 and self._listener.state == "IDLE"
                 and self._is_current(gen)
             ):
+                self._windowed_wake = origin[1]
                 self._listener.listen_now(self._follow_up_s)
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
         if event.kind == "wake":
             self._talk_over_turn = False
+            self._wake_id += 1
+            self._via = "wake"
             self._cue("wake")
             self._maybe_barge_in()
         elif event.kind in ("talk_over", "talk_over_stop"):
             if event.kind == "talk_over":
                 self._talk_over_turn = True
+                self._via = "talk_over"
                 # Snapshot before the barge-in bumps the generation.
                 with self._lock:
                     self._echo_ref = (
@@ -202,6 +221,7 @@ class ChatSession:
             self._maybe_barge_in()  # no cue: the user is already talking
         elif event.kind == "follow_up":
             self._talk_over_turn = False
+            self._via = "follow_up"
             self._cue("follow_up")
         elif event.kind == "utterance":
             text = event.text or ""
@@ -220,7 +240,8 @@ class ChatSession:
                 self._gen += 1
                 gen = self._gen
                 self._in_flight += 1
-            self._prompts.put((gen, text, now, t_speech_end))
+            origin = (self._via, self._wake_id) if self._via else None
+            self._prompts.put((gen, text, now, t_speech_end, origin))
         # wake_no_speech / dropped_empty: nothing to do
 
     def _maybe_barge_in(self) -> None:
@@ -296,10 +317,10 @@ class ChatSession:
             item = self._prompts.get()
             if item is None:
                 return
-            gen, text, t_submit, t_speech_end = item
+            gen, text, t_submit, t_speech_end, origin = item
             try:
                 if self._is_current(gen):
-                    self._serve(gen, text, t_submit, t_speech_end)
+                    self._serve(gen, text, t_submit, t_speech_end, origin)
             except Exception as exc:  # keep the loop alive for the next utterance
                 self._print(f"[error] {type(exc).__name__}: {exc}\n")
             finally:
@@ -330,7 +351,14 @@ class ChatSession:
             except Exception:
                 pass
 
-    def _serve(self, gen: int, text: str, t_submit: float, t_speech_end: float) -> None:
+    def _serve(
+        self,
+        gen: int,
+        text: str,
+        t_submit: float,
+        t_speech_end: float,
+        origin: tuple[str, int] | None,
+    ) -> None:
         turn = _Turn(gen=gen, t_submit=t_submit, t_speech_end=t_speech_end)
         with self._lock:
             self._turn = turn
@@ -381,4 +409,4 @@ class ChatSession:
         self._player.wait_idle()
         if self._is_current(gen):
             self._print_latency(turn)
-            self._control.put(("reply_done", gen))
+            self._control.put(("reply_done", gen, origin))

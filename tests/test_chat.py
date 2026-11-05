@@ -427,6 +427,82 @@ class BargeInTest(ChatSessionTestCase):
         self.assertEqual(self.cues[-1], "follow_up")
 
 
+class NoWakeWindowOriginTest(ChatSessionTestCase):
+    """The no-wake window opens only after the first answer to a wake turn."""
+
+    def _idle_pump(self) -> None:
+        for _ in range(5):
+            self.session.process_frame(FRAME)
+
+    def _follow_up_cues(self) -> int:
+        return self.cues.count("follow_up")
+
+    def test_wake_turn_reply_opens_exactly_one_window(self) -> None:
+        self.wake()
+        self.speak("hello")
+        self.settle()
+        self.assertTrue(self.pump_until(lambda: self.listener_state == "LISTENING"))
+        self.assertEqual(self._follow_up_cues(), 1)
+
+    def test_follow_up_turn_reply_opens_no_window(self) -> None:
+        self.wake()
+        self.speak("hello")
+        self.settle()
+        self.assertTrue(self.pump_until(lambda: self.listener_state == "LISTENING"))
+        self.speak("ambient chatter")  # follow-up turn, no wake word
+        self.settle()
+        self._idle_pump()  # drains the reply_done of the follow-up turn
+        self.assertEqual(self.world.asks, ["hello", "ambient chatter"])
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self._follow_up_cues(), 1)
+
+    def test_second_reply_in_same_wake_turn_opens_no_second_window(self) -> None:
+        self.wake()
+        self.speak("hello")
+        self.settle()
+        self.assertTrue(self.pump_until(lambda: self.listener_state == "LISTENING"))
+        self.clock.now += 10.0  # window times out
+        self._idle_pump()
+        self.assertEqual(self.listener_state, "IDLE")
+        gen = self.session._gen
+        # Simulates the worker's reply_done post directly: chat cannot produce
+        # two replies for one wake turn.
+        self.session._control.put(("reply_done", gen, ("wake", self.session._wake_id)))
+        self._idle_pump()
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self._follow_up_cues(), 1)
+
+    def test_stale_reply_done_of_earlier_wake_opens_no_window(self) -> None:
+        gate = threading.Event()
+        self.world.script["story"] = "BLOCK"
+        self.world.script["q2"] = [
+            lambda: gate.wait(timeout=2.0),
+            TextDelta("Answer two. "),
+            TurnEnd("sid-2", False, False),
+        ]
+        self.wake()  # wake 1: its turn is interrupted before it ever answers
+        self.speak("story")
+        self.assertTrue(self.world.blocked.wait(timeout=2.0))
+        old_gen = self.session._gen
+        self.addCleanup(gate.set)
+        self.wake()  # wake 2 barge-in
+        self.assertTrue(self.world.finished_blocked.wait(timeout=2.0))
+        self.speak("q2")  # listener back to IDLE; q2 held by the gate
+        self.assertEqual(self.listener_state, "IDLE")
+        # Late reply_done from wake 1 (gen already bumped past it).
+        self.session._control.put(("reply_done", old_gen, ("wake", 1)))
+        self._idle_pump()
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self._follow_up_cues(), 0)
+
+        gate.set()
+        self.settle()
+        self.assertTrue(self.pump_until(lambda: self.listener_state == "LISTENING"))
+        self.assertEqual(self._follow_up_cues(), 1)
+        self.assertEqual(self.player.enqueued[-1], "Answer two.")
+
+
+
 class TalkOverTest(ChatSessionTestCase):
     talk_over = True
 
@@ -496,6 +572,56 @@ class TalkOverTest(ChatSessionTestCase):
     def test_unrelated_talk_over_is_submitted(self) -> None:
         self._barge_in_on_story("never mind that, what time is it")
         self.assertEqual(self.world.asks, ["story", "never mind that, what time is it"])
+
+    def test_talk_over_reply_opens_no_window(self) -> None:
+        self.world.script["story"] = "BLOCK"
+        self.wake()
+        self.speak("story")
+        self.assertTrue(self.world.blocked.wait(timeout=2.0))
+        self.player.busy = True
+        self.transcript = "new question"
+        self._talk()
+        self.assertTrue(self.world.finished_blocked.wait(timeout=2.0))
+        self.player.busy = False
+        self.vad_value = 0.0
+        self.clock.now += 1.0
+        self.session.process_frame(FRAME)
+        self.settle()
+        self.assertEqual(self.world.asks, ["story", "new question"])
+        for _ in range(5):
+            self.session.process_frame(FRAME)
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertNotIn("follow_up", self.cues)
+
+    def test_talk_over_of_a_later_wake_turn_reply_opens_no_window(self) -> None:
+        self.world.script["hello"] = [TextDelta("Hi. "), TurnEnd("s", False, False)]
+        self.world.script["story"] = "BLOCK"
+        self.wake()
+        self.speak("hello")
+        self.settle()
+        self.assertTrue(self.pump_until(lambda: self.listener_state == "LISTENING"))
+        self.clock.now += 10.0  # first window times out
+        self.session.process_frame(FRAME)
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self.cues.count("follow_up"), 1)
+
+        self.wake()  # wake 2, then talk-over interrupts it
+        self.speak("story")
+        self.assertTrue(self.world.blocked.wait(timeout=2.0))
+        self.player.busy = True
+        self.transcript = "new question"
+        self._talk()
+        self.assertTrue(self.world.finished_blocked.wait(timeout=2.0))
+        self.player.busy = False
+        self.vad_value = 0.0
+        self.clock.now += 1.0
+        self.session.process_frame(FRAME)
+        self.settle()
+        self.assertEqual(self.world.asks, ["hello", "story", "new question"])
+        for _ in range(5):
+            self.session.process_frame(FRAME)
+        self.assertEqual(self.listener_state, "IDLE")
+        self.assertEqual(self.cues.count("follow_up"), 1)  # none for the talk-over reply
 
     def test_idle_player_does_not_arm(self) -> None:
         self._talk(30)
