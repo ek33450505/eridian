@@ -1,7 +1,7 @@
 """The Path A voice bridge: mic + speech on one side of a unix socket, a Claude
 Code Channel MCP server (mcp_channel.py) on the other.
 
-`undertone attach` runs this process. "hey jarvis" plus a spoken question is
+`eridian attach` runs this process. "hey jarvis" plus a spoken question is
 transcribed on-device and sent to the attached channel as an `utterance`; the
 channel injects it into Ed's interactive Claude Code session, Claude answers by
 calling the channel's `reply` tool, and the channel sends the text back as a
@@ -15,7 +15,7 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
                        {"type":"reply","text":"...","kind":"ack"|"answer"|"confirm"[,"check":"..."]}
                                                                     (any number; `check` is
                         honoured on a confirm only: what the voice guard blocked,
-                        spoken in undertone's own voice before Claude's words)
+                        spoken in eridian's own voice before Claude's words)
     voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                        (`via` = what opened the turn; the channel lets only "wake"
                         satisfy a confirm phrase)
@@ -75,7 +75,7 @@ has the words that repeat the reply being spoken removed (`spoken.strip_echo`);
 if nothing is left it is dropped instead of sent.
 
 Echo text guard: a `talk_over` or `follow_up` turn (never a wake turn) whose
-transcript mostly repeats what undertone itself just said (replies, read-backs,
+transcript mostly repeats what eridian itself just said (replies, read-backs,
 announcements; numbers compared as digits, so "ninety three" matches "93") is
 dropped and printed as `[dropped: echo of own speech]`, because a live speaker
 leaks more than the offline AEC check shows. It only drops: it never changes
@@ -89,7 +89,7 @@ SELF_WAKE_GUARD_S after we stopped, may be our own voice tripping the detector
 that turn is tagged `wake_barge_in` and can never grant a confirmation; only a
 wake word heard after a full second of silence can.
 While a confirmation is pending, a `wake_barge_in` turn is held, not sent (it
-could not grant, and sending it would use up the challenge): undertone says so
+could not grant, and sending it would use up the challenge): eridian says so
 and the user repeats the wake word after a moment.
 
 Unknown types and malformed lines are ignored; a failure in one connection never
@@ -107,7 +107,7 @@ serializes writers on that one socket and is bounded).
 
 Test seams: every collaborator (`wake_factory`, `vad`, `stt`, `clock`,
 `player_factory`, `socket_path`, `cue`, `out`) is injected; tests/test_voice.py
-uses fakes plus a real unix socket in a temp UNDERTONE_HOME -- no mic, speaker,
+uses fakes plus a real unix socket in a temp ERIDIAN_HOME -- no mic, speaker,
 or real `claude`.
 """
 
@@ -139,7 +139,7 @@ from . import voice_guard
 from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
-NO_SESSION_SPEECH = "No Claude session is attached. Start one with undertone session."
+NO_SESSION_SPEECH = "No Claude session is attached. Start one with eridian session."
 WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
 WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
@@ -171,7 +171,7 @@ MAX_CHECK_CHARS = 600  # a confirm reply's read-back is ~400 chars at most
 SELF_WAKE_GUARD_S = 1.0
 _SELF_WAKE_GUARD_MAX_S = 10.0
 # Text guard for turns with no wake word (talk_over, follow_up): the transcript
-# is compared with what undertone itself said. A turn is checked only if it
+# is compared with what eridian itself said. A turn is checked only if it
 # opened while we were speaking or within ECHO_GUARD_S after the player went
 # idle: the 6 s follow-up window opens right at idle, so its first words are
 # the room's tail of our last sentence (reverb, output latency, AEC residue);
@@ -317,7 +317,7 @@ class VoiceBridge:
         if existing is not None and not stat.S_ISSOCK(existing.st_mode):
             # Never unlink something we didn't create.
             print(
-                f"undertone: refusing to start -- {path} exists and is not a "
+                f"eridian: refusing to start -- {path} exists and is not a "
                 f"socket (mode {stat.filemode(existing.st_mode)})",
                 file=sys.stderr,
             )
@@ -325,7 +325,7 @@ class VoiceBridge:
 
         if existing is not None:
             if _server_answers(path):
-                print(f"undertone: another attach is already running at {path}", file=sys.stderr)
+                print(f"eridian: another attach is already running at {path}", file=sys.stderr)
                 return 1
             path.unlink()  # stale socket from a crashed/killed attach
 
@@ -345,13 +345,13 @@ class VoiceBridge:
         except OSError as exc:
             server.close()
             self._unlink_socket()
-            print(f"undertone: cannot listen on {path}: {exc}", file=sys.stderr)
+            print(f"eridian: cannot listen on {path}: {exc}", file=sys.stderr)
             return 1
         self._server = server
 
         for name, target in (
-            ("undertone-voice-accept", self._accept_loop),
-            ("undertone-voice-speech", self._speech_watcher),
+            ("eridian-voice-accept", self._accept_loop),
+            ("eridian-voice-speech", self._speech_watcher),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
@@ -560,7 +560,7 @@ class VoiceBridge:
         # wake_no_speech / dropped_empty: nothing to do
 
     def _note_spoken(self, text: str) -> None:
-        """Remember something undertone said, for the echo text guard. Session lock NOT held."""
+        """Remember something eridian said, for the echo text guard. Session lock NOT held."""
         with _bounded(self._lock):
             self._spoken_log.append((self._clock(), text))
 
@@ -629,7 +629,7 @@ class VoiceBridge:
                     conn.close()
                     continue
                 reader = threading.Thread(
-                    target=self._reader, args=(conn,), name="undertone-voice-reader", daemon=True
+                    target=self._reader, args=(conn,), name="eridian-voice-reader", daemon=True
                 )
                 self._threads.append(reader)
                 reader.start()
@@ -773,7 +773,7 @@ class VoiceBridge:
             if conn is not self._conn:
                 return  # a replaced / never-hello'd connection has no voice
         if check is not None:
-            self._print(f"undertone: {check}\n")
+            self._print(f"eridian: {check}\n")
         self._print(f"claude: {text}\n")
         with _bounded(self._chunk_lock):
             self._chunker.reset()
@@ -830,12 +830,12 @@ class VoiceBridge:
 
 
 def self_wake_guard_from_env(environ=os.environ, err: TextIO = sys.stderr) -> float:
-    """Guard window from UNDERTONE_SELF_WAKE_GUARD_S (seconds).
+    """Guard window from ERIDIAN_SELF_WAKE_GUARD_S (seconds).
 
     For AirPlay or other high-latency outputs, set 3. Values below the default
     would weaken the guard, so 1.0 is a hard floor; the cap is 10.0.
     """
-    name = "UNDERTONE_SELF_WAKE_GUARD_S"
+    name = "ERIDIAN_SELF_WAKE_GUARD_S"
     raw = environ.get(name, "")
     if raw == "":
         return SELF_WAKE_GUARD_S
@@ -845,7 +845,7 @@ def self_wake_guard_from_env(environ=os.environ, err: TextIO = sys.stderr) -> fl
         value = math.nan
     if not math.isfinite(value) or value < SELF_WAKE_GUARD_S:
         print(
-            f"undertone: ignoring {name}={raw!r}; "
+            f"eridian: ignoring {name}={raw!r}; "
             f"using {SELF_WAKE_GUARD_S} (minimum {SELF_WAKE_GUARD_S})",
             file=err,
         )
@@ -873,7 +873,7 @@ def run_attach(
     tts: str = "kokoro",
     announce: str = "all",
 ) -> int:
-    """The real wiring behind `undertone attach` (real mic; not unit-tested)."""
+    """The real wiring behind `eridian attach` (real mic; not unit-tested)."""
     # Lazy imports for the same reason as cli._cmd_chat: keep `--help` fast and
     # the heavy audio/model deps out of import time. cli is imported lazily too
     # (it imports this module).
@@ -885,7 +885,7 @@ def run_attach(
     try:
         stt = ParakeetSTT()
     except ModelNotCachedError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
 
     from pysilero_vad import SileroVoiceActivityDetector
@@ -896,7 +896,7 @@ def run_attach(
     try:
         io = cli.make_audio_io(no_aec, tts=tts)
     except cli.OwnVoiceError as exc:
-        print(f"undertone: {exc}", file=sys.stderr)
+        print(f"eridian: {exc}", file=sys.stderr)
         return 1
     bridge = VoiceBridge(
         wake_factory=cli._make_wake_factory(),
@@ -915,7 +915,7 @@ def run_attach(
     pid = os.getpid()
 
     def _on_sigterm(signum: int, frame: object) -> None:
-        # `undertone stop` sends SIGTERM; unwind through the finally below so the
+        # `eridian stop` sends SIGTERM; unwind through the finally below so the
         # socket and pidfile are removed.
         raise KeyboardInterrupt
 
@@ -927,8 +927,8 @@ def run_attach(
         print(cli.banner_line(io))
         paths.write_attach_pid(pid)
         print(
-            f"undertone attach: listening for '{wake.current().phrase}'. Start a Claude session with "
-            "`undertone session` in another terminal. Ctrl-C to quit.",
+            f"eridian attach: listening for '{wake.current().phrase}'. Start a Claude session with "
+            "`eridian session` in another terminal. Ctrl-C to quit.",
             flush=True,
         )
         try:

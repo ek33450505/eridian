@@ -1,4 +1,4 @@
-"""Tests for the announce hook command (undertone.announce)."""
+"""Tests for the announce hook command (eridian.announce)."""
 from __future__ import annotations
 
 import contextlib
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import announce, cli
+from eridian import announce, cli
 
 TOK = "0123456789abcdef0123456789abcdef"
 
@@ -163,7 +163,7 @@ class MainTests(unittest.TestCase):
         self.assertEqual((out.getvalue(), err.getvalue()), ("", ""))
 
     def test_broken_voice_guard_import_is_silent(self) -> None:
-        with mock.patch.dict(sys.modules, {"undertone.voice_guard": None}):
+        with mock.patch.dict(sys.modules, {"eridian.voice_guard": None}):
             self.run_main(self.args())
         self.assertIsNone(announce.event_for("bogus", {}))
 
@@ -224,8 +224,8 @@ class BrokenInstallTests(unittest.TestCase):
     def test_import_survives_missing_voice_guard(self) -> None:
         code = (
             "import sys, io\n"
-            "sys.modules['undertone.voice_guard'] = None\n"
-            "from undertone import announce\n"
+            "sys.modules['eridian.voice_guard'] = None\n"
+            "from eridian import announce\n"
             f"sys.exit(announce.main(['stop', '--home', '/', '--session', '{TOK}'], io.StringIO('{{}}')))\n"
         )
         res = subprocess.run([sys.executable, "-P", "-c", code], capture_output=True, text=True, timeout=30,

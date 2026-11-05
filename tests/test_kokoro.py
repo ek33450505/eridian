@@ -10,7 +10,7 @@ from unittest import mock
 
 import numpy as np
 
-from undertone import kokoro
+from eridian import kokoro
 
 
 RATE = 24000
@@ -667,7 +667,7 @@ class StartupFailureTests(KokoroTestBase):
                 self.make()
 
 
-@unittest.skipUnless(os.environ.get("UNDERTONE_TEST_REAL_KOKORO") == "1", "real model smoke test")
+@unittest.skipUnless(os.environ.get("ERIDIAN_TEST_REAL_KOKORO") == "1", "real model smoke test")
 class RealModelSmoke(unittest.TestCase):
     def test_renders_audio(self):
         v = kokoro.KokoroVoice()
@@ -678,11 +678,11 @@ class RealModelSmoke(unittest.TestCase):
     def test_blend_and_chord_sample(self):
         import wave
 
-        pitch = float(os.environ.get("UNDERTONE_TEST_SAMPLE_PITCH", "0"))
+        pitch = float(os.environ.get("ERIDIAN_TEST_SAMPLE_PITCH", "0"))
         v = kokoro.KokoroVoice("am_adam:0.6,bm_george:0.4", effect="chord", pitch=pitch)
         out = v.render("hɛlˈoʊ, aɪ æm ɹˈɑki. aɪ wɪl hɛlp.")
         self.assertTrue(out and len(out) % 2 == 0)
-        dest = os.environ.get("UNDERTONE_TEST_SAMPLE_WAV")
+        dest = os.environ.get("ERIDIAN_TEST_SAMPLE_WAV")
         if dest:
             with wave.open(dest, "wb") as w:
                 w.setnchannels(1)

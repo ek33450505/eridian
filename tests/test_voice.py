@@ -1,9 +1,9 @@
-"""Tests for undertone.voice.VoiceBridge.
+"""Tests for eridian.voice.VoiceBridge.
 
 Fakes only for the mic/VAD/STT/clock/player/output side; the socket is a REAL
 unix socket in a short temp directory (macOS caps AF_UNIX paths near 104
 chars). The "channel" is a plain socket client that sends hello and reads
-newline-delimited JSON. No real mic, speaker, ~/.undertone or `claude`.
+newline-delimited JSON. No real mic, speaker, ~/.eridian or `claude`.
 """
 
 from __future__ import annotations
@@ -21,10 +21,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import voice_guard, wake
-from undertone.listener import VAD_CHUNK_BYTES, ListenerEvent
-from undertone.spoken import sanitize_terminal
-from undertone.voice import (
+from eridian import voice_guard, wake
+from eridian.listener import VAD_CHUNK_BYTES, ListenerEvent
+from eridian.spoken import sanitize_terminal
+from eridian.voice import (
     ANNOUNCE_LEVELS,
     ANNOUNCE_REPEAT_S,
     ANNOUNCE_TEMPLATES,
@@ -1542,19 +1542,19 @@ class SelfWakeGuardEnvTest(unittest.TestCase):
 
     def test_unset_and_empty_use_default_silently(self) -> None:
         self.assertEqual(self._read(), (1.0, ""))
-        self.assertEqual(self._read(UNDERTONE_SELF_WAKE_GUARD_S=""), (1.0, ""))
+        self.assertEqual(self._read(ERIDIAN_SELF_WAKE_GUARD_S=""), (1.0, ""))
 
     def test_valid_values(self) -> None:
-        self.assertEqual(self._read(UNDERTONE_SELF_WAKE_GUARD_S="3"), (3.0, ""))
-        self.assertEqual(self._read(UNDERTONE_SELF_WAKE_GUARD_S="50"), (10.0, ""))
+        self.assertEqual(self._read(ERIDIAN_SELF_WAKE_GUARD_S="3"), (3.0, ""))
+        self.assertEqual(self._read(ERIDIAN_SELF_WAKE_GUARD_S="50"), (10.0, ""))
 
     def test_invalid_or_low_values_fall_back_with_message(self) -> None:
         for raw in ("0.5", "abc", "nan", "inf", "-1"):
-            value, err = self._read(UNDERTONE_SELF_WAKE_GUARD_S=raw)
+            value, err = self._read(ERIDIAN_SELF_WAKE_GUARD_S=raw)
             self.assertEqual(value, 1.0, raw)
             self.assertEqual(
                 err,
-                f"undertone: ignoring UNDERTONE_SELF_WAKE_GUARD_S={raw!r}; "
+                f"eridian: ignoring ERIDIAN_SELF_WAKE_GUARD_S={raw!r}; "
                 "using 1.0 (minimum 1.0)\n",
                 raw,
             )
@@ -1707,7 +1707,7 @@ class ReadBackReplyTest(VoiceTestCase):
                 self.reply(kind=kind, check=self.CHECK)
                 self.assertNotIn(self.CHECK, self.player.enqueued)
                 self.assertNotIn(True, self.player.own_flags)
-                self.assertNotIn("undertone:", self.out.getvalue())
+                self.assertNotIn("eridian:", self.out.getvalue())
 
     def test_oversized_or_non_str_check_is_ignored(self) -> None:
         for bad in ("x" * (MAX_CHECK_CHARS + 1), "", 7, ["a"], None):
@@ -1715,12 +1715,12 @@ class ReadBackReplyTest(VoiceTestCase):
                 self.player.own_flags.clear()
                 self.reply(kind="confirm", check=bad)
                 self.assertNotIn(True, self.player.own_flags)
-        self.assertNotIn("undertone:", self.out.getvalue())
+        self.assertNotIn("eridian:", self.out.getvalue())
 
     def test_check_is_printed_before_claude_and_confirmation_notice(self) -> None:
         self.reply(kind="confirm", check=self.CHECK)
         printed = self.out.getvalue()
-        a = printed.index(f"undertone: {self.CHECK}\n")
+        a = printed.index(f"eridian: {self.CHECK}\n")
         b = printed.index("claude: ")
         c = printed.index("[confirmation needed")
         self.assertTrue(a < b < c)
@@ -1758,7 +1758,7 @@ class TooSoonAndRedactionTest(VoiceTestCase):
         self.assertEqual(self.player.own_flags[0], True)
         self.assertNotIn(True, self.player.own_flags[1:])
         printed = self.out.getvalue()
-        self.assertLess(printed.index("undertone: "), printed.index("claude: "))
+        self.assertLess(printed.index("eridian: "), printed.index("claude: "))
 
     def test_early_wake_turn_held_while_confirm_pending(self) -> None:
         self.reply(kind="confirm", check=self.CHECK)
@@ -1917,7 +1917,7 @@ class HomeDefaultIsLazyTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         target = Path(tmp.name) / "no-such-home"
-        with mock.patch.dict(os.environ, {"UNDERTONE_HOME": str(target)}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_HOME": str(target)}):
             bridge = VoiceBridge(
                 wake_factory=lambda: (lambda frame: False),
                 vad=lambda chunk: 0.0,

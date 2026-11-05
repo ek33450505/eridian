@@ -1,18 +1,18 @@
 """MCP stdio channel server: bridges a Claude Code session to the voice process.
 
-Claude Code spawns `undertone channel` as an MCP server that declares the
-`claude/channel` capability. Transcribed speech arrives from the `undertone
+Claude Code spawns `eridian channel` as an MCP server that declares the
+`claude/channel` capability. Transcribed speech arrives from the `eridian
 attach` voice process over a unix socket and is pushed into the session as a
 `notifications/claude/channel` event; Claude answers by calling the `reply`
 tool, which is forwarded back over the socket to be spoken.
 
 Wire format to Claude Code: newline-delimited JSON-RPC 2.0 on stdin/stdout.
 stdout carries ONLY JSON-RPC -- anything else would corrupt the transport --
-so all diagnostics go to <UNDERTONE_HOME>/logs/channel.log.
+so all diagnostics go to <ERIDIAN_HOME>/logs/channel.log.
 
 Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
   channel -> voice  {"type":"hello","pid":N,"cwd":"...","wake":"<phrase>"[,"session":"<32 hex>"]}  (first line;
-                    `session` is the UNDERTONE_SESSION token, omitted when unset --
+                    `session` is the ERIDIAN_SESSION token, omitted when unset --
                     a hook's `announce` line must present it to be spoken)
   voice -> channel  {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                     (only a "wake" turn can satisfy a confirm challenge; a missing
@@ -21,12 +21,12 @@ Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
                     echo: it opens a turn but never grants)
   channel -> voice  {"type":"reply","text":"...","kind":"ack|answer|confirm"[,"check":"..."]}
                     (`check`, confirm only: what the voice guard blocked, spoken in
-                    undertone's own voice after the reply)
+                    eridian's own voice after the reply)
   voice -> channel  {"type":"detached"}  (a newer session won; stop retrying)
 
 Test seams: ChannelServer takes its stdin/stdout streams, socket path and
 reconnect interval as constructor args, so tests drive it with pipes and a
-fake voice daemon in a temp UNDERTONE_HOME.
+fake voice daemon in a temp ERIDIAN_HOME.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ from typing import Any, TextIO
 from . import paths, voice_guard, wake
 from . import persona as persona_mod
 
-SERVER_NAME = "undertone"
+SERVER_NAME = "eridian"
 SERVER_VERSION = "0.1.0"
 
 _SUPPORTED_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26")
@@ -59,12 +59,12 @@ REPLY_KINDS = ("ack", "answer", "confirm")
 _MAX_REPLY_CHARS = 4000
 
 _INSTR_HEAD = (
-    'Messages wrapped in <channel source="undertone" input="voice"> were spoken aloud '
-    "by the user and transcribed on-device by undertone. Your normal text output is NOT "
+    'Messages wrapped in <channel source="eridian" input="voice"> were spoken aloud '
+    "by the user and transcribed on-device by eridian. Your normal text output is NOT "
     "heard -- reply to EVERY voice message by calling the `reply` tool, in 1-3 short plain "
     "sentences with no code, file paths, URLs or markdown (say details are on screen). "
     "If the `reply` tool is not loaded yet, load it first (for example with ToolSearch "
-    '"select:mcp__undertone__reply"); never answer a voice message in text only. '
+    '"select:mcp__eridian__reply"); never answer a voice message in text only. '
     "Never say the wake word in a reply (not even \"{quoted}\"); refer to it as \"the wake "
     "word\" -- your own speech can retrigger the wake detector. {avoid_name}"
     'Set `kind` on every call. kind="ack" is a brief early acknowledgement (for example '
@@ -72,7 +72,7 @@ _INSTR_HEAD = (
     'kind="answer" is the actual spoken answer and is the default. kind="confirm" is for '
     "anything destructive, irreversible or outward-facing requested by voice -- "
     "deleting or overwriting files, git commit/push/reset/rebase, installing or removing "
-    "packages, sending messages, or changing remote state: make the tool call first; undertone's "
+    "packages, sending messages, or changing remote state: make the tool call first; eridian's "
     'voice guard refuses it; then send kind="confirm", restating the exact action and asking '
     "the user to say the wake word, then "
 )
@@ -82,7 +82,7 @@ _INSTR_ASK_TWO_WORD = (
     "scratch.txt, say the wake word, then 'confirm walnut lantern'.\"), where the two words are "
     "uncommon-but-easy-to-pronounce nouns (for example \"copper maple\") you pick fresh each "
     'time; avoid high-frequency words such as "the", "go", "yes" or "okay". Note (do not say this '
-    'aloud) that undertone strips the wake word "{phrase}" before the message reaches you, so the '
+    'aloud) that eridian strips the wake word "{phrase}" before the message reaches you, so the '
     'message you will receive and must accept is "confirm <word1> <word2>". Matching '
     "ignores case, punctuation and extra whitespace, so \"Confirm Velvet Harbor..\" matches "
     '"confirm velvet harbor". Proceed ONLY if the next voice message contains "confirm" '
@@ -97,7 +97,7 @@ _INSTR_ASK_SAFE_PHRASE = (
 )
 
 _INSTR_ENFORCE = (
-    "undertone enforces this in code: during a voice turn it refuses file edits, web fetches, "
+    "eridian enforces this in code: during a voice turn it refuses file edits, web fetches, "
     "MCP tools other than a few read-only ones, and any shell command that is not read-only or a test run, until the user "
     "speaks "
 )
@@ -110,9 +110,9 @@ _INSTR_ENFORCE_TWO_WORD = (
 _INSTR_ENFORCE_SAFE_PHRASE = "their safe phrase after the wake word. "
 
 _INSTR_MID = (
-    'If a tool call is refused by "undertone voice guard", ask for confirmation with '
+    'If a tool call is refused by "eridian voice guard", ask for confirmation with '
     'kind="confirm"; never try another tool or command to get around it. '
-    "Before your confirm prompt is spoken, undertone says, in its own voice, what its guard "
+    "Before your confirm prompt is spoken, eridian says, in its own voice, what its guard "
     "blocked. "
     "During a voice turn, run shell commands in their plainest form -- no redirects to files, "
     "no $ variables such as $?, no globs -- and read the exit code from the tool result; plain "
@@ -217,8 +217,8 @@ REPLY_TOOL: dict[str, Any] = {
     },
 }
 
-_NOT_CONNECTED = "Not spoken: no `undertone attach` voice process is connected."
-READ_BACK_UNAVAILABLE = "undertone could not read back what it blocked."
+_NOT_CONNECTED = "Not spoken: no `eridian attach` voice process is connected."
+READ_BACK_UNAVAILABLE = "eridian could not read back what it blocked."
 
 
 def _open_log() -> int:
@@ -243,14 +243,14 @@ class ChannelServer:
         socket_path: Path,
         reconnect_s: float = 2.0,
         session_token: str | None = None,
-        undertone_home: Path | None = None,
+        eridian_home: Path | None = None,
     ) -> None:
         self._stdin = stdin
         self._stdout = stdout
         self._socket_path = socket_path
         self._reconnect_s = reconnect_s
         self._token = session_token
-        self._home = undertone_home or paths.home_dir()
+        self._home = eridian_home or paths.home_dir()
         self._safe_phrase = False  # fixed at initialize: the instructions go out once
         self._out_lock = threading.Lock()
         self._conn_lock = threading.Lock()
@@ -389,17 +389,17 @@ class ChannelServer:
     def _admit_voice(self, text: str, can_grant: bool = False) -> str | None:
         """Record a voice turn in the guard state; None if admitted, else a refusal sentence."""
         if not self._token:
-            return "Voice turns are off: this session was not started with undertone session."
+            return "Voice turns are off: this session was not started with eridian session."
         try:
             state = voice_guard.load_state(self._home, self._token)
         except (voice_guard.GuardError, OSError):
-            return "Voice turns are off: undertone's safety state is unreadable."
+            return "Voice turns are off: eridian's safety state is unreadable."
         if state is None or state.get("armed_at") is None:
-            return "Voice turns are off: undertone's safety hook did not load in this session."
+            return "Voice turns are off: eridian's safety hook did not load in this session."
         try:
             voice_guard.record_voice(self._home, self._token, text, can_grant=can_grant)
         except (voice_guard.GuardError, OSError):
-            return "Voice turns are off: undertone could not record this voice turn."
+            return "Voice turns are off: eridian could not record this voice turn."
         return None
 
     def _connector(self) -> None:
@@ -465,7 +465,7 @@ class ChannelServer:
                 fail(str(exc))
                 return
             except (voice_guard.GuardError, OSError):
-                fail("Not spoken: undertone could not record the confirmation request; try again.")
+                fail("Not spoken: eridian could not record the confirmation request; try again.")
                 return
         reply: dict[str, Any] = {"type": "reply", "text": text, "kind": kind}
         check = None
@@ -486,8 +486,8 @@ class ChannelServer:
                 else f"'confirm {phrase}'"
             )
             spoken = (
-                f"Spoken aloud. undertone will accept only {accepted}. "
-                f"undertone also read back, in its own voice, before your words: {check}"
+                f"Spoken aloud. eridian will accept only {accepted}. "
+                f"eridian also read back, in its own voice, before your words: {check}"
             )
         self._result(req_id, {"content": [{"type": "text", "text": spoken}]})
 
@@ -545,18 +545,18 @@ class ChannelServer:
 
 def main() -> int:
     try:
-        wake.resolve_phrase_only()  # fail closed: a bad UNDERTONE_WAKE_PHRASE must not yield wrong instructions
+        wake.resolve_phrase_only()  # fail closed: a bad ERIDIAN_WAKE_PHRASE must not yield wrong instructions
     except wake.WakeWordError as exc:
-        print(f"undertone channel: {exc}", file=sys.stderr)
+        print(f"eridian channel: {exc}", file=sys.stderr)
         return 1
     try:
-        persona_mod.resolve()  # fail closed likewise: a bad UNDERTONE_PERSONA must not drop the persona silently
+        persona_mod.resolve()  # fail closed likewise: a bad ERIDIAN_PERSONA must not drop the persona silently
     except persona_mod.PersonaError as exc:
-        print(f"undertone channel: {exc}", file=sys.stderr)
+        print(f"eridian channel: {exc}", file=sys.stderr)
         return 1
     return ChannelServer(
         sys.stdin,
         sys.stdout,
         paths.voice_socket_path(),
-        session_token=os.environ.get("UNDERTONE_SESSION") or None,
+        session_token=os.environ.get("ERIDIAN_SESSION") or None,
     ).run()

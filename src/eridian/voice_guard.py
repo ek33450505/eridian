@@ -1,6 +1,6 @@
 """Voice turn guard: a PreToolUse hook that gates tool calls made on a spoken turn.
 
-`undertone session` launches an interactive `claude` with a voice channel, so a
+`eridian session` launches an interactive `claude` with a voice channel, so a
 transcribed utterance arrives as a channel event with full tool power. Claude's
 instructions ask it to get a spoken "confirm <word1> <word2>" before anything
 destructive, but that is a soft control. This module is the hard one:
@@ -8,7 +8,7 @@ destructive, but that is a soft control. This module is the hard one:
   - the channel records each utterance and each confirm request in a small
     per-session state file (record_voice / record_confirm_request);
   - Claude Code hooks (SessionStart, UserPromptSubmit, PreToolUse) run
-    `python -m undertone.voice_guard <event> --home PATH --session TOKEN`;
+    `python -m eridian.voice_guard <event> --home PATH --session TOKEN`;
   - a channel event also fires UserPromptSubmit, with a prompt wrapped in
     `<channel ...>`; typed prompts never carry that wrapper. Injected non-user
     messages (`<task-notification>`, `<system-reminder>`, ...) fire it too, so
@@ -28,8 +28,8 @@ destructive, but that is a soft control. This module is the hard one:
     picks. The stored hash is scrypt (salted), but a 1-3 word phrase is still
     guessable offline by anyone holding the file, so the protection is 0600
     plus keeping the file unreadable: on a voice turn the guard refuses any
-    Read/Grep/Glob/LS/Bash that could touch undertone's home, even after a
-    confirm, and `undertone session` also adds a Claude Code deny rule for
+    Read/Grep/Glob/LS/Bash that could touch eridian's home, even after a
+    confirm, and `eridian session` also adds a Claude Code deny rule for
     Reading the file.
 
 Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
@@ -48,7 +48,7 @@ read-back: tool kinds, program and file names, location classes, and never an
 argument value.
 
 Imports stay light on purpose: the hook starts a fresh interpreter per tool
-call, so this module must not pull in undertone.paths or anything heavy.
+call, so this module must not pull in eridian.paths or anything heavy.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ MAX_AGENT_ID = 128
 MAX_BLOCKED = 3
 MAX_WHAT_CHARS = 160
 MAX_BLOCKED_MORE = 1_000_000
-NOTHING_BLOCKED = "undertone has not blocked anything yet."
+NOTHING_BLOCKED = "eridian has not blocked anything yet."
 SAFE_PHRASE_FILE = "safe_phrase.json"
 _MAX_WALK = 64  # ancestor steps when comparing path identity
 SAFE_PHRASE_MARKER = "<safe phrase>"  # challenge phrase in safe-phrase mode; normalize() can never produce it
@@ -103,7 +103,7 @@ STOPWORDS = frozenset({
 })
 
 DENY_REASON = (
-    "undertone voice guard: this {tool} call is part of an unconfirmed voice turn. "
+    "eridian voice guard: this {tool} call is part of an unconfirmed voice turn. "
     "Ask the user with the reply tool (kind=\"confirm\") to say the wake word, then "
     "\"confirm <word1> <word2>\", and retry only after that exact phrase arrives. "
     "Do not try a different tool or command to get around this. "
@@ -111,14 +111,14 @@ DENY_REASON = (
 )
 
 HOME_DENY_REASON = (
-    "undertone voice guard: undertone's own state folder can't be read or searched on a voice turn, "
+    "eridian voice guard: eridian's own state folder can't be read or searched on a voice turn, "
     "even after a confirm. Tell the user; they can do it by typing."
 )
 
 UNGATED_TOOLS = frozenset({
     "Read", "Grep", "Glob", "LS", "WebSearch", "TodoWrite", "Task", "Agent",
     "AskUserQuestion", "ToolSearch", "Skill", "EnterPlanMode", "ExitPlanMode",
-    "BashOutput", "TaskOutput", "mcp__undertone__reply",
+    "BashOutput", "TaskOutput", "mcp__eridian__reply",
 })
 
 # Exact MCP tool names that run ungated on a voice turn. They live in code, not a
@@ -910,7 +910,7 @@ def _speakable(text: str, limit: int = MAX_WHAT_CHARS) -> str:
 
 
 _LONG_NAME = "a long name"
-_UNREADABLE_BASH = "a shell command undertone could not read"
+_UNREADABLE_BASH = "a shell command eridian could not read"
 _COMPLEX_MARKERS = ("`", "$(", "<(", ">(", "<<")
 _SCRIPT_COMPLEX_CHARS = ";&|\n`<>()${}"
 _SUBCOMMAND_PROGRAMS = frozenset({
@@ -1308,7 +1308,7 @@ def read_back(home: Any, token: str, *, now: float | None = None) -> str:
     ]
     if not whats:
         return NOTHING_BLOCKED
-    text = "undertone blocked: " + "; and ".join(whats)
+    text = "eridian blocked: " + "; and ".join(whats)
     more = state["blocked_more"]
     if more:
         text += f", and {more} more blocked call{'s' if more > 1 else ''}"
@@ -1450,7 +1450,7 @@ def _glob_pattern_hits(pattern: Any, home: str, cwd: str | None, ids: Any) -> bo
 
 
 def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -> bool:
-    """True when the call could read or search undertone's home.
+    """True when the call could read or search eridian's home.
 
     Paths are compared by file identity (device+inode, symlinks followed) as well as by
     string, so `//`, case variants, firmlinks and symlinks into the home are caught. After
@@ -1474,7 +1474,7 @@ def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -
     if not isinstance(command, str):
         return True
     folded = command.casefold()
-    if ".undertone" in folded or home.casefold() in folded:
+    if ".eridian" in folded or home.casefold() in folded:
         return True
     if cwd is not None and _path_hits(cwd, home, cwd, ids):
         return True
@@ -1693,7 +1693,7 @@ def main(
         raw = ""
     home: Any = None
     try:
-        parser = _Parser(prog="undertone.voice_guard")
+        parser = _Parser(prog="eridian.voice_guard")
         parser.add_argument("event", choices=_EVENTS)
         parser.add_argument("--home", required=True)
         parser.add_argument("--session", required=True)
@@ -1715,10 +1715,10 @@ def main(
         _log(home, event, "error", "-", type(exc).__name__)
         if event == "pretooluse":
             reason = exc if isinstance(exc, GuardError) else type(exc).__name__
-            stderr.write(f"undertone voice guard: failing closed: {reason}\n")
+            stderr.write(f"eridian voice guard: failing closed: {reason}\n")
             return 2
         if event == "userpromptsubmit" and _raw_has_channel(raw):
-            stderr.write("undertone voice guard: failing closed; voice turn dropped\n")
+            stderr.write("eridian voice guard: failing closed; voice turn dropped\n")
             return 2
         return 0  # exit 2 on a typed prompt would erase what the user typed
 

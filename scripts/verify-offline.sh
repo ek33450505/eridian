@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prove the audio pipeline (wake word, VAD, STT, TTS, Kokoro, self-screen, echo cancellation) runs with the network denied.
 # Uses macOS sandbox-exec; a Docker --network none container can't run MLX or `say`.
-# Run `uv run undertone models fetch` first (outside the sandbox).
+# Run `uv run eridian models fetch` first (outside the sandbox).
 #
 # Usage: scripts/verify-offline.sh [--keep]
 set -euo pipefail
@@ -49,8 +49,8 @@ out="$TMP/reply.aiff"
 phrase="Hey Jarvis. [[slnc 600]] What is the capital of France? [[slnc 1500]]"
 
 voice_args=()
-if [[ -n "${UNDERTONE_VOICE:-}" ]]; then
-  voice_args=(-v "$UNDERTONE_VOICE")
+if [[ -n "${ERIDIAN_VOICE:-}" ]]; then
+  voice_args=(-v "$ERIDIAN_VOICE")
 fi
 say "${voice_args[@]+"${voice_args[@]}"}" -o "$clip" --data-format=LEI16@16000 -- "$phrase"
 

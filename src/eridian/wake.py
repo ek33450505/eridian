@@ -1,14 +1,14 @@
 """The one wake-word record every surface reads.
 
-Default is the builtin "hey jarvis". `UNDERTONE_WAKE_MODEL` points at a
+Default is the builtin "hey jarvis". `ERIDIAN_WAKE_MODEL` points at a
 microWakeWord manifest json (loaded with `MicroWakeWord.from_config`) and
 replaces it everywhere: detector, acoustic self-screen, text scrub, transcript
 stripping, hints and the channel's instructions. A set-but-invalid manifest is
 an error at startup, never a silent fall back to the default.
 
 The channel process runs inside Claude's process tree and needs only the phrase,
-not the tflite model. `undertone session` resolves the manifest once and hands
-the phrase to the channel as `UNDERTONE_WAKE_PHRASE` in the MCP config's env,
+not the tflite model. `eridian session` resolves the manifest once and hands
+the phrase to the channel as `ERIDIAN_WAKE_PHRASE` in the MCP config's env,
 so the channel never reads the manifest (or imports pymicro-wakeword) itself.
 """
 
@@ -28,8 +28,8 @@ from typing import Mapping
 
 from . import paths
 
-MODEL_ENV = "UNDERTONE_WAKE_MODEL"
-PHRASE_ENV = "UNDERTONE_WAKE_PHRASE"
+MODEL_ENV = "ERIDIAN_WAKE_MODEL"
+PHRASE_ENV = "ERIDIAN_WAKE_PHRASE"
 
 DEFAULT_PHRASE = "hey jarvis"
 
@@ -151,7 +151,7 @@ def _remove_copy(root: Path, target: Path) -> None:
 
 
 def _private_copy(manifest: bytes, model_name: str, model: bytes) -> Path:
-    """Copy the validated bytes into a 0700 content-addressed dir under UNDERTONE_HOME.
+    """Copy the validated bytes into a 0700 content-addressed dir under ERIDIAN_HOME.
 
     Every later load (detector, per-chunk self-screen detectors) reads this copy,
     so the source can't be swapped or re-pointed after validation. A stale or
@@ -256,19 +256,19 @@ def resolve(environ: Mapping[str, str] | None = None) -> WakeWord:
     """The configured wake word. Raises WakeWordError if configured but unusable."""
     env = os.environ if environ is None else environ
     raw_model = env.get(MODEL_ENV)
-    if raw_model:  # set-but-empty counts as unset, like the other UNDERTONE_* knobs
+    if raw_model:  # set-but-empty counts as unset, like the other ERIDIAN_* knobs
         return from_manifest(raw_model)
     raw_phrase = env.get(PHRASE_ENV)
-    if raw_phrase:  # handed down by `undertone session`; no model needed (channel, hooks)
+    if raw_phrase:  # handed down by `eridian session`; no model needed (channel, hooks)
         return WakeWord(normalize_phrase(raw_phrase, PHRASE_ENV))
     return DEFAULT
 
 
 def resolve_phrase_only(environ: Mapping[str, str] | None = None) -> WakeWord:
-    """The wake word from UNDERTONE_WAKE_PHRASE alone; never reads a manifest.
+    """The wake word from ERIDIAN_WAKE_PHRASE alone; never reads a manifest.
 
     For the channel, which runs inside Claude's process tree: an exported
-    UNDERTONE_WAKE_MODEL in the user's shell must not make it open a model file.
+    ERIDIAN_WAKE_MODEL in the user's shell must not make it open a model file.
     """
     env = os.environ if environ is None else environ
     raw_phrase = env.get(PHRASE_ENV)

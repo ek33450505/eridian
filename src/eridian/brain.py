@@ -5,9 +5,9 @@ child alive and feeding it stream-json user turns gives ~1.4 s to first token.
 This module owns that child, turns its newline-delimited JSON stdout into a
 small stream of BrainEvents, and lets another thread interrupt a turn.
 
-Test seams: `claude_cmd` (constructor arg, else UNDERTONE_CLAUDE_CMD, else
+Test seams: `claude_cmd` (constructor arg, else ERIDIAN_CLAUDE_CMD, else
 "claude") is pointed at a fake CLI by the tests -- they never run real `claude`.
-State lives under UNDERTONE_HOME (see paths.py).
+State lives under ERIDIAN_HOME (see paths.py).
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-from undertone import paths
+from eridian import paths
 
 # What the model is told about the voice channel. Kept here (not in a file) so
 # the policy and the wording ship together and tests can see it.
 VOICE_PROMPT = (
-    "The user is speaking to you through undertone, a hands-free voice interface. "
+    "The user is speaking to you through eridian, a hands-free voice interface. "
     "Your reply will be read aloud by text-to-speech, so answer conversationally "
     "in short, plain sentences. Do not use markdown, headings, tables or bullet "
     "lists unless the user asks for them, and keep replies to a few sentences "
@@ -120,7 +120,7 @@ class ClaudeBrain:
         turn_timeout_s: float = 120.0,
     ) -> None:
         self._cwd = os.fspath(cwd)
-        self._claude_cmd = claude_cmd or os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"
+        self._claude_cmd = claude_cmd or os.environ.get("ERIDIAN_CLAUDE_CMD") or "claude"
         # Fail on a bad resume id at construction, not at spawn.
         self._argv = build_command(self._claude_cmd, resume_session_id)
         self._turn_timeout_s = turn_timeout_s
@@ -275,7 +275,7 @@ class ClaudeBrain:
         """Fail closed if the child's advertised policy is not what we asked for.
 
         The argv is the intent; the init event is what the child actually
-        runs with. This catches a wrapper behind UNDERTONE_CLAUDE_CMD that
+        runs with. This catches a wrapper behind ERIDIAN_CLAUDE_CMD that
         drops flags, an env var that weakens the policy, or a future CLI that
         renames or ignores a flag. A missing mcp_servers key is a mismatch.
         """

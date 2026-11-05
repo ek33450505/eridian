@@ -1,6 +1,6 @@
 """Full-duplex audio with WebRTC echo cancellation.
 
-One `sounddevice.RawStream` carries both the mic and the speaker. Undertone
+One `sounddevice.RawStream` carries both the mic and the speaker. Eridian
 plays TTS PCM itself, so every 10 ms audio callback knows exactly which speaker
 frame went out alongside the mic frame it captured. The main thread feeds that
 pair to WebRTC AEC3 (via `livekit`) and yields echo-free mic frames to the

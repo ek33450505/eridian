@@ -133,7 +133,7 @@ class ChatSession:
             vad_reset=vad_reset,
         )
         self._worker = threading.Thread(
-            target=self._worker_loop, name="undertone-brain", daemon=True
+            target=self._worker_loop, name="eridian-brain", daemon=True
         )
         self._worker.start()
 

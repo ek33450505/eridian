@@ -1,4 +1,4 @@
-"""Tests for undertone.chat.ChatSession -- fakes only.
+"""Tests for eridian.chat.ChatSession -- fakes only.
 
 No mic, speaker, model, or real `claude` is touched: the wake detector, VAD,
 STT and clock are scripted, the brain is a `_FakeBrain` replaying canned event
@@ -14,9 +14,9 @@ import threading
 import time
 import unittest
 
-from undertone.brain import BrainError, TextDelta, ToolUse, TurnEnd
-from undertone.chat import APOLOGY, ChatSession
-from undertone.listener import VAD_CHUNK_BYTES
+from eridian.brain import BrainError, TextDelta, ToolUse, TurnEnd
+from eridian.chat import APOLOGY, ChatSession
+from eridian.listener import VAD_CHUNK_BYTES
 
 FRAME = bytes(VAD_CHUNK_BYTES)
 

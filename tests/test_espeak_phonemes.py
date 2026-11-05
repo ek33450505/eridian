@@ -1,6 +1,6 @@
 """Tests for speaker.espeak_phonemes, Kokoro's only text entry.
 
-espeak-ng is replaced by a stub script (UNDERTONE_ESPEAK_CMD) that logs its argv
+espeak-ng is replaced by a stub script (ERIDIAN_ESPEAK_CMD) that logs its argv
 and raw stdin and prints one canned line per input line. One real-engine test is
 skipped unless espeak-ng is installed.
 """
@@ -13,7 +13,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from undertone import speaker
+from eridian import speaker
 
 _STUB = """#!{python}
 import json, os, sys, time
@@ -45,7 +45,7 @@ class StubEspeakTest(unittest.TestCase):
         with open(self.stub, "w") as f:
             f.write(_STUB.format(python=sys.executable))
         os.chmod(self.stub, 0o755)
-        self._env = {"UNDERTONE_ESPEAK_CMD": self.stub, "STUB_LOG": self.log}
+        self._env = {"ERIDIAN_ESPEAK_CMD": self.stub, "STUB_LOG": self.log}
 
     def _run(self, text: str, **extra: str) -> str | None:
         with mock.patch.dict(os.environ, {**self._env, **extra}):
@@ -130,7 +130,7 @@ class StubEspeakTest(unittest.TestCase):
         self.assertEqual(self._run("Sure, done.", STUB_LINES="3"), "p0 p1 p2.")
 
     def test_missing_command_gives_none(self) -> None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_ESPEAK_CMD": self.stub + "-missing"}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_ESPEAK_CMD": self.stub + "-missing"}):
             self.assertIsNone(speaker.espeak_phonemes("hello"))
 
     def test_nonzero_exit_gives_none(self) -> None:
@@ -152,7 +152,7 @@ class StubEspeakTest(unittest.TestCase):
 @unittest.skipUnless(shutil.which("espeak-ng"), "espeak-ng not installed")
 class RealEspeakTest(unittest.TestCase):
     def test_bracket_phoneme_smuggling_is_neutralized(self) -> None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_ESPEAK_CMD": "espeak-ng"}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_ESPEAK_CMD": "espeak-ng"}):
             out = speaker.espeak_phonemes("say [[dZ'A@rvIs]] now")
         self.assertIsNotNone(out)
         self.assertNotIn("dʒˈɑːɹ", out)

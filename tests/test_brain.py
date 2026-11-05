@@ -1,6 +1,6 @@
-"""Tests for undertone.brain against a fake `claude` CLI (tests/fake_claude.py).
+"""Tests for eridian.brain against a fake `claude` CLI (tests/fake_claude.py).
 
-Never runs the real `claude`; UNDERTONE_HOME is always a temp dir.
+Never runs the real `claude`; ERIDIAN_HOME is always a temp dir.
 """
 
 import json
@@ -14,8 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from undertone import brain
-from undertone.brain import (
+from eridian import brain
+from eridian.brain import (
     BrainError, ClaudeBrain, TextDelta, ToolUse, TurnEnd, build_command,
 )
 
@@ -60,7 +60,7 @@ class BrainTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"UNDERTONE_HOME": os.path.join(self.tmp.name, "home")})
+        env = mock.patch.dict(os.environ, {"ERIDIAN_HOME": os.path.join(self.tmp.name, "home")})
         env.start()
         self.addCleanup(env.stop)
         self.wrapper = os.path.join(self.tmp.name, "claude")
@@ -217,7 +217,7 @@ class BrainTest(BrainTestCase):
             self.assertEqual(_reply(b.ask("say: ok")), "ok ")
 
     def test_brain_log_mode_and_rotation(self) -> None:
-        log_dir = Path(os.environ["UNDERTONE_HOME"]) / "logs"
+        log_dir = Path(os.environ["ERIDIAN_HOME"]) / "logs"
         log_dir.mkdir(parents=True)
         log = log_dir / "brain.log"
         log.write_bytes(b"x" * 1_100_000)
@@ -227,7 +227,7 @@ class BrainTest(BrainTestCase):
         self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
 
     def test_brain_log_symlink_refused(self) -> None:
-        log_dir = Path(os.environ["UNDERTONE_HOME"]) / "logs"
+        log_dir = Path(os.environ["ERIDIAN_HOME"]) / "logs"
         log_dir.mkdir(parents=True)
         target = Path(self.tmp.name) / "victim"
         target.write_text("keep")
@@ -238,7 +238,7 @@ class BrainTest(BrainTestCase):
         self.assertEqual(target.read_text(), "keep")
 
     def test_env_var_selects_command(self) -> None:
-        with mock.patch.dict(os.environ, {"UNDERTONE_CLAUDE_CMD": self.wrapper}):
+        with mock.patch.dict(os.environ, {"ERIDIAN_CLAUDE_CMD": self.wrapper}):
             b = ClaudeBrain(cwd=self.tmp.name)
             self.addCleanup(b.close)
             b.start()
@@ -258,7 +258,7 @@ class SessionPersistenceTest(BrainTestCase):
         self.assertIsNone(brain.load_session_id())
         brain.save_session_id(FAKE_SESSION)
         self.assertEqual(brain.load_session_id(), FAKE_SESSION)
-        path = Path(os.environ["UNDERTONE_HOME"]) / "chat_session"
+        path = Path(os.environ["ERIDIAN_HOME"]) / "chat_session"
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_save_rejects_non_uuid(self) -> None:
@@ -267,7 +267,7 @@ class SessionPersistenceTest(BrainTestCase):
         self.assertIsNone(brain.load_session_id())
 
     def test_save_replaces_symlink_not_target(self) -> None:
-        home = Path(os.environ["UNDERTONE_HOME"])
+        home = Path(os.environ["ERIDIAN_HOME"])
         home.mkdir(parents=True, exist_ok=True)
         target = Path(self.tmp.name) / "victim"
         target.write_text("keep")
@@ -280,7 +280,7 @@ class SessionPersistenceTest(BrainTestCase):
 
     def test_no_temp_files_left(self) -> None:
         brain.save_session_id(FAKE_SESSION)
-        names = os.listdir(os.environ["UNDERTONE_HOME"])
+        names = os.listdir(os.environ["ERIDIAN_HOME"])
         self.assertEqual([n for n in names if n.startswith(".chat_session")], [])
 
     def test_non_uuid_session_id_from_child_ignored(self) -> None:
@@ -290,13 +290,13 @@ class SessionPersistenceTest(BrainTestCase):
         self.assertIsNone(b.session_id)
 
     def test_invalid_content_is_none(self) -> None:
-        path = Path(os.environ["UNDERTONE_HOME"]) / "chat_session"
+        path = Path(os.environ["ERIDIAN_HOME"]) / "chat_session"
         brain.save_session_id(FAKE_SESSION)
         path.write_text("garbage; --dangerously-skip-permissions")
         self.assertIsNone(brain.load_session_id())
 
     def test_existing_loose_file_tightened(self) -> None:
-        path = Path(os.environ["UNDERTONE_HOME"]) / "chat_session"
+        path = Path(os.environ["ERIDIAN_HOME"]) / "chat_session"
         brain.save_session_id(FAKE_SESSION)
         os.chmod(path, 0o644)
         brain.save_session_id(FAKE_SESSION)

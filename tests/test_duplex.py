@@ -3,7 +3,7 @@
 import threading
 import unittest
 
-from undertone.duplex import DEFAULT_DELAY_MS, DuplexAudio
+from eridian.duplex import DEFAULT_DELAY_MS, DuplexAudio
 
 BLOCK = 320
 

@@ -1,7 +1,7 @@
 """Real microphone frame source.
 
 Heavy/optional deps (`sounddevice`) are imported lazily inside functions so
-`undertone hook stop` and friends stay fast and dependency-light even when
+`eridian hook stop` and friends stay fast and dependency-light even when
 this module is imported transitively. Not unit-tested beyond import-guarding
 -- a real audio stream needs a real mic, which tests must never open.
 """

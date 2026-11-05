@@ -3,7 +3,7 @@
 SpeechQueue plays sentences one after another through `say`, so the first
 sentence can start while the rest of a reply is still streaming. It is the
 `--no-aec` fallback. RenderedSpeechQueue asks a Renderer for 16 kHz mono
-int16 PCM pieces per sentence and hands them to a PlaybackSink, so undertone
+int16 PCM pieces per sentence and hands them to a PlaybackSink, so eridian
 plays the audio itself and an echo canceller sees the reference signal; it
 renders ahead (the sink buffers) to keep sentences gapless. SayRenderer uses
 `say -o` (argv from speaker.build_say_argv, the single sanitizing argv builder);
@@ -11,10 +11,10 @@ KokoroRenderer synthesizes with a resident Kokoro voice. on_start fires once per
 item, after the first piece the sink accepts (a sink returning False screened
 it out). stop() is there for barge-in.
 
-enqueue(text, own=True) marks undertone's own words; they get its second voice.
+enqueue(text, own=True) marks eridian's own words; they get its second voice.
 
-Test seams: UNDERTONE_SAY_CMD / UNDERTONE_VOICE (via build_say_argv); tests
-must point UNDERTONE_SAY_CMD at a stub (see tests/test_player.py).
+Test seams: ERIDIAN_SAY_CMD / ERIDIAN_VOICE (via build_say_argv); tests
+must point ERIDIAN_SAY_CMD at a stub (see tests/test_player.py).
 RenderedSpeechQueue takes its sink and renderer as constructor arguments, so
 tests pass fakes and never open an audio device or load a model.
 """
@@ -65,7 +65,7 @@ class SpeechQueue:
         self._proc: subprocess.Popen | None = None
         self._playing = False  # an item is dequeued and not yet finished
         self._closed = False
-        self._thread = threading.Thread(target=self._run, name="undertone-speech", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="eridian-speech", daemon=True)
         self._thread.start()
 
     def enqueue(self, text: str, *, own: bool = False) -> None:
@@ -169,7 +169,7 @@ class SayRenderer:
         self._proc: subprocess.Popen | None = None
         self._counter = 0
         # Private (0700) dir for render files; names are ours, never model text.
-        self._dir = tempfile.mkdtemp(prefix="undertone-tts-")
+        self._dir = tempfile.mkdtemp(prefix="eridian-tts-")
 
     def render(
         self, text: str, wanted: Callable[[], bool], *, own: bool = False
@@ -271,7 +271,7 @@ class RenderedSpeechQueue:
         self._generation = 0
         self._rendering = False  # an item is dequeued and not yet fully handed to the sink
         self._closed = False
-        self._thread = threading.Thread(target=self._run, name="undertone-render", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="eridian-render", daemon=True)
         self._thread.start()
 
     def enqueue(self, text: str, *, own: bool = False) -> None:

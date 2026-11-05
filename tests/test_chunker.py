@@ -1,8 +1,8 @@
-"""Behavioral tests for undertone.chunker.SentenceChunker (pure, no I/O)."""
+"""Behavioral tests for eridian.chunker.SentenceChunker (pure, no I/O)."""
 
 import unittest
 
-from undertone.chunker import CODE_PLACEHOLDER, SentenceChunker
+from eridian.chunker import CODE_PLACEHOLDER, SentenceChunker
 
 
 def feed_all(chunker: SentenceChunker, deltas: list[str]) -> list[str]:

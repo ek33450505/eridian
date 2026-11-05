@@ -35,17 +35,17 @@ TOKENIZER_FILE = "tokenizer.json"
 # Ed's pick; screen test 2026-10-02 over 200 sentences: 0 ordinary blocked, 10/11 homophone attacks blocked
 # (am_michael: 2 blocked, 11/11).
 DEFAULT_VOICE = "am_adam"
-VOICE_ENV = "UNDERTONE_KOKORO_VOICE"
-# undertone's own words (confirm read-backs) use a second voice so they sound different
+VOICE_ENV = "ERIDIAN_KOKORO_VOICE"
+# eridian's own words (confirm read-backs) use a second voice so they sound different
 # from Claude's replies; Claude's text then can't imitate them. af_heart contrasts with
 # am_adam and is American English, so the en-us espeak phonemes fit.
-OWN_VOICE_ENV = "UNDERTONE_KOKORO_OWN_VOICE"
+OWN_VOICE_ENV = "ERIDIAN_KOKORO_OWN_VOICE"
 DEFAULT_OWN_VOICE = "af_heart"
 # "chord" layers +4 and +7 semitone copies over the reply voice (a Rocky-style chord
-# voice); default off. Never applied to undertone's own voice.
-EFFECT_ENV = "UNDERTONE_KOKORO_EFFECT"
-# Semitone shift of the reply voice (never undertone's own), applied before the chord.
-PITCH_ENV = "UNDERTONE_KOKORO_PITCH"
+# voice); default off. Never applied to eridian's own voice.
+EFFECT_ENV = "ERIDIAN_KOKORO_EFFECT"
+# Semitone shift of the reply voice (never eridian's own), applied before the chord.
+PITCH_ENV = "ERIDIAN_KOKORO_PITCH"
 _PITCH_LIMIT = 6.0
 _CHORD_VOICES = ((4.0, 0.35, 5.3), (7.0, 0.25, 6.1))  # (semitones, gain, vibrato Hz)
 _CHORD_WINDOW_S = 0.04
@@ -139,7 +139,7 @@ class KokoroUnavailable(RuntimeError):
 
 
 def fetch_model() -> None:
-    """Download the pinned model, tokenizer and voices once (used by `undertone models fetch`)."""
+    """Download the pinned model, tokenizer and voices once (used by `eridian models fetch`)."""
     previous = os.environ.pop("HF_HUB_OFFLINE", None)
     try:
         from huggingface_hub import snapshot_download
@@ -158,7 +158,7 @@ def _check_voice_name(voice: str) -> str:
     # The name becomes part of a file path, so it is validated, never sanitized.
     if not _VOICE_RE.fullmatch(voice):
         raise KokoroUnavailable(
-            f"undertone: invalid Kokoro voice name {voice!r} (expected e.g. 'am_michael')"
+            f"eridian: invalid Kokoro voice name {voice!r} (expected e.g. 'am_michael')"
         )
     return voice
 
@@ -173,7 +173,7 @@ def parse_voice_spec(spec: str) -> list[tuple[str, float]]:
         name, sep, raw = part.partition(":")
         if not sep:
             raise KokoroUnavailable(
-                f"undertone: Kokoro voice blend {spec!r} needs name:weight for every voice"
+                f"eridian: Kokoro voice blend {spec!r} needs name:weight for every voice"
             )
         try:
             weight = float(raw)
@@ -181,13 +181,13 @@ def parse_voice_spec(spec: str) -> list[tuple[str, float]]:
             weight = math.nan
         if not (math.isfinite(weight) and weight > 0.0):
             raise KokoroUnavailable(
-                f"undertone: invalid Kokoro blend weight {raw!r} for {name!r} "
+                f"eridian: invalid Kokoro blend weight {raw!r} for {name!r} "
                 "(must be positive and finite)"
             )
         parsed.append((_check_voice_name(name), weight))
     names = [n for n, _ in parsed]
     if len(set(names)) != len(names):
-        raise KokoroUnavailable(f"undertone: duplicate voice in Kokoro blend {spec!r}")
+        raise KokoroUnavailable(f"eridian: duplicate voice in Kokoro blend {spec!r}")
     total = sum(w for _, w in parsed)
     return [(n, w / total) for n, w in parsed]
 
@@ -201,9 +201,9 @@ def _load_styles(path: str, label: str) -> np.ndarray:
     try:
         styles = np.fromfile(path, dtype=np.float32)
     except (OSError, ValueError) as exc:
-        raise KokoroUnavailable(f"undertone: could not load Kokoro assets: {exc}") from exc
+        raise KokoroUnavailable(f"eridian: could not load Kokoro assets: {exc}") from exc
     if styles.size == 0 or styles.size % STYLE_DIM:
-        raise KokoroUnavailable(f"undertone: Kokoro voice {label!r} has an unexpected shape")
+        raise KokoroUnavailable(f"eridian: Kokoro voice {label!r} has an unexpected shape")
     return styles.reshape(-1, STYLE_DIM)
 
 
@@ -213,7 +213,7 @@ def blend_styles(parts: list[tuple[str, float, np.ndarray]]) -> np.ndarray:
     for name, _, arr in parts:
         if arr.shape != shape:
             raise KokoroUnavailable(
-                f"undertone: Kokoro voice {name!r} shape {arr.shape} does not match {shape}"
+                f"eridian: Kokoro voice {name!r} shape {arr.shape} does not match {shape}"
             )
     out = np.zeros(shape, dtype=np.float64)
     for _, w, arr in parts:
@@ -267,7 +267,7 @@ def parse_pitch(raw: str | float | None) -> float:
         semitones = math.nan
     if not (math.isfinite(semitones) and abs(semitones) <= _PITCH_LIMIT):
         raise KokoroUnavailable(
-            f"undertone: invalid {PITCH_ENV} value {raw!r} (expected semitones in -6..6)"
+            f"eridian: invalid {PITCH_ENV} value {raw!r} (expected semitones in -6..6)"
         )
     return semitones
 
@@ -287,7 +287,7 @@ def _model_paths_multi(voices: list[str]) -> tuple[str, str, list[str]]:
         _check_voice_name(voice)
         voice_sha = VOICE_SHA256.get(voice)
         if voice_sha is None:
-            raise KokoroUnavailable(f"undertone: unknown Kokoro voice {voice!r}")
+            raise KokoroUnavailable(f"eridian: unknown Kokoro voice {voice!r}")
         wanted.append((f"voices/{voice}.bin", voice_sha))
     from huggingface_hub import hf_hub_download
 
@@ -300,13 +300,13 @@ def _model_paths_multi(voices: list[str]) -> tuple[str, str, list[str]]:
             ok = _sha256_file(path) == sha
         except Exception as exc:  # noqa: BLE001 - any cache miss means "not fetched"
             raise KokoroUnavailable(
-                f"undertone: Kokoro model/voice {', '.join(voices)!r} is not cached locally -- "
-                "run `undertone models fetch` first"
+                f"eridian: Kokoro model/voice {', '.join(voices)!r} is not cached locally -- "
+                "run `eridian models fetch` first"
             ) from exc
         if not ok:
             raise KokoroUnavailable(
-                f"undertone: Kokoro file {name!r} failed its integrity check -- "
-                "re-run `undertone models fetch`"
+                f"eridian: Kokoro file {name!r} failed its integrity check -- "
+                "re-run `eridian models fetch`"
             )
         by_name[name] = path
     return (
@@ -328,11 +328,11 @@ def _default_session(model_path: str) -> Any:
     onnxruntime.disable_telemetry_events()
     # Default session options on purpose: disabling intra-op spinning costs ~20% idle and
     # only helps against competing onnxruntime processes (2 rivals: 0.99 vs 1.29 s), and
-    # undertone is normally the only one.
+    # eridian is normally the only one.
     try:
         return onnxruntime.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     except Exception as exc:  # noqa: BLE001 - ORT raises InvalidProtobuf etc., not OSError
-        raise KokoroUnavailable(f"undertone: could not load the Kokoro model: {exc}") from exc
+        raise KokoroUnavailable(f"eridian: could not load the Kokoro model: {exc}") from exc
 
 
 def _default_resample(pcm24: bytes) -> bytes:
@@ -370,7 +370,7 @@ class KokoroVoice:
         blended = len(components) > 1
         effect = (os.environ.get(EFFECT_ENV, "") if effect is None else effect).strip().lower()
         if effect not in ("", "off", "none", "chord"):
-            raise KokoroUnavailable(f"undertone: unknown {EFFECT_ENV} value {effect!r}")
+            raise KokoroUnavailable(f"eridian: unknown {EFFECT_ENV} value {effect!r}")
         self.effect = "chord" if effect == "chord" else ""
         self.pitch = parse_pitch(os.environ.get(PITCH_ENV) if pitch is None else pitch)
 
@@ -388,7 +388,7 @@ class KokoroVoice:
             with open(tokenizer_path, encoding="utf-8") as fh:
                 vocab = json.load(fh)["model"]["vocab"]
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise KokoroUnavailable(f"undertone: could not load Kokoro assets: {exc}") from exc
+            raise KokoroUnavailable(f"eridian: could not load Kokoro assets: {exc}") from exc
         if not (
             isinstance(vocab, dict)
             and vocab.get("$") == 0
@@ -396,12 +396,12 @@ class KokoroVoice:
                 isinstance(k, str) and len(k) == 1 and type(v) is int for k, v in vocab.items()
             )
         ):
-            raise KokoroUnavailable("undertone: Kokoro tokenizer vocab is malformed")
+            raise KokoroUnavailable("eridian: Kokoro tokenizer vocab is malformed")
         self._vocab: dict[str, int] = vocab
         if blended:
             missing = [n for n in self.voice_names if n not in component_files]
             if missing:
-                raise KokoroUnavailable(f"undertone: no voice file for {missing[0]!r}")
+                raise KokoroUnavailable(f"eridian: no voice file for {missing[0]!r}")
             self._styles = blend_styles(
                 [(n, w, _load_styles(component_files[n], n)) for n, w in components]
             )
@@ -416,10 +416,10 @@ class KokoroVoice:
                 own_voice_path or model_paths(self.own_voice)[2], dtype=np.float32
             )
         except (OSError, ValueError) as exc:
-            raise KokoroUnavailable(f"undertone: could not load Kokoro assets: {exc}") from exc
+            raise KokoroUnavailable(f"eridian: could not load Kokoro assets: {exc}") from exc
         if own_styles.size == 0 or own_styles.size % STYLE_DIM:
             raise KokoroUnavailable(
-                f"undertone: Kokoro voice {self.own_voice!r} has an unexpected shape"
+                f"eridian: Kokoro voice {self.own_voice!r} has an unexpected shape"
             )
         self._own_styles = own_styles.reshape(-1, STYLE_DIM)
 
@@ -487,7 +487,7 @@ class KokoroVoice:
     def render(self, phonemes: str, *, own: bool = False) -> bytes | None:
         """Render one piece to 16 kHz int16 PCM, or None if there is nothing safe to play.
 
-        own=True uses undertone's own voice instead of the reply voice.
+        own=True uses eridian's own voice instead of the reply voice.
         """
         ids = [self._vocab[c] for c in phonemes if c in self._vocab]
         if not ids:
@@ -531,6 +531,6 @@ class KokoroVoice:
         try:
             out = self.render(WARM_UP_PHONEMES)
         except Exception as exc:  # noqa: BLE001 - startup must fall back, never crash
-            raise KokoroUnavailable(f"undertone: Kokoro warm-up failed: {exc}") from exc
+            raise KokoroUnavailable(f"eridian: Kokoro warm-up failed: {exc}") from exc
         if out is None:
-            raise KokoroUnavailable("undertone: Kokoro warm-up failed: no audio produced")
+            raise KokoroUnavailable("eridian: Kokoro warm-up failed: no audio produced")

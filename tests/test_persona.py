@@ -7,7 +7,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from undertone import cli, mcp_channel, persona
+from eridian import cli, mcp_channel, persona
 
 
 class ResolveTest(unittest.TestCase):
@@ -25,10 +25,10 @@ class ResolveTest(unittest.TestCase):
 
 
 class InstructionsTest(unittest.TestCase):
-    # SHA-256 of build_instructions(safe_phrase) at HEAD 4c12c80 (before the persona existed).
+    # SHA-256 of build_instructions(safe_phrase), as at HEAD 4c12c80 (before the persona existed) with the product-name rename applied.
     GOLDEN = {
-        False: "f3cab9be39646f919f28fe330c29cff34f2ab57887c7cbf6dbcf80dcf51cdcc6",
-        True: "fa93786457122c70137fdde3ef9c6b0e535a83bf9d91d2d0680effd032270616",
+        False: "514b75e112d2f5c359cedbc21a8e0cb9f5a5bacd5123dce12c7962759cd612f1",
+        True: "87bc8aae967103a8ab8037d592fa208fa2ebf987853b4815c562227e7adfcdb6",
     }
 
     def test_off_is_byte_identical(self) -> None:
@@ -74,7 +74,7 @@ class PassthroughTest(unittest.TestCase):
     def _env(self, **extra: str) -> dict:
         with mock.patch.dict(os.environ, extra):
             cfg = cli.channel_mcp_config("py", Path("/h"), "tok")
-            return cfg["mcpServers"]["undertone"]["env"]
+            return cfg["mcpServers"]["eridian"]["env"]
 
     def setUp(self) -> None:
         patcher = mock.patch.dict(os.environ)
@@ -86,7 +86,7 @@ class PassthroughTest(unittest.TestCase):
         self.assertNotIn(persona.PERSONA_ENV, self._env())
 
     def test_rocky_reaches_channel_env(self) -> None:
-        env = self._env(UNDERTONE_PERSONA="rocky")
+        env = self._env(ERIDIAN_PERSONA="rocky")
         self.assertEqual(env[persona.PERSONA_ENV], "rocky")
         json.dumps(env)
 
@@ -105,13 +105,13 @@ class PassthroughTest(unittest.TestCase):
                 self.assertEqual(cli.main(["session"]), 1)
             execvpe.assert_not_called()
             self.assertEqual(mcp_channel.main(), 1)
-        self.assertEqual(err.getvalue().count("UNDERTONE_PERSONA"), 2)
+        self.assertEqual(err.getvalue().count("ERIDIAN_PERSONA"), 2)
 
 
 class LaunchGateTest(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch.dict(
-            os.environ, {persona.PERSONA_ENV: "pirate", "UNDERTONE_CLAUDE_CMD": "fakeclaude"}
+            os.environ, {persona.PERSONA_ENV: "pirate", "ERIDIAN_CLAUDE_CMD": "fakeclaude"}
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -136,7 +136,7 @@ class LaunchGateTest(unittest.TestCase):
             self.assertEqual(cli.main(["launch", "--", "--model", "x"]), 1)
         ensure.assert_not_called()
         execvpe.assert_not_called()
-        self.assertIn("UNDERTONE_PERSONA", err.getvalue())
+        self.assertIn("ERIDIAN_PERSONA", err.getvalue())
 
 
 if __name__ == "__main__":
