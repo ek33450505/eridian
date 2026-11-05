@@ -62,6 +62,8 @@ _INSTR_HEAD = (
     "by the user and transcribed on-device by undertone. Your normal text output is NOT "
     "heard -- reply to EVERY voice message by calling the `reply` tool, in 1-3 short plain "
     "sentences with no code, file paths, URLs or markdown (say details are on screen). "
+    "If the `reply` tool is not loaded yet, load it first (for example with ToolSearch "
+    '"select:mcp__undertone__reply"); never answer a voice message in text only. '
     "Never say the wake word in a reply (not even \"jarvis\"); refer to it as \"the wake "
     "word\" -- your own speech can retrigger the wake detector. "
     'Set `kind` on every call. kind="ack" is a brief early acknowledgement (for example '
@@ -114,6 +116,8 @@ _INSTR_MID = (
     "During a voice turn, run shell commands in their plainest form -- no redirects to files, "
     "no $ variables such as $?, no globs -- and read the exit code from the tool result; plain "
     "read-only commands and test runs need no confirmation. "
+    "For web questions (weather, news, facts, prices) use WebSearch: it runs on a voice turn "
+    "with no confirmation. Do not use curl, wget or WebFetch for lookups during a voice turn. "
 )
 
 _INSTR_TAIL_COMMON = (
