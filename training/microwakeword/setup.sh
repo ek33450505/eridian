@@ -32,7 +32,8 @@ NOTEBOOK_URL="https://raw.githubusercontent.com/kahrendt/microWakeWord/main/note
 MWW_REPO="https://github.com/kahrendt/microWakeWord"
 PIPER_REPO="https://github.com/kahrendt/piper-sample-generator"
 PIPER_MODEL_URL="https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt"
-PYMICRO_FEATURES_SPEC="git+https://github.com/puddly/pymicro-features@puddly/minimum-cpp-version"
+# The PyPI universal2 wheel replaces the notebook's macOS fork, which no longer builds with current clang; it is the version pymicro-wakeword pulls in for undertone's runtime.
+PYMICRO_FEATURES_SPEC="pymicro-features==2.0.2"
 AUDIO_METADATA_SPEC="git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f"
 AUDIOSET_URL="https://huggingface.co/datasets/agkphysics/AudioSet/resolve/main/data/bal_train/09.parquet"
 FMA_URL="https://huggingface.co/datasets/mchl914/fma_xsmall/resolve/main/fma_xs.zip"
@@ -159,7 +160,7 @@ else
 	# TF >= 2.18 (arm64 wheel) with numpy 2+; installed before microWakeWord
 	# so its requirements resolve against them.
 	pip_install 'tensorflow>=2.18' 'numpy>=2'
-	# Darwin forks, exactly as the notebook installs them.
+	# pymicro-features from PyPI (see above); audio-metadata fork as in the notebook.
 	pip_install "$PYMICRO_FEATURES_SPEC"
 	pip_install "$AUDIO_METADATA_SPEC"
 	pip_install -e "$MWW_DIR"

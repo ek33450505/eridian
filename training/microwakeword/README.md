@@ -48,6 +48,9 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
   `ambient_false_positives_per_hour`, needs a `validation_ambient` split that
   `dinner_party_eval` is not confirmed to provide, so it is not used.
 - Audio decoding uses `soundfile` and `datasets<4` instead of ffmpeg/torchcodec.
+- `pymicro-features==2.0.2` from PyPI (universal2 wheel) replaces the notebook's
+  macOS fork, which no longer builds with current clang; it matches undertone's
+  runtime frontend.
 
 ## Train
 
