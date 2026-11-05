@@ -38,7 +38,7 @@ class CliTestCase(unittest.TestCase):
 class RetiredCommandsTest(CliTestCase):
     def test_phase1_commands_are_gone(self) -> None:
         parser = cli.build_parser()
-        for name in ("serve", "say", "stop", "on", "off", "status", "hook", "hooks-snippet"):
+        for name in ("serve", "say", "on", "off", "status", "hook", "hooks-snippet"):
             with self.subTest(command=name):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
                     parser.parse_args([name])
@@ -48,7 +48,10 @@ class RetiredCommandsTest(CliTestCase):
         sub = next(a for a in cli.build_parser()._actions if a.dest == "command")
         self.assertEqual(
             sorted(sub.choices),
-            ["attach", "channel", "chat", "listen", "models", "safe-phrase", "session"],
+            [
+                "attach", "channel", "chat", "launch", "listen", "models",
+                "safe-phrase", "session", "shell-init", "stop",
+            ],
         )
 
 
@@ -720,6 +723,291 @@ class MakeAudioIoTest(unittest.TestCase):
         ):
             cli._cmd_models_fetch(mock.Mock())
         self.assertNotIn("espeak", out.getvalue())
+
+
+class LaunchModeTest(unittest.TestCase):
+    def _mode(self, argv, env=None, stdin=True, stdout=True) -> str:
+        return cli.launch_mode(argv, env or {}, stdin, stdout)
+
+    def test_voice_cases(self) -> None:
+        for argv in ([], ["--model", "opus"], ["fix the bug"], ["--resume"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._mode(argv), "voice")
+
+    def test_passthrough_cases(self) -> None:
+        cases = {
+            "optout": ([], {"UNDERTONE_AUTOLAUNCH": "0"}, True, True),
+            "stdin not tty": ([], {}, False, True),
+            "stdout not tty": ([], {}, True, False),
+            "print": (["-p", "hi"], {}, True, True),
+            "print long": (["--print"], {}, True, True),
+            "help": (["--help"], {}, True, True),
+            "help short": (["-h"], {}, True, True),
+            "version": (["-v"], {}, True, True),
+            "version long": (["--version"], {}, True, True),
+            "settings": (["--settings", "x.json"], {}, True, True),
+            "settings=": (["--settings=x.json"], {}, True, True),
+            "bare": (["--bare"], {}, True, True),
+            "safe-mode": (["--safe-mode"], {}, True, True),
+            "subcommand": (["mcp", "list"], {}, True, True),
+            "subcommand after option": (["--model", "x", "doctor"], {}, True, True),
+        }
+        for name, (argv, env, stdin, stdout) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self._mode(argv, env, stdin, stdout), "passthrough")
+
+    def test_autolaunch_other_value_still_voice(self) -> None:
+        self.assertEqual(self._mode([], {"UNDERTONE_AUTOLAUNCH": "1"}), "voice")
+
+
+class LaunchCommandTest(CliTestCase):
+    def test_passthrough_execs_plain_claude(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"UNDERTONE_CLAUDE_CMD": "fakeclaude"}),
+            mock.patch.object(cli.os, "execvpe") as execvpe,
+            mock.patch.object(cli, "_ensure_attach") as ensure,
+        ):
+            self.assertEqual(cli.main(["launch", "--", "mcp", "list"]), 1)
+        execvpe.assert_called_once_with(
+            "fakeclaude", ["fakeclaude", "mcp", "list"], os.environ
+        )
+        ensure.assert_not_called()
+
+    def test_voice_ensures_attach_then_runs_session(self) -> None:
+        with (
+            mock.patch.object(cli, "launch_mode", return_value="voice"),
+            mock.patch.object(cli, "_ensure_attach") as ensure,
+            mock.patch.object(cli, "_exec_session", return_value=0) as session,
+        ):
+            self.assertEqual(cli.main(["launch", "--", "--model", "x"]), 0)
+        ensure.assert_called_once_with()
+        session.assert_called_once_with(["--model", "x"], warn_no_voice=False)
+
+
+class EnsureAttachTest(CliTestCase):
+    def test_spawns_detached_attach_with_log_and_pidfile(self) -> None:
+        from undertone import voice
+
+        child = mock.Mock(pid=4242)
+        err = io.StringIO()
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen", return_value=child) as popen,
+            contextlib.redirect_stderr(err),
+        ):
+            cli._ensure_attach()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv, [sys.executable, "-m", "undertone", "attach"])
+        kwargs = popen.call_args.kwargs
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        log = paths.attach_log_path()
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(paths.read_attach_pid(), 4242)
+        self.assertEqual(paths.attach_pid_path().stat().st_mode & 0o777, 0o600)
+        self.assertIn("starting voice in the background", err.getvalue())
+        self.assertIn(str(log), err.getvalue())
+
+    def test_no_spawn_when_socket_answers(self) -> None:
+        from undertone import voice
+
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=True),
+            mock.patch.object(cli.subprocess, "Popen") as popen,
+        ):
+            cli._ensure_attach()
+        popen.assert_not_called()
+
+    def test_no_spawn_while_previous_attach_still_loading(self) -> None:
+        from undertone import voice
+
+        paths.write_attach_pid(777)
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli, "_pid_is_attach", return_value=True),
+            mock.patch.object(cli.subprocess, "Popen") as popen,
+        ):
+            cli._ensure_attach()
+        popen.assert_not_called()
+
+    def test_symlinked_pidfile_is_refused(self) -> None:
+        target = Path(self._tmp.name) / "victim"
+        target.write_text("keep")
+        paths.attach_pid_path().symlink_to(target)
+        with self.assertRaises(OSError):
+            paths.write_attach_pid(1)
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_preexisting_loose_log_is_tightened(self) -> None:
+        from undertone import voice
+
+        log = paths.attach_log_path()
+        log.write_text("old\n")
+        log.chmod(0o644)
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen", return_value=mock.Mock(pid=9)),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            cli._ensure_attach()
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    def test_symlinked_log_warns_and_does_not_raise(self) -> None:
+        from undertone import voice
+
+        target = Path(self._tmp.name) / "victim"
+        target.write_text("keep")
+        paths.attach_log_path().symlink_to(target)
+        err = io.StringIO()
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen") as popen,
+            contextlib.redirect_stderr(err),
+        ):
+            cli._ensure_attach()
+        popen.assert_not_called()
+        self.assertIn("could not start voice", err.getvalue())
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_popen_failure_warns_and_does_not_raise(self) -> None:
+        from undertone import voice
+
+        err = io.StringIO()
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen", side_effect=OSError("boom")),
+            contextlib.redirect_stderr(err),
+        ):
+            cli._ensure_attach()
+        self.assertIn("boom", err.getvalue())
+
+    def test_spawn_takes_the_flock(self) -> None:
+        from undertone import voice
+
+        modes = []
+        real_flock = cli.fcntl.flock
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=True),
+            mock.patch.object(
+                cli.fcntl, "flock", side_effect=lambda fd, op: modes.append(op) or real_flock(fd, op)
+            ),
+        ):
+            cli._ensure_attach()
+        self.assertEqual(modes, [cli.fcntl.LOCK_EX])
+        self.assertEqual(paths.attach_lock_path().stat().st_mode & 0o777, 0o600)
+
+
+class StopCommandTest(CliTestCase):
+    def test_no_pidfile(self) -> None:
+        rc, out = self._run("stop")
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to stop", out)
+
+    def test_refuses_pid_that_is_not_attach(self) -> None:
+        paths.write_attach_pid(31337)
+        with (
+            mock.patch.object(cli, "_pid_is_attach", return_value=False),
+            mock.patch.object(cli.os, "kill") as kill,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            rc, _ = self._run("stop")
+        self.assertEqual(rc, 1)
+        kill.assert_not_called()
+
+    def test_sigterms_a_verified_attach(self) -> None:
+        paths.write_attach_pid(31337)
+        with (
+            mock.patch.object(cli, "_pid_is_attach", return_value=True),
+            mock.patch.object(cli.os, "kill") as kill,
+        ):
+            rc, out = self._run("stop")
+        self.assertEqual(rc, 0)
+        kill.assert_called_once_with(31337, cli.signal.SIGTERM)
+        self.assertIn("31337", out)
+
+    def test_pid_is_attach_checks_command_line(self) -> None:
+        def ps(command: str):
+            return mock.Mock(stdout=command)
+
+        with mock.patch.object(cli.subprocess, "run", return_value=ps("vim notes.txt\n")):
+            self.assertFalse(cli._pid_is_attach(1))
+        with mock.patch.object(
+            cli.subprocess,
+            "run",
+            return_value=ps("/x/python -m undertone attach\n"),
+        ):
+            self.assertTrue(cli._pid_is_attach(1))
+
+    def test_pid_is_attach_rejects_lookalike_command_lines(self) -> None:
+        for command in (
+            "tail -f /Users/x/.undertone/attach.log\n",
+            "vim undertone-attach-notes\n",
+        ):
+            with self.subTest(command=command):
+                with mock.patch.object(
+                    cli.subprocess, "run", return_value=mock.Mock(stdout=command)
+                ):
+                    self.assertFalse(cli._pid_is_attach(1))
+        for command in (
+            "/x/.venv/bin/python /x/.venv/bin/undertone attach --no-beep\n",
+            "/x/python -m undertone attach\n",
+        ):
+            with self.subTest(command=command):
+                with mock.patch.object(
+                    cli.subprocess, "run", return_value=mock.Mock(stdout=command)
+                ):
+                    self.assertTrue(cli._pid_is_attach(1))
+
+    def test_remove_pid_only_if_it_is_ours(self) -> None:
+        paths.write_attach_pid(5)
+        paths.remove_attach_pid(6)
+        self.assertEqual(paths.read_attach_pid(), 5)
+        paths.remove_attach_pid(5)
+        self.assertIsNone(paths.read_attach_pid())
+
+
+class ShellInitTest(CliTestCase):
+    def test_zsh_function_uses_absolute_executable(self) -> None:
+        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/undertone", "shell-init", "zsh"]):
+            rc, out = self._run("shell-init", "zsh")
+        self.assertEqual(rc, 0)
+        self.assertIn('claude() { /opt/v/bin/undertone launch -- "$@"; }', out)
+        self.assertIn("command claude", out)
+        self.assertIn("add-zsh-hook precmd _undertone_claude_precmd", out)
+        self.assertIn("add-zsh-hook -d precmd _undertone_claude_precmd", out)
+
+    @unittest.skipUnless(shutil.which("zsh"), "zsh not installed")
+    def test_function_survives_cmux_redefining_claude_at_first_prompt(self) -> None:
+        with mock.patch.object(cli.sys, "argv", ["/opt/v/bin/undertone", "shell-init", "zsh"]):
+            _, init = self._run("shell-init", "zsh")
+        script = (
+            "autoload -Uz add-zsh-hook\n"
+            "_cmux_fix_path() {\n"
+            "  claude() { _cmux_claude_wrapper_command \"$@\"; }\n"
+            "  add-zsh-hook -d precmd _cmux_fix_path\n"
+            "}\n"
+            "add-zsh-hook precmd _cmux_fix_path\n"  # cmux loads before .zshrc
+            f"{init}\n"
+            "for f in $precmd_functions; do $f; done\n"
+            "whence -f claude\n"
+        )
+        proc = subprocess.run(
+            ["zsh", "-f", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={**os.environ, "UNDERTONE_HOME": self._tmp.name},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("undertone launch", proc.stdout)
+        self.assertNotIn("_cmux_claude_wrapper_command", proc.stdout)
+
+    def test_only_zsh(self) -> None:
+        with (
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            cli.main(["shell-init", "bash"])
 
 
 if __name__ == "__main__":

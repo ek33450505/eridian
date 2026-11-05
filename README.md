@@ -98,6 +98,14 @@ uv run undertone attach [--no-beep] [--no-aec] [--announce {all,permission,off}]
 
 This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`, with the voice-turn hard control (`voice_guard`) injected via `--settings`. Your voice input from Terminal 1 arrives as `← undertone: <text>`, and Claude can call the `reply` tool to speak answers. undertone announces when Claude finishes or needs your permission, opening a no-wake-word follow-up window after "Claude finished." The command generates a session token and refuses `--settings`, `--settings=…`, `--bare` and `--safe-mode`, since each would override the guard.
 
+#### Autolaunch
+
+To start voice automatically whenever you run `claude` in an interactive terminal, add this to `~/.zshrc`:
+```bash
+eval "$(~/Projects/personal/undertone/.venv/bin/undertone shell-init zsh)"
+```
+This defines a `claude` function that runs `undertone launch -- "$@"`. In an interactive terminal it starts `undertone attach` in the background if none is answering (log: `~/.undertone/attach.log`; model load takes a moment), then runs `undertone session`. Everything else goes to plain `claude` unchanged: `UNDERTONE_AUTOLAUNCH=0`, stdin or stdout not a terminal, `-p`/`--print`, `-h`/`--help`, `-v`/`--version`, `--settings`, `--bare`, `--safe-mode`, and claude's own subcommands (`mcp`, `doctor`, `update`, ...). `command claude` bypasses the function. `undertone stop` ends the background attach (SIGTERM; it checks the process is an undertone attach first).
+
 ### Standalone voice conversation (Path B)
 
 `undertone chat [--no-beep] [--no-aec] [--resume] [--follow-up SECONDS] [--tts {kokoro,say}]`
@@ -238,6 +246,7 @@ Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word 
 ## Environment variables
 
 - `UNDERTONE_HOME` (default `~/.undertone`) — state directory for sockets and workspace
+- `UNDERTONE_AUTOLAUNCH` — set to `0` to make `undertone launch` (and the `shell-init` function) run plain `claude`
 - `UNDERTONE_SESSION` (set by `undertone session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `UNDERTONE_VOICE` — voice name for `say` (e.g., `"Daniel"`); empty string uses system voice
 - `UNDERTONE_KOKORO_OWN_VOICE` — Kokoro voice for undertone's own words, the confirm read-back (default `af_heart`); keep it different from `UNDERTONE_KOKORO_VOICE`

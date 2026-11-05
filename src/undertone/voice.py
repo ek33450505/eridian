@@ -100,6 +100,7 @@ import os
 import queue
 import re
 import select
+import signal
 import socket
 import stat
 import sys
@@ -780,18 +781,25 @@ def run_attach(
         self_wake_guard_s=self_wake_guard_from_env(),
         announce=ANNOUNCE_LEVELS[announce],
     )
-    if bridge.start() != 0:
-        bridge.close()
-        io.close()
-        return 1
-    print(cli.banner_line(io))
+    pid = os.getpid()
 
-    print(
-        "undertone attach: listening for 'hey jarvis'. Start a Claude session with "
-        "`undertone session` in another terminal. Ctrl-C to quit.",
-        flush=True,
-    )
+    def _on_sigterm(signum: int, frame: object) -> None:
+        # `undertone stop` sends SIGTERM; unwind through the finally below so the
+        # socket and pidfile are removed.
+        raise KeyboardInterrupt
+
+    # Installed before start() so no SIGTERM can land outside the try/finally.
+    signal.signal(signal.SIGTERM, _on_sigterm)
     try:
+        if bridge.start() != 0:
+            return 1
+        print(cli.banner_line(io))
+        paths.write_attach_pid(pid)
+        print(
+            "undertone attach: listening for 'hey jarvis'. Start a Claude session with "
+            "`undertone session` in another terminal. Ctrl-C to quit.",
+            flush=True,
+        )
         try:
             io.start()
         except Exception as exc:  # noqa: BLE001 - any device/engine failure
@@ -801,7 +809,10 @@ def run_attach(
     except KeyboardInterrupt:
         pass
     finally:
+        # A second SIGTERM must not interrupt cleanup.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         # Bridge first: that stops the player, which clears the sink.
         bridge.close()
         io.close()
+        paths.remove_attach_pid(pid)
     return 0

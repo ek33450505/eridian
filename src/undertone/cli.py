@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import getpass
 import json
 import os
+import re
 import secrets
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from . import paths
 
@@ -488,6 +491,11 @@ def _cmd_session(args: argparse.Namespace) -> int:
     rest = list(args.claude_args)
     if rest[:1] == ["--"]:
         rest = rest[1:]
+    return _exec_session(rest, warn_no_voice=True)
+
+
+def _exec_session(rest: list[str], *, warn_no_voice: bool) -> int:
+    """Exec claude wired to the voice channel; returns only on a refused flag."""
     for arg in rest:
         if arg in _REFUSED_SESSION_FLAGS or arg.startswith("--settings="):
             flag = arg.split("=", 1)[0]
@@ -501,7 +509,7 @@ def _cmd_session(args: argparse.Namespace) -> int:
     home = paths.home_dir()
     mcp_json = json.dumps(channel_mcp_config(sys.executable, home, token))
     settings_json = json.dumps(voice_guard_settings(sys.executable, home, token))
-    if not _voice_socket_present(paths.voice_socket_path()):
+    if warn_no_voice and not _voice_socket_present(paths.voice_socket_path()):
         print(
             "undertone: no voice process is listening -- start `undertone attach` "
             "in another terminal to talk",
@@ -514,6 +522,169 @@ def _cmd_session(args: argparse.Namespace) -> int:
     env = {k: v for k, v in os.environ.items() if k not in _HOOK_DISABLING_ENV}
     os.execvpe(claude_cmd, argv, env)
     return 1  # unreachable: execvpe replaces the process
+
+
+# Subcommands of `claude`, read from `claude --help` on Claude Code 2.1.311.
+_CLAUDE_SUBCOMMANDS = frozenset(
+    {
+        "agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import",
+        "install", "logs", "mcp", "plugin", "plugins", "purge", "respawn", "rm",
+        "setup-token", "stop", "kill", "ultrareview", "update", "upgrade",
+    }
+)  # fmt: skip
+_PASSTHROUGH_FLAGS = frozenset(
+    {"-p", "--print", "-h", "--help", "-v", "--version", *_REFUSED_SESSION_FLAGS}
+)
+
+
+def launch_mode(
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    stdin_tty: bool,
+    stdout_tty: bool,
+) -> str:
+    """Return "voice" to start claude with the voice channel, else "passthrough" (plain claude).
+
+    A claude subcommand anywhere among the non-option args passes through too: an
+    option's value can precede it (`--model x mcp list`), and a stray prompt that
+    happens to equal a subcommand name failing safe to plain claude is harmless.
+    """
+    if env.get("UNDERTONE_AUTOLAUNCH") == "0" or not (stdin_tty and stdout_tty):
+        return "passthrough"
+    for arg in argv:
+        if arg in _PASSTHROUGH_FLAGS or arg.startswith("--settings="):
+            return "passthrough"
+        if not arg.startswith("-") and arg in _CLAUDE_SUBCOMMANDS:
+            return "passthrough"
+    return "voice"
+
+
+def _pid_is_attach(pid: int) -> bool:
+    """True if pid is alive and its command line is an undertone attach."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # Match tokens, not substrings: `tail -f ~/.undertone/attach.log` must not pass.
+    return bool(
+        re.search(r"(?:^|/)undertone attach(?:\s|$)|-m undertone attach(?:\s|$)", out)
+    )
+
+
+def _ensure_attach() -> None:
+    """Spawn a background `undertone attach` unless one answers or is still starting.
+
+    flock serializes terminals starting together. The child's pid is written to the
+    pidfile at spawn, so a second terminal during the model load sees a live attach
+    instead of spawning another. Attach is started from the terminal's process tree
+    (not launchd) so it can use the terminal app's mic permission; that still needs
+    a live check. Failures are warned about, never raised: claude still starts.
+    """
+    from . import voice
+
+    try:
+        _spawn_attach_locked(voice)
+    except OSError as exc:
+        print(f"undertone: could not start voice in the background: {exc}", file=sys.stderr)
+
+
+def _spawn_attach_locked(voice) -> None:
+    home = paths.home_dir()
+    lock_fd = os.open(
+        paths.attach_lock_path(), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if voice._server_answers(paths.voice_socket_path()):
+            return
+        pid = paths.read_attach_pid()
+        if pid is not None and _pid_is_attach(pid):
+            return
+        log_path = paths.attach_log_path()
+        log_fd = os.open(
+            log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.fchmod(log_fd, 0o600)  # tighten a pre-existing log
+            child = subprocess.Popen(
+                [sys.executable, "-m", "undertone", "attach"],
+                stdin=subprocess.DEVNULL,
+                stdout=log_fd,
+                stderr=log_fd,
+                start_new_session=True,
+                cwd=home,
+            )
+        finally:
+            os.close(log_fd)
+        paths.write_attach_pid(child.pid)
+        print(
+            f"undertone: starting voice in the background (log: {log_path})",
+            file=sys.stderr,
+        )
+    finally:
+        os.close(lock_fd)  # closing releases the flock
+
+
+def _cmd_launch(args: argparse.Namespace) -> int:
+    rest = list(args.claude_args)
+    if rest[:1] == ["--"]:
+        rest = rest[1:]
+    mode = launch_mode(rest, os.environ, sys.stdin.isatty(), sys.stdout.isatty())
+    if mode == "voice":
+        _ensure_attach()
+        return _exec_session(rest, warn_no_voice=False)
+    claude_cmd = os.environ.get("UNDERTONE_CLAUDE_CMD") or "claude"
+    os.execvpe(claude_cmd, [claude_cmd, *rest], os.environ)
+    return 1  # unreachable: execvpe replaces the process
+
+
+def _cmd_stop(args: argparse.Namespace) -> int:
+    del args
+    pid = paths.read_attach_pid()
+    if pid is None:
+        print("undertone: no attach pidfile; nothing to stop")
+        return 0
+    if not _pid_is_attach(pid):
+        print(
+            f"undertone: pid {pid} is not an undertone attach (stale pidfile?); "
+            "not signalling it",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        print(f"undertone: could not stop attach (pid {pid}): {exc}", file=sys.stderr)
+        return 1
+    print(f"undertone: sent SIGTERM to attach (pid {pid})")
+    return 0
+
+
+def _cmd_shell_init(args: argparse.Namespace) -> int:
+    del args
+    exe = Path(sys.argv[0]).absolute()
+    if exe.name != "undertone":  # e.g. `python -m undertone`: use the venv script
+        exe = Path(sys.executable).absolute().parent / "undertone"
+    fn = f"claude() {{ {shlex.quote(str(exe))} launch -- \"$@\"; }}"
+    print(
+        "# `command claude` bypasses this function and runs plain claude.\n"
+        f"{fn}\n"
+        "# cmux redefines claude() at the first prompt (its _cmux_fix_path precmd hook); "
+        "re-assert ours once, after it.\n"
+        "_undertone_claude_precmd() {\n"
+        f"  {fn}\n"
+        "  add-zsh-hook -d precmd _undertone_claude_precmd\n"
+        "}\n"
+        "autoload -Uz add-zsh-hook\n"
+        "add-zsh-hook precmd _undertone_claude_precmd"
+    )
+    return 0
 
 
 def _voice_socket_present(sock_path: Path) -> bool:
@@ -669,6 +840,24 @@ def build_parser() -> argparse.ArgumentParser:
     session_parser.add_argument("claude_args", nargs=argparse.REMAINDER)
     session_parser.set_defaults(func=_cmd_session)
 
+    launch_parser = sub.add_parser(
+        "launch",
+        help="run claude with voice when interactive (starts attach if needed), "
+        "else plain claude",
+    )
+    launch_parser.add_argument("claude_args", nargs=argparse.REMAINDER)
+    launch_parser.set_defaults(func=_cmd_launch)
+
+    sub.add_parser("stop", help="stop the background `undertone attach`").set_defaults(
+        func=_cmd_stop
+    )
+
+    shell_parser = sub.add_parser(
+        "shell-init", help="print shell code that makes `claude` autolaunch voice"
+    )
+    shell_parser.add_argument("shell", choices=["zsh"])
+    shell_parser.set_defaults(func=_cmd_shell_init)
+
     attach_parser = sub.add_parser(
         "attach", help="listen for 'hey jarvis' and send speech to the latest `undertone session`"
     )
@@ -729,10 +918,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     raw = list(sys.argv[1:] if argv is None else argv)
-    if raw[:1] == ["session"]:
+    if raw[:1] in (["session"], ["launch"]):
         # argparse's REMAINDER drops a leading option (`session --model x`), so
-        # hand everything after `session` to claude untouched.
-        args = parser.parse_args(["session"])
+        # hand everything after the subcommand to claude untouched.
+        args = parser.parse_args(raw[:1])
         args.claude_args = raw[1:]
     else:
         args = parser.parse_args(raw)
