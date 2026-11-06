@@ -1665,5 +1665,195 @@ class HomeGateTests(GuardTestCase):
         self.assertEqual(self.hook("pretooluse", payload)[:2], (0, ""))
 
 
+CONTROL_REFUSED = [
+    "eridian voice on",
+    "eridian voice on --session 1a2b3c4d5e6f",
+    "eridian voice --session=1a2b on",
+    "eridian voice --sess 1a2b on",
+    "eridian unmute",
+    "eridian unm",
+    "/x/.venv/bin/eridian unmute",
+    "python -m eridian unmute",
+    "python3 -m eridian.cli voice on",
+    "uv run eridian voice on",
+    "env FOO=1 eridian unmute",
+    "nohup eridian unmute &",
+    'bash -c "eridian voice on"',
+    "sh -c 'cd /tmp && eridian unmute'",
+    "python -c \"from eridian import control; control.request({'op':'unmute'})\"",
+    "nc -U ~/.eridian/control.sock",
+    "nc -U /tmp/s",
+    "x=1; nc -U /tmp/s",
+    "/usr/bin/ncat -U /tmp/s",
+    "echo x | socat - UNIX-CONNECT:/tmp/x",
+    "curl --unix-socket /tmp/s http://x/",
+    "cat > /tmp/x <<EOF\nsock = 'control.sock'\nEOF",
+    "python - <<EOF\nimport eridian.control\nEOF",
+    "eridian unmute '",
+    # command substitution
+    "echo $(eridian unmute)",
+    "echo `eridian unmute`",
+    "echo a $(echo $(eridian voice on)) b",
+    # compound syntax
+    "{ eridian unmute; }",
+    "if true; then eridian unmute; fi",
+    "for i in 1; do eridian unmute; done",
+    "! eridian unmute",
+    "ls | { eridian unmute; }",
+    # eval
+    "eval 'eridian unmute'",
+    "eval \"bash -c 'eridian voice on'\"",
+    # uvx / pipx
+    "uvx eridian unmute",
+    "pipx run eridian voice on",
+    # python flag clusters and module names
+    "python -Im eridian unmute",
+    "python3 -um eridian.cli voice on",
+    "python -m eridian.control unmute",
+    # piping into a shell
+    "echo unmute | xargs eridian",
+    "echo eridian unmute | sh",
+    "echo eridian voice on | bash",
+    "bash <<< 'eridian unmute'",
+    # the socket name, whatever the program
+    "rg -n control.sock src/",
+    "grep -rn control.sock .",
+    "git log --grep control.sock",
+    "git grep control.sock",
+    "cat tests/x.py | grep control.sock",
+    # env-assignment values
+    "GIT_PAGER='eridian unmute' git --paginate log",
+    "FOO=\"$(eridian unmute)\" true",
+    "FOO='eridian voice on' true",
+    "sudo env nohup timeout 5 eridian voice on",
+    'eri""dian voice on',
+    'e""ridian voice on',
+    '"eri""dian" voice on',
+    "eri\\dian voice on",
+    "eri''dian unmu''te",
+    'python3 -m eri""dian voice on',
+    'n""c -U s',
+    "ERIDIAN voice on",
+    "python3 -m ERIDIAN.cli unmute",
+    "sudo env nohup timeout 5 nice -n 3 eridian unmute",
+    "env " * 12 + "eridian voice on",
+    "eridian unmute " + "$(true) " * 17,
+    "eridian unmute # " + "x" * 20000,
+    "env GIT_PAGER='eridian unmute' git log",
+    "cat control.sock > /tmp/x",
+    "python -c \"x = 'control.sock'\"",
+    # op-like python markers
+    "python -c 'c.send({\"op\": \"voice_on\"})'",
+    "python -c \"c.send(dict(op='unmute'))\"",
+]
+
+CONTROL_ALLOWED = [
+    "eridian voice off",
+    "eridian voice status",
+    "eridian mute",
+    "eridian voice off --session 1a2b3c4d5e6f",
+    "grep -rn unmute src/",
+    "git log --grep unmute",
+    "cat tests/test_control_cli.py",
+    "rg voice_on",
+    "sed -n 1,20p src/eridian/control.py",
+    "python -c \"print('unmute')\"",
+    "FOO=bar git log",
+    "grep -rl eridian src | xargs grep -n voice",
+    "cat > /tmp/x <<'EOF'\n" + "this happened once since we sync it\n" * 600 + "EOF",
+    "GIT_PAGER=less git --paginate log",
+]
+
+
+class ControlRefusalTests(GuardTestCase):
+    def state(self, mode):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        if mode == "none":
+            return None
+        if mode == "typed":
+            vg.record_typed(self.home, TOKEN, now=T0)
+        else:
+            vg.record_voice(self.home, TOKEN, "do it", now=T0)
+            if mode == "grant":
+                vg.record_confirm_request(self.home, TOKEN, "confirm walnut lantern", now=T0)
+                self.assertTrue(vg.record_voice(self.home, TOKEN, "hey jarvis confirm walnut lantern",
+                                                can_grant=True, now=T0 + 1))
+        return vg.load_state(self.home, TOKEN)
+
+    def decide(self, mode, command, **kw):
+        return vg.decide(self.state(mode), "Bash", {"command": command}, T0 + 2, **kw)
+
+    def test_refused_on_every_turn_kind(self):
+        for command in CONTROL_REFUSED:
+            for mode in ("none", "typed", "voice", "grant"):
+                with self.subTest(command=command, mode=mode):
+                    self.assertEqual(self.decide(mode, command), vg.CONTROL_DENY_REASON)
+
+    def test_refused_for_tainted_subagent(self):
+        for command in CONTROL_REFUSED:
+            with self.subTest(command=command):
+                self.assertEqual(self.decide("typed", command, agent_id="a" * 16), vg.CONTROL_DENY_REASON)
+
+    def test_allowed_forms_pass_on_typed_turn(self):
+        for command in CONTROL_ALLOWED:
+            with self.subTest(command=command):
+                self.assertIsNone(self.decide("typed", command))
+                self.assertIsNone(self.decide("none", command))
+
+    def test_allowed_forms_reach_normal_gate_on_voice_turn(self):
+        self.assertEqual(self.decide("voice", "eridian voice off"), vg.DENY_REASON.format(tool="Bash"))
+
+    def test_scan_time_is_bounded(self):
+        import time as _time
+        shapes = ["{}", "echo {}", "A='{}", "eridian unmute {}", "echo `{}", "eridian voice on; {}"]
+        for n in (100, 1000, 5000):
+            for opener in ("$(", "`", "<(", "(("):
+                for shape in shapes:
+                    command = shape.format(opener * n)
+                    with self.subTest(n=n, command=command[:30]):
+                        start = _time.perf_counter()
+                        vg.control_reason("Bash", {"command": command})
+                        self.assertLess(_time.perf_counter() - start, 0.05)
+        for command in ("echo " + "a " * 10000, "eridian " + "a " * 10000, "nc " * 7000):
+            with self.subTest(size=len(command)):
+                start = _time.perf_counter()
+                vg.control_reason("Bash", {"command": command})
+                self.assertLess(_time.perf_counter() - start, 0.05)
+
+    def test_limits_fail_closed(self):
+        self.assertEqual(vg.control_reason("Bash", {"command": "eridian " + "$(true) " * 17}),
+                         vg.CONTROL_DENY_REASON)
+        self.assertEqual(vg.control_reason("Bash", {"command": "echo eridian " + "a " * 10000}),
+                         vg.CONTROL_DENY_REASON)
+        self.assertEqual(vg.control_reason("Bash", {"command": "eridian " + "x=1 " * 3000 + "ls"}),
+                         vg.CONTROL_DENY_REASON)
+
+    def test_plain_commands_skip_the_scan(self):
+        with mock.patch.object(vg, "_command_control", side_effect=AssertionError("scanned")):
+            self.assertIsNone(vg.control_reason("Bash", {"command": "ls -la && git status"}))
+
+    def test_non_bash_tools_unaffected(self):
+        self.assertIsNone(vg.control_reason("Write", {"file_path": "/x/control.sock", "command": "eridian unmute"}))
+        self.assertIsNone(vg.control_reason("Bash", {"command": 5}))
+
+    def test_main_output_and_log(self):
+        vg.record_typed(self.home, TOKEN, now=T0)
+        rc, out, _ = self.pre("Bash", {"command": "eridian voice on --session SECRETWORD"})
+        self.assertEqual(rc, 0)
+        dec = json.loads(out)["hookSpecificOutput"]
+        self.assertEqual(dec["permissionDecision"], "deny")
+        self.assertEqual(dec["permissionDecisionReason"], vg.CONTROL_DENY_REASON)
+        log = (Path(self.home) / "logs" / "guard.log").read_text()
+        self.assertIn(" control", log)
+        self.assertNotIn("SECRETWORD", log)
+        self.assertNotIn("unmute", log)
+
+    def test_main_refuses_without_state(self):
+        rc, out, _ = self.pre("Bash", {"command": "eridian unmute"})
+        self.assertEqual(rc, 0)
+        self.assertIn("Claude can't turn voice on", out)
+
+
 if __name__ == "__main__":
     unittest.main()

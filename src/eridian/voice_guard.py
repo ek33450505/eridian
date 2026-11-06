@@ -32,6 +32,17 @@ destructive, but that is a soft control. This module is the hard one:
     confirm, and `eridian session` also adds a Claude Code deny rule for
     Reading the file.
 
+Voice control: on EVERY turn (typed or voice, any grant or subagent, even with no
+state) the guard refuses a Bash call that could turn voice on or unmute the mic: eridian
+run with `unmute` or `voice ... on`, inline Python that drives eridian's control code,
+a raw unix-socket client, or any command naming `control.sock`. Turning
+things off (`voice off`, `mute`, `status`) stays allowed. This is a string-matching
+deterrent: it catches literal and quote-split spellings, while variable-built names,
+globs, Unicode look-alikes, scripts written then run and similar indirection are out of
+scope, and attach's process-ancestry check (see voice.py) covers them. Search for the
+socket name with the Grep/Read tools, which this rule does not touch. A command shlex
+cannot parse that mentions eridian and voice fails closed; `git commit -F file` avoids it.
+
 Fail-closed rules (Claude Code lets the tool run on any exit code but 0 or 2):
   - pretooluse turns every error into exit 2 (block, stderr goes to Claude);
   - userpromptsubmit exits 2 on failure only when the input carries a channel
@@ -113,6 +124,11 @@ DENY_REASON = (
 HOME_DENY_REASON = (
     "eridian voice guard: eridian's own state folder can't be read or searched on a voice turn, "
     "even after a confirm. Tell the user; they can do it by typing."
+)
+
+CONTROL_DENY_REASON = (
+    "eridian voice guard: Claude can't turn voice on or unmute the mic. "
+    "Ask the user to do it from the eridian menu or a terminal."
 )
 
 UNGATED_TOOLS = frozenset({
@@ -1495,6 +1511,232 @@ def _touches_home(tool_name: str, tool_input: Any, home: str, cwd: str | None) -
     return False
 
 
+_PY_RE = re.compile(r"python[0-9.]*", re.ASCII)
+_PY_M_FLAG_RE = re.compile(r"-[A-Za-z]*m", re.ASCII)
+_PY_C_FLAG_RE = re.compile(r"-[A-Za-z]*c", re.ASCII)
+_ERIDIAN_MODULES = frozenset({"eridian", "eridian.cli", "eridian.control"})
+_NC_PROGRAMS = frozenset({"nc", "ncat", "netcat"})
+_RESERVED_WORDS = frozenset({
+    "!", "if", "then", "do", "else", "elif", "while", "until", "{", "(", "}", "fi", "done", "esac",
+})
+_SUBSTITUTION_OPENERS = ("$(", "<(", ">(")
+_PAREN_RE = re.compile(r"[()]")
+_UNQUOTE = str.maketrans("", "", "'\"\\")
+_PREFILTER_RE = re.compile(
+    r"eridian|unmute|voice_on|control\.sock|socat|unix-socket"
+    r"|(?<![a-z0-9_.-])(?:nc|ncat|netcat)(?![a-z0-9_.-])",
+    re.ASCII,
+)
+_SCAN_BUDGET = 2000
+_SCAN_DEPTH = 8
+_MAX_SCAN_CHARS = 16 * 1024
+_MAX_SUBSTITUTIONS = 16
+_CONTROL_CODE_RE = re.compile(
+    r"control\.request|eridian\.control|eridian\.cli|control\.sock"
+    r"|from\s+eridian\s+import[^\n;]*\b(?:control|cli)\b"
+    r"|['\"]op['\"]\s*:\s*['\"](?:voice_on|unmute)['\"]"
+    r"|\bop\s*=\s*['\"](?:voice_on|unmute)['\"]",
+    re.ASCII,
+)
+_CONTROL_WORDS = ("unmute", "voice")
+
+
+class _ScanLimit(Exception):
+    """The scan hit a limit (budget, depth, size); the caller fails closed."""
+
+
+class _Budget:
+    def __init__(self) -> None:
+        self.left = _SCAN_BUDGET
+
+    def spend(self, units: int = 1) -> None:
+        self.left -= units
+        if self.left < 0:
+            raise _ScanLimit
+
+
+def _is_unmute_word(arg: str) -> bool:
+    return len(arg) >= 3 and "unmute".startswith(arg)
+
+
+def _eridian_turns_on(args: list[str]) -> bool:
+    """Whether eridian's arguments ask to unmute, or for `voice ... on`."""
+    if any(_is_unmute_word(arg) for arg in args):
+        return True
+    for i, arg in enumerate(args):
+        if arg == "voice":
+            return "on" in args[i + 1:]
+    return False
+
+
+def _code_mentions_control(code: str) -> bool:
+    return bool(_CONTROL_CODE_RE.search(code.casefold()))
+
+
+def _strip_reserved(words: list[str]) -> list[str]:
+    """Drop leading shell reserved words, `!` and env assignments."""
+    i = 0
+    while i < len(words) and (words[i] in _RESERVED_WORDS or _ENV_ASSIGN_RE.match(words[i])):
+        i += 1
+    return words[i:]
+
+
+def _substitutions(command: str, budget: _Budget) -> list[str]:
+    """Bodies of closed $(...), <(...), >(...) and backtick substitutions (nested ones appear twice)."""
+    ticks = command.split("`")
+    if sum(command.count(o) for o in _SUBSTITUTION_OPENERS) + len(ticks) - 1 > _MAX_SUBSTITUTIONS:
+        raise _ScanLimit
+    bodies = [ticks[k] for k in range(1, len(ticks) - 1, 2)]
+    for opener in _SUBSTITUTION_OPENERS:
+        i = command.find(opener)
+        while i >= 0:
+            budget.spend()
+            depth = 1
+            for match in _PAREN_RE.finditer(command, i + 2):
+                budget.spend()
+                depth += 1 if match.group() == "(" else -1
+                if depth == 0:
+                    bodies.append(command[i + 2:match.start()])
+                    break
+            i = command.find(opener, i + 2)
+    return bodies
+
+
+def _words_control(words: list[str], depth: int, budget: _Budget) -> bool:
+    """Whether one command (program and args) could turn voice on, unmute, or reach the socket."""
+    words = _strip_reserved(words)
+    if not words:
+        return False
+    if depth > _SCAN_DEPTH:
+        raise _ScanLimit
+    budget.spend()
+    prog = os.path.basename(words[0]).casefold()
+    args = words[1:]
+    if prog in _WRAPPER_VALUE_FLAGS:
+        return _words_control(_wrapped_command(prog, args), depth + 1, budget)
+    if prog in _SHELLS:
+        for j, arg in enumerate(args):
+            if not arg.startswith("-"):
+                break
+            if _SHELL_C_FLAG_RE.fullmatch(arg):
+                return _command_control(args[j + 1] if j + 1 < len(args) else "", depth + 1, budget)
+        return False
+    if prog == "eval":
+        return _command_control(" ".join(args), depth + 1, budget)
+    if prog == "find":
+        for j, arg in enumerate(args):
+            if arg in _FIND_EXEC:
+                return _words_control(args[j + 1:], depth + 1, budget)
+        return False
+    if prog in ("uv", "uvx", "pipx"):
+        if prog != "uvx" and args[:1] != ["run"]:
+            return False
+        for j, arg in enumerate(args):
+            name = os.path.basename(arg).casefold()
+            if name == "eridian" or _PY_RE.fullmatch(name):
+                return _words_control(args[j:], depth + 1, budget)
+        return False
+    if prog == "eridian":
+        return _eridian_turns_on(args)
+    if _PY_RE.fullmatch(prog):
+        for j, arg in enumerate(args):
+            nxt = args[j + 1:j + 2]
+            if _PY_M_FLAG_RE.fullmatch(arg) and nxt and nxt[0].casefold() in _ERIDIAN_MODULES:
+                return _eridian_turns_on(args[j + 2:])
+            if _PY_C_FLAG_RE.fullmatch(arg) and nxt:
+                return _code_mentions_control(nxt[0])
+        return False
+    if prog in _NC_PROGRAMS:
+        return any(a.startswith("-") and not a.startswith("--") and "U" in a for a in args)
+    if prog == "socat":
+        return any("unix-connect" in a.casefold() or "unix-client" in a.casefold() for a in args)
+    if prog == "curl":
+        return any(a.startswith(("--unix-socket", "--abstract-unix-socket")) for a in args)
+    return False
+
+
+def _feeds_shell(words: list[str]) -> bool:
+    """Whether a segment is a shell reading its script from stdin (no -c), or xargs running
+    eridian or a shell."""
+    words = _strip_reserved(words)
+    if not words:
+        return False
+    prog = os.path.basename(words[0]).casefold()
+    if prog == "xargs":
+        target = _strip_reserved(_wrapped_command("xargs", words[1:]))
+        return bool(target) and os.path.basename(target[0]).casefold() in _SHELLS | {"eridian"}
+    if prog not in _SHELLS:
+        return False
+    for arg in words[1:]:
+        if not arg.startswith("-"):
+            break
+        if _SHELL_C_FLAG_RE.fullmatch(arg):
+            return False
+    return True
+
+
+def _assignment_values(command: str, budget: _Budget) -> list[str]:
+    """The value of every `VAR=value` word; _bash_segments drops these before scanning."""
+    lex = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return []
+    values = [tok.partition("=")[2] for tok in tokens if _ENV_ASSIGN_RE.match(tok)]
+    budget.spend(len(values))
+    return values
+
+
+def _command_control(command: str, depth: int, budget: _Budget) -> bool:
+    if depth > _SCAN_DEPTH:
+        raise _ScanLimit
+    budget.spend(1 + len(command) // 16)
+    if any(_command_control(body, depth + 1, budget) for body in _substitutions(command, budget)):
+        return True
+    if any(_command_control(v, depth + 1, budget) for v in _assignment_values(command, budget)):
+        return True
+    text = command.casefold()
+    mentions = "eridian" in text and any(w in text for w in _CONTROL_WORDS)
+    try:
+        segments = _bash_segments(command)
+    except ValueError:
+        return mentions
+    budget.spend(len(segments))
+    if any(_words_control(words, depth, budget) for words, _ in segments):
+        return True
+    if mentions and ("|" in command or "<<<" in command) and any(_feeds_shell(w) for w, _ in segments):
+        return True
+    # A heredoc into python carries its code outside the argv.
+    return "<<" in command and _code_mentions_control(command) and any(
+        _PY_RE.fullmatch(os.path.basename(_strip_reserved(words)[0])) for words, _ in segments if _strip_reserved(words)
+    )
+
+
+def control_reason(tool_name: str, tool_input: Any) -> str | None:
+    """CONTROL_DENY_REASON for a Bash call that could turn voice on, unmute, or write the
+    control socket; else None. String matching only: a deterrent, not a boundary.
+
+    A cheap prefilter lets ordinary commands through untouched. The structural scan has a
+    work budget; any limit it hits (budget, depth, size) denies rather than allows.
+    """
+    if tool_name != "Bash" or not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return None
+    text = command.casefold()
+    if not (_PREFILTER_RE.search(text) or _PREFILTER_RE.search(text.translate(_UNQUOTE))):
+        return None
+    if "control.sock" in text or len(command) > _MAX_SCAN_CHARS:
+        return CONTROL_DENY_REASON
+    try:
+        return CONTROL_DENY_REASON if _command_control(command, 0, _Budget()) else None
+    except _ScanLimit:
+        return CONTROL_DENY_REASON
+
+
 def decide(
     state: dict[str, Any] | None, tool_name: str, tool_input: Any, now: float,
     agent_id: Any = _NO_AGENT, *, home: str | None = None, cwd: str | None = None,
@@ -1506,6 +1748,8 @@ def decide(
     With `home`, a voice-gated call that could read that folder is denied no
     matter what grant is held.
     """
+    if control_reason(tool_name, tool_input) is not None:
+        return CONTROL_DENY_REASON
     if state is None:
         return None
     tainted = _agent_tainted(state, agent_id)
@@ -1644,7 +1888,12 @@ def _pretooluse(home: Any, token: str, raw: str, stdout: TextIO) -> None:
         )
         _log(home, "pretooluse", "granted" if gated else "allow", tool_name, f"-{tag}")
         return
-    why = "home" if reason == HOME_DENY_REASON else (gate_reason(tool_name, tool_input) or "-")
+    if reason == HOME_DENY_REASON:
+        why = "home"
+    elif reason == CONTROL_DENY_REASON:
+        why = "control"
+    else:
+        why = gate_reason(tool_name, tool_input) or "-"
     _log(home, "pretooluse", "deny", tool_name, f"{why}{tag}")
     stdout.write(json.dumps({
         "hookSpecificOutput": {
