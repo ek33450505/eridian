@@ -48,7 +48,65 @@ atomically) keyed by sha256(token), never the raw token, capped at 64 entries.
 A missing file means nothing is off; a corrupt / unreadable / wrong-shape file
 fails toward not listening: EVERY session is treated as OFF (`state_error`)
 until a write replaces the file. The in-process API for the control surface is
-`sessions_status()` and `set_voice()`.
+`sessions_status()`, `set_voice()`, `set_muted()` / `is_muted()` and
+`voice_state_health()`.
+
+State file v2: `{"version":2, "off":{sha256hex: ts}, "muted":bool}`. A v1 file (no
+"muted") loads as unmuted; any other version, or a non-bool "muted", is corrupt.
+
+Mute is GLOBAL and REAL: while muted, `process_frame` still drains the control
+queue (replies and announces keep playing) but never hands a frame to the
+listener, so no wake word, VAD or STT ever runs. At each mute / unmute transition
+the main thread calls `Listener.cancel()`: a turn in progress when mute lands is
+discarded, so nothing captured before the mute is transcribed or sent, and unmute
+starts from fresh detectors. While muted the follow-up window does not open. Mute
+fails toward not listening: unreadable / corrupt state starts MUTED (and every
+session OFF); a mute is applied in memory before its write is tried (a failed
+write leaves it muted, `saved` False); an unmute needs a successful write first
+(else nothing changes and it returns False); an unmute during `state_error` uses
+the same recovery write as voice ON, which records every connected tokened
+session OFF, so recovering by unmuting never makes an OFF session audible. One
+transaction (`_change_state`) serves set_voice and set_muted. A MUTE during
+`state_error` also performs that recovery write (every connected tokened session
+recorded OFF, `muted: true`, `state_error` cleared): fail-closed, intended.
+The cancel is driven by a mute-change counter, so a quick mute->unmute between two
+frames still cancels. The same counter gives each turn a MUTE EPOCH (`_turn_mute_gen`,
+recorded when `wake` / `talk_over` / `follow_up` opens it; those events do nothing while
+muted: no cue, no barge-in, no turn). `_turn_muted_locked()` is the one rule for an
+utterance: muted now, or any mute change since the turn opened. The utterance branch
+decides everything first (echo drop, strip_echo, too-soon hold, outgoing text) with no
+prints or enqueues; then, under the session lock, applies that rule and bumps the turn
+counters; then `conn.send` is the very next statement, with no I/O between. Only after the
+send returns does any transcript text print. A muted turn prints just `[muted: not sent]`,
+touches no turn flags and sends nothing; the non-send outcomes (echo drop, own-reply,
+too-soon hold) apply the same rule before they print. The one remaining window: a mute
+landing between the in-lock check and the `conn.send` call (a few bytecodes, no I/O), and a
+frame already inside the listener; the next frame is dropped and the listener cancelled. For
+a non-send outcome, audio captured BEFORE the mute may print in the bytecodes after its check;
+nothing is sent and no post-mute audio is involved. The player's busy state keeps being
+tracked while muted, so the self-wake guard survives a mute. If the control accept loop gives
+up (ACCEPT_MAX_ERRORS consecutive failures) the mute switch is gone, so the bridge mutes
+itself and prints `[control socket failed; muted]`.
+
+Control socket (`paths.control_socket_path()`, 0600, bound like voice.sock). It is
+the mute switch, so `start()` FAILS (and releases voice.sock) if it cannot be
+bound. Newline-delimited JSON, one response line per request line, several
+requests per connection allowed; caps: CONTROL_MAX_CONNECTIONS connections,
+CONTROL_MAX_LINE_BYTES per line (longer drops the connection); a request line must
+complete within CONTROL_IDLE_S of its first byte, idle between requests is capped at
+CONTROL_IDLE_S, a connection lives at most CONTROL_LIFETIME_S and serves at most
+CONTROL_MAX_REQUESTS requests (so a slow drip cannot hold a slot). A session `cwd`
+in status is stripped of control characters and cut to CONTROL_CWD_CHARS:
+
+    {"op":"status"}  -> {"ok":true,"muted":b,"state_error":b,"saved":b,"sessions":[...]}
+    {"op":"voice_on"|"voice_off","session":"<id or pid>"} | {"op":"mute"} | {"op":"unmute"}
+                     -> {"ok":true} | {"ok":false,"error":"<fixed text>"}
+    anything else (unknown op, bad JSON, wrong types) -> {"ok":false,"error":"bad request"}
+
+Errors are fixed text (no such session / can't turn on a session without a token /
+could not save) and never echo the request. Nothing on this socket can create an
+utterance, open a listening turn or grant anything: it only toggles state and
+reports it. Each state change prints a terminal line.
 
 Races, stated rather than closed: no lock is held across socket I/O, so an
 utterance whose send began while its session was ON can still reach it if an OFF
@@ -168,6 +226,7 @@ import stat
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol, TextIO
 
@@ -181,11 +240,24 @@ from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with eridian session."
-_RECOVERY_ATTEMPTS = 3  # set_voice retries when a session connects during a recovery write
+_RECOVERY_ATTEMPTS = 3  # set_voice / set_muted retry when a session connects during a recovery write
 NO_HELLO_IDLE_S = 5.0  # a connection with no hello is closed after this long without a complete line
 ALL_OFF_SPEECH = "Voice is off in every session. Turn one on in the eridian menu or with eridian voice on."
 MAX_OFF_ENTRIES = 64  # persisted OFF sessions; the oldest are dropped past this
-VOICE_STATE_VERSION = 1
+VOICE_STATE_VERSION = 2  # v1 files (no "muted") still load, as unmuted
+CONTROL_MAX_CONNECTIONS = 8
+CONTROL_MAX_LINE_BYTES = 4096
+CONTROL_IDLE_S = 5.0  # a request line must complete this long after its first byte; idle between requests is capped too
+CONTROL_LIFETIME_S = 30.0  # absolute cap on one control connection
+CONTROL_MAX_REQUESTS = 64  # requests served on one control connection
+ACCEPT_MAX_ERRORS = 50  # consecutive accept failures (~10 s) before an accept loop gives up
+CONTROL_CWD_CHARS = 200  # status shows at most this much of a session's cwd
+CONTROL_BAD_REQUEST = "bad request"
+CONTROL_ERRORS = {
+    "no_session": "no such session",
+    "no_token": "can't turn on a session without a token",
+    "save": "could not save",
+}
 WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
 WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
@@ -237,6 +309,9 @@ class PlayerLike(Protocol):
     def stop(self) -> None: ...
     def wait_idle(self, timeout: float | None = None) -> bool: ...
     def close(self) -> None: ...
+
+
+_CWD_DROP_CATEGORIES = ("Cc", "Cf", "Zl", "Zp")  # control, format (e.g. U+202E), line / paragraph separators
 
 
 def _sid_hash(token: str) -> str:
@@ -302,10 +377,18 @@ class VoiceBridge:
         announce: frozenset[str] = frozenset(),
         home: Path | None = None,
         no_hello_idle_s: float = NO_HELLO_IDLE_S,
+        control_socket_path: Path | None = None,
+        control_idle_s: float = CONTROL_IDLE_S,
     ) -> None:
+        self._control_idle_s = control_idle_s
         self._no_hello_idle_s = no_hello_idle_s
         self._home = Path(home) if home is not None else None  # resolved lazily: no mkdir at construction
         self._socket_path = Path(socket_path)
+        self._control_path: Path | None = None  # resolved lazily like the home: no mkdir at construction
+        if control_socket_path is not None:
+            self._control_path = Path(control_socket_path)
+        elif self._home is not None:
+            self._control_path = self._home / "control.sock"
         self._follow_up_s = follow_up_s
         self._talk_over = talk_over
         self._announce = announce
@@ -319,6 +402,7 @@ class VoiceBridge:
         self._no_talk_over_gen = -1  # gen whose speech (confirm) talk-over must not cut
         self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
         self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
+        self._turn_mute_gen = 0  # main thread: _mute_gen when the current turn opened
         self._turn_via = ""  # main thread: what opened the current turn (tagging / echo filter only)
         self._reply_origin = ""  # session lock: via of the sole outstanding utterance; one-shot credit for one answer
         self._reply_origin_at = 0.0  # session lock: self._clock() when the credit was set
@@ -330,7 +414,11 @@ class VoiceBridge:
         self._sessions: list[_Conn] = []  # session lock: hello'd connections, oldest first
         self._state_lock = threading.Lock()  # serializes voice-state changes; taken BEFORE the session lock
         self._off: dict[str, float] = {}  # session lock: sha256(token) -> when turned off
-        self._state_extra: dict = {}  # other keys of voice-state.json (e.g. "muted"), kept across writes
+        self._state_extra: dict = {}  # unknown keys of voice-state.json, kept across writes
+        self._muted = False  # written under the session lock (and _state_lock); the main thread reads it every frame
+        self._mute_gen = 0  # bumped (session lock) on every mute-state change; never reset
+        self._mute_applied_gen = 0  # main thread only: the _mute_gen the listener was last cancelled for
+        self._threads_lock = threading.Lock()
         self._state_error = False  # session lock: state file unreadable -> every session is OFF
         self._saved = True  # session lock: False after an OFF whose write failed (file still says ON)
         self._speakers: set[str] = set()  # session lock: _sid_hash of sessions with speech queued/playing
@@ -348,6 +436,10 @@ class VoiceBridge:
 
         self._server: socket.socket | None = None
         self._bound = False
+        self._control_server: socket.socket | None = None
+        self._control_bound = False
+        self._control_ident: tuple[int, int] | None = None  # (dev, inode) of the socket file we bound
+        self._control_conns: set[_Conn] = set()  # guarded by the session lock
         self._threads: list[threading.Thread] = []
         self._chunker = SentenceChunker()
         self._control: queue.Queue = queue.Queue()
@@ -380,9 +472,13 @@ class VoiceBridge:
         try:
             raw = paths.read_private_json(self._state_file(create=False))
             off = raw.get("off") if isinstance(raw, dict) else None
+            version = raw.get("version") if isinstance(raw, dict) else None
+            muted = False if version == 1 else raw.get("muted") if isinstance(raw, dict) else None  # v1 has no "muted"
             if (
                 not isinstance(raw, dict)
-                or raw.get("version") != VOICE_STATE_VERSION
+                or type(version) is not int
+                or version not in (1, VOICE_STATE_VERSION)
+                or not isinstance(muted, bool)
                 or not isinstance(off, dict)
                 or not all(
                     isinstance(k, str) and re.fullmatch(r"[0-9a-f]{64}", k)
@@ -395,24 +491,28 @@ class VoiceBridge:
             return
         except (OSError, ValueError, RecursionError):
             self._state_error = True
+            self._muted = True  # fail toward not listening
             self._print(
-                "[voice] voice-state.json is unreadable: treating every session as off "
-                "until a voice on/off change rewrites it\n"
+                "[voice] voice-state.json is unreadable: treating every session as off and "
+                "starting muted until a voice on/off or unmute change rewrites it\n"
             )
             return
         self._off = dict(off)
-        # Hook for later keys (e.g. "muted"): carried through every write untouched.
-        self._state_extra = {k: v for k, v in raw.items() if k not in ("version", "off")}
+        self._muted = muted
+        # Hook for later keys: carried through every write untouched.
+        self._state_extra = {k: v for k, v in raw.items() if k not in ("version", "off", "muted")}
 
-    def _write_state(self, off: dict[str, float], live: frozenset[str] = frozenset()) -> bool:
-        """Persist `off`; False if the write failed. No lock needed.
+    def _write_state(
+        self, off: dict[str, float], live: frozenset[str] = frozenset(), muted: bool = False
+    ) -> bool:
+        """Persist `off` and `muted`; False if the write failed. No lock needed.
 
         Past MAX_OFF_ENTRIES only entries of disconnected sessions (hashes not in
         `live`) are dropped, oldest first; a connected session's OFF is kept.
         """
         ranked = sorted(off.items(), key=lambda kv: (kv[0] in live, kv[1]))
         kept = dict(ranked[-MAX_OFF_ENTRIES:])
-        doc = {**self._state_extra, "version": VOICE_STATE_VERSION, "off": kept}
+        doc = {**self._state_extra, "version": VOICE_STATE_VERSION, "off": kept, "muted": muted}
         try:
             paths.write_private_json(self._state_file(create=True), doc)
         except (OSError, TypeError, ValueError) as exc:
@@ -448,7 +548,7 @@ class VoiceBridge:
                 {
                     "id": self._session_id(c),
                     "pid": c.pid,
-                    "cwd": c.cwd,
+                    "cwd": "".join(ch for ch in c.cwd if unicodedata.category(ch) not in _CWD_DROP_CATEGORIES)[:CONTROL_CWD_CHARS],
                     "on": not self._is_off_locked(c),
                     "target": c is self._conn,
                 }
@@ -461,6 +561,13 @@ class VoiceBridge:
         successful write."""
         with _bounded(self._lock):
             return {"state_error": self._state_error, "saved": self._saved}
+
+    def _matches_locked(self, session_id: str) -> list[_Conn]:
+        """Session lock held. Connections whose id (see sessions_status) or decimal pid is `session_id`."""
+        return [
+            c for c in self._sessions
+            if self._session_id(c) == session_id or str(c.pid) == session_id
+        ]
 
     def set_voice(self, session_id: str, on: bool) -> bool:
         """Turn voice on/off for the session(s) with this id (see sessions_status) or decimal pid.
@@ -483,26 +590,58 @@ class VoiceBridge:
         """
         if not isinstance(session_id, str):
             return False
+        return self._change_state(session_id, on, None)
+
+    def set_muted(self, muted: bool) -> bool:
+        """Mute or unmute the microphone for every session (global, persisted).
+
+        Same discipline as set_voice: MUTE lands in memory before any I/O, so it
+        holds even when the write fails (`saved` goes False). UNMUTE needs a
+        successful write first (else nothing changes and False is returned),
+        and during `state_error` it goes through the same recovery write as an
+        ON, which records every connected tokened session OFF, so unmuting never
+        makes an OFF session audible. The listener is cancelled on the main
+        thread (see _sync_mute) at each transition.
+        """
+        if not isinstance(muted, bool):
+            return False
+        return self._change_state(None, not muted, muted)
+
+    def is_muted(self) -> bool:
+        with _bounded(self._lock):
+            return self._muted
+
+    def _change_state(self, session_id: str | None, on: bool, mute: bool | None) -> bool:
+        """The snapshot / write / commit / retry transaction shared by set_voice and set_muted.
+
+        `on` is the direction that needs a write first (voice on, unmute); the
+        other direction is applied in memory before any I/O. `session_id` None
+        means no session is targeted (a mute change); `mute` None leaves mute as is.
+        """
         changed = stop = False
         target = None
+        matches: list[_Conn] = []
+        muted_changed = False
         with _bounded(self._state_lock):
+            with _bounded(self._lock):
+                was_muted = self._muted
             for _attempt in range(_RECOVERY_ATTEMPTS):
                 with _bounded(self._lock):
-                    matches = [
-                        c for c in self._sessions
-                        if self._session_id(c) == session_id or str(c.pid) == session_id
-                    ]
-                    hashes = {_sid_hash(c.session) for c in matches if c.session}
-                    if not matches or (on and not hashes):
-                        return False
+                    hashes: set[str] = set()
+                    if session_id is not None:
+                        matches = self._matches_locked(session_id)
+                        hashes = {_sid_hash(c.session) for c in matches if c.session}
+                        if not matches or (on and not hashes):
+                            return False
+                    new_muted = self._muted if mute is None else mute
                     recovering = self._state_error
                     new_off = self._off_after_locked(hashes, on, recovering)
                     live = self._live_hashes_locked()
-                    if not on:  # OFF lands in memory before any I/O can fail or raise
-                        ch, target, st = self._commit_locked(new_off, matches, on, False, None)
+                    if not on:  # OFF / mute land in memory before any I/O can fail or raise
+                        ch, target, st = self._commit_locked(new_off, matches, on, False, None, new_muted)
                         changed, stop = changed or ch, stop or st
-                if on or hashes or recovering:
-                    wrote = self._write_state(new_off, live)  # no lock held across the write
+                if on or hashes or recovering or mute is not None:
+                    wrote = self._write_state(new_off, live, new_muted)  # no lock held across the write
                 else:
                     wrote = None  # only token-less sessions: nothing to persist
                 with _bounded(self._lock):
@@ -511,7 +650,7 @@ class VoiceBridge:
                     if recovering and wrote and not self._live_hashes_locked() <= live:
                         continue  # a tokened session connected mid-write: the file misses it
                     if on:
-                        ch, target, st = self._commit_locked(new_off, matches, on, True, True)
+                        ch, target, st = self._commit_locked(new_off, matches, on, True, True, new_muted)
                         changed, stop = changed or ch, stop or st
                     elif wrote is not None:
                         self._saved = wrote
@@ -520,14 +659,18 @@ class VoiceBridge:
                 break
             else:
                 # Still racing after every attempt: fail closed. state_error stays set, so
-                # every session stays OFF; an OFF already applied above stands.
+                # every session stays OFF and the mic stays muted; an OFF / mute already applied stands.
                 if on:
                     return False
+            with _bounded(self._lock):
+                muted_changed = self._muted != was_muted
         if stop:
             self._player.stop()  # outside the locks, like a barge-in
         label = "on" if on else "off"
         for c in matches:
             self._print(f"[voice {label}: session pid {c.pid}]\n")
+        if muted_changed:
+            self._print("[muted]\n" if self._muted else "[unmuted]\n")
         if changed:
             self._print(
                 f"[voice target: session pid {target.pid}]\n" if target is not None
@@ -562,10 +705,19 @@ class VoiceBridge:
         return new_off
 
     def _commit_locked(
-        self, new_off: dict[str, float], matches: list[_Conn], on: bool, wrote: bool, saved: bool | None
+        self,
+        new_off: dict[str, float],
+        matches: list[_Conn],
+        on: bool,
+        wrote: bool,
+        saved: bool | None,
+        muted: bool,
     ) -> tuple[bool, "_Conn | None", bool]:
         """Session lock held. Apply a voice change in memory; (target changed, target, cut speech)."""
         self._off = new_off
+        if muted != self._muted:
+            self._mute_gen += 1
+        self._muted = muted
         if wrote:
             self._state_error = False
         if saved is not None:
@@ -583,9 +735,12 @@ class VoiceBridge:
 
     # ---- lifecycle -----------------------------------------------------
 
-    def start(self) -> int:
-        """Bind the listener socket and start the threads. 0 ok, 1 refused."""
-        path = self._socket_path
+    def _bind_socket(self, path: Path) -> socket.socket | None:
+        """Bind a 0600 listening unix socket at `path`; None (reason printed) if refused.
+
+        Never unlinks anything that is not a socket, refuses while another
+        process answers on it, and removes a stale socket file.
+        """
         try:
             existing = os.lstat(path)
         except FileNotFoundError:
@@ -598,41 +753,70 @@ class VoiceBridge:
                 f"socket (mode {stat.filemode(existing.st_mode)})",
                 file=sys.stderr,
             )
-            return 1
+            return None
 
         if existing is not None:
             if _server_answers(path):
                 print(f"eridian: another attach is already running at {path}", file=sys.stderr)
-                return 1
+                return None
             path.unlink()  # stale socket from a crashed/killed attach
 
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound = False
         try:
             # umask so the socket is never wider than 0600, even briefly; the
             # explicit chmod below stays as the belt to this pair of braces.
             old_umask = os.umask(0o177)
             try:
                 server.bind(str(path))
+                bound = True
             finally:
                 os.umask(old_umask)
-            self._bound = True
             os.chmod(path, 0o600)
             server.listen(_BACKLOG)
             server.settimeout(_POLL_S)
         except OSError as exc:
             server.close()
-            self._unlink_socket()
+            if bound:
+                with contextlib.suppress(OSError):
+                    path.unlink()
             print(f"eridian: cannot listen on {path}: {exc}", file=sys.stderr)
+            return None
+        return server
+
+    def start(self) -> int:
+        """Bind the voice and control sockets and start the threads. 0 ok, 1 refused.
+
+        The control socket is the mute switch, so attach never runs without it:
+        if it cannot be bound, the voice socket is released again and start fails.
+        """
+        server = self._bind_socket(self._socket_path)
+        if server is None:
             return 1
         self._server = server
+        self._bound = True
+        if self._control_path is None:
+            self._control_path = paths.control_socket_path()
+        control = self._bind_socket(self._control_path)
+        if control is None:
+            server.close()
+            self._server = None
+            self._unlink_socket()
+            return 1
+        self._control_server = control
+        self._control_bound = True
+        with contextlib.suppress(OSError):
+            ident = os.lstat(self._control_path)
+            self._control_ident = (ident.st_dev, ident.st_ino)
 
         for name, target in (
             ("eridian-voice-accept", self._accept_loop),
             ("eridian-voice-speech", self._speech_watcher),
+            ("eridian-control-accept", self._control_accept_loop),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
-            self._threads.append(thread)
+            self._track_thread(thread)
         return 0
 
     def close(self) -> None:
@@ -641,13 +825,16 @@ class VoiceBridge:
                 return
             self._closed = True
             self._gen += 1
-            conns = list(self._conns)
+            conns = list(self._conns) + list(self._control_conns)
             self._conn = None
             self._sessions.clear()
         self._speech_q.put(None)
         if self._server is not None:
             with contextlib.suppress(OSError):
                 self._server.close()
+        if self._control_server is not None:
+            with contextlib.suppress(OSError):
+                self._control_server.close()
         for conn in conns:
             conn.close()
         self._player.stop()
@@ -660,20 +847,45 @@ class VoiceBridge:
         self._unlink_socket()
         self._player.close()
 
+    def _track_thread(self, thread: threading.Thread) -> None:
+        """Remember `thread` for close(); dead reader threads are dropped so connects can't grow the list."""
+        with self._threads_lock:
+            self._threads[:] = [t for t in self._threads if t.is_alive() or t is thread]
+            self._threads.append(thread)
+
     def _unlink_socket(self) -> None:
-        if not self._bound:
-            return
-        self._bound = False
-        with contextlib.suppress(OSError):
-            self._socket_path.unlink()
+        if self._bound:
+            self._bound = False
+            with contextlib.suppress(OSError):
+                self._socket_path.unlink()
+        if self._control_bound and self._control_path is not None:
+            self._control_bound = False
+            with contextlib.suppress(OSError):
+                self._control_path.unlink()
 
     # ---- main thread ---------------------------------------------------
 
+    def _sync_mute(self) -> None:
+        """Main thread. Cancel the listener whenever the mute state changed since it last ran.
+
+        Mute: a turn in progress, the wake pre-roll and the talk-over buffers are
+        discarded, so nothing captured before the mute is ever transcribed or sent.
+        Unmute: the listener restarts from fresh detectors.
+        """
+        gen = self._mute_gen
+        if gen != self._mute_applied_gen:  # a counter, so a quick mute->unmute still cancels
+            self._mute_applied_gen = gen
+            self._listener.cancel()
+
     def process_frame(self, frame: bytes) -> None:
+        self._sync_mute()
         self._drain_control()
-        self._listener.talk_over = self._talk_over_mode()
-        if self._player.busy:
+        if self._player.busy:  # kept fresh while muted: the self-wake guard must survive a mute
             self._last_busy = self._clock()
+        if self._muted:
+            return  # real mute: no wake word, VAD or STT ever sees this frame
+        self._sync_mute()  # an unmute landed mid-drain: start from a cancelled listener
+        self._listener.talk_over = self._talk_over_mode()
         self._listener.process_frame(frame)
 
     def _talk_over_mode(self) -> str:
@@ -706,6 +918,7 @@ class VoiceBridge:
             if (
                 kind == "reply_done"
                 and self._follow_up_s > 0
+                and not self._muted
                 and self._listener.state == "IDLE"
                 and gen != self._followed_gen
                 and self._is_current(gen)
@@ -774,6 +987,14 @@ class VoiceBridge:
         self._speech_q.put((gen, False, seq))  # an announcement never opens a window
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
+        if event.kind in ("wake", "talk_over", "follow_up"):
+            # One lock section reads the flag and the counter together (every writer holds
+            # this lock), so a mute+unmute can never slip between the two reads.
+            with _bounded(self._lock):
+                muted = self._muted
+                self._turn_mute_gen = self._mute_gen  # the turn's mute epoch
+            if muted:
+                return  # no cue, no barge-in, no turn while muted
         if event.kind == "wake":
             own_voice = (
                 self._player.busy
@@ -797,47 +1018,68 @@ class VoiceBridge:
             self._echo_hist = self._recent_spoken()
             self._cue("follow_up")
         elif event.kind == "utterance":
-            text = event.text or ""
-            if (
-                self._turn_via in ("talk_over", "follow_up")
-                and self._echo_hist
-                and is_echo(text, self._echo_hist)
-            ):
-                # Drop only; never alters a grant decision. A talk-over that
-                # already stopped playback stays stopped: the player has no
-                # resume, and replaying a half-heard reply is worse than silence.
-                self._print(
-                    f"you [{self._turn_via}]: {self._redact(text)} "
-                    "[dropped: echo of own speech]\n"
-                )
+            self._on_utterance(event.text or "")
+        # wake_no_speech / dropped_empty: nothing to do
+
+    def _turn_muted_locked(self) -> bool:
+        """Session lock held. The ONE mute rule for an utterance: muted now, or any mute
+        change (even a quick mute->unmute) since the turn opened."""
+        return self._muted or self._mute_gen != self._turn_mute_gen
+
+    def _unsent(self, line: str, then: Callable[[], None] | None = None) -> None:
+        """A non-send outcome (echo drop, own-reply, too-soon hold). If the turn was muted, only
+        `[muted: not sent]` is printed. Accepted: audio captured BEFORE the mute may print in the
+        few bytecodes after this check; nothing is sent and no post-mute audio is involved."""
+        with _bounded(self._lock):
+            muted = self._turn_muted_locked()
+        if muted:
+            self._print("[muted: not sent]\n")
+            return
+        self._print(line)
+        if then is not None:
+            then()
+
+    def _on_utterance(self, text: str) -> None:
+        via = self._turn_via
+        # 1. Decide everything first: no prints, no enqueues. Lines are buffered.
+        if via in ("talk_over", "follow_up") and self._echo_hist and is_echo(text, self._echo_hist):
+            # Drop only; never alters a grant decision. A talk-over that
+            # already stopped playback stays stopped: the player has no
+            # resume, and replaying a half-heard reply is worse than silence.
+            self._unsent(f"you [{via}]: {self._redact(text)} [dropped: echo of own speech]\n")
+            return
+        removed_line = ""
+        if via == "talk_over" and self._echo_ref:
+            kept = strip_echo(text, self._echo_ref)
+            if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
+                self._unsent(f'[ignored as my own reply: "{self._redact(text)}"]\n')
                 return
-            if self._turn_via == "talk_over" and self._echo_ref:
-                kept = strip_echo(text, self._echo_ref)
-                if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
-                    self._print(f'[ignored as my own reply: "{self._redact(text)}"]\n')
-                    return
-                if kept != text:
-                    self._print(
-                        f'[removed my own words: "{self._redact(text)}" -> "{self._redact(kept)}"]\n'
-                    )
-                    text = kept
-            if self._turn_via == "wake_barge_in":
-                with _bounded(self._lock):
-                    held = self._confirm_is_pending()
-                if held:
-                    # Could be our own voice, so it can never grant; sending it
-                    # would only use up the challenge. Say why instead.
-                    self._print(
-                        "[too soon after I spoke, so not sent: wait a moment, "
-                        "then say the wake word again]\n"
-                    )
+            if kept != text:
+                removed_line = f'[removed my own words: "{self._redact(text)}" -> "{self._redact(kept)}"]\n'
+                text = kept
+        if via == "wake_barge_in":
+            with _bounded(self._lock):
+                held = self._confirm_is_pending()
+            if held:
+                # Could be our own voice, so it can never grant; sending it
+                # would only use up the challenge. Say why instead.
+                def _say_too_soon() -> None:
                     self._note_spoken(TOO_SOON_SPEECH)
                     self._player.enqueue(TOO_SOON_SPEECH, own=True)
-                    return
-            via = self._turn_via
-            tag = f" [{via}]" if via not in ("", "wake") else ""
-            self._print(f"you{tag}: {self._redact(text)}\n")
-            with _bounded(self._lock):
+
+                self._unsent(
+                    "[too soon after I spoke, so not sent: wait a moment, "
+                    "then say the wake word again]\n",
+                    _say_too_soon,
+                )
+                return
+        tag = f" [{via}]" if via not in ("", "wake") else ""
+        you_line = f"you{tag}: {self._redact(text)}\n"
+        payload = {"type": "utterance", "text": text, "via": via}
+        # 2. The final check, then the send as the very next statement: no I/O between them.
+        with _bounded(self._lock):
+            muted = self._turn_muted_locked()
+            if not muted:
                 self._gen += 1
                 conn = self._conn
                 any_sessions = bool(self._sessions)
@@ -846,24 +1088,34 @@ class VoiceBridge:
                 self._outstanding += 1
                 self._reply_origin = via if self._outstanding == 1 else ""
                 self._reply_origin_at = self._clock()
-            if conn is not None and conn.send(
-                {"type": "utterance", "text": text, "via": via}
-            ):
-                with _bounded(self._lock):
-                    self._confirm_pending = False
-                return
-            with _bounded(self._lock):
+        if muted:  # send nothing, touch no turn flags, print no transcript
+            self._print("[muted: not sent]\n")
+            return
+        # The one remaining mute window: a mute landing between the in-lock check above and
+        # this send (a few bytecodes, no I/O).
+        sent = conn is not None and conn.send(payload)
+        # 3. State that depends on the outcome is settled BEFORE any print, so a failing
+        # print can never strand it; then the transcript prints (a print failure there is dropped silently).
+        with _bounded(self._lock):
+            if sent:
+                self._confirm_pending = False
+            else:
                 self._outstanding = max(0, self._outstanding - 1)  # a failed send is not a turn
                 self._reply_origin = ""
-            if conn is None and any_sessions:
-                self._print("[no session has voice on]\n")
-                self._note_spoken(ALL_OFF_SPEECH)
-                self._player.enqueue(ALL_OFF_SPEECH)
-                return
-            self._print("[no Claude session attached]\n")
-            self._note_spoken(NO_SESSION_SPEECH)
-            self._player.enqueue(NO_SESSION_SPEECH)
-        # wake_no_speech / dropped_empty: nothing to do
+        with contextlib.suppress(Exception):
+            if removed_line:
+                self._print(removed_line)
+            self._print(you_line)
+        if sent:
+            return
+        if conn is None and any_sessions:
+            self._print("[no session has voice on]\n")
+            self._note_spoken(ALL_OFF_SPEECH)
+            self._player.enqueue(ALL_OFF_SPEECH)
+            return
+        self._print("[no Claude session attached]\n")
+        self._note_spoken(NO_SESSION_SPEECH)
+        self._player.enqueue(NO_SESSION_SPEECH)
 
     def _note_spoken(self, text: str) -> None:
         """Remember something eridian said, for the echo text guard. Session lock NOT held."""
@@ -913,13 +1165,25 @@ class VoiceBridge:
     def _accept_loop(self) -> None:
         server = self._server
         assert server is not None
+        errors = setup_failures = 0
         while not self._closed:
             try:
                 sock, _ = server.accept()
             except socket.timeout:
+                errors = 0
                 continue
-            except OSError:
-                return  # server closed
+            except OSError as exc:
+                if self._closed:
+                    return  # server closed
+                errors += 1
+                if errors == 1:  # one line per streak
+                    self._print(f"[voice] accept error: {type(exc).__name__}: {exc}\n")
+                if errors >= ACCEPT_MAX_ERRORS:
+                    self._print("[voice socket stopped accepting: no new session can attach]\n")
+                    return
+                time.sleep(_POLL_S)  # transient (EMFILE...): keep serving, never spin hot
+                continue
+            errors = 0
             try:
                 sock.settimeout(_IO_TIMEOUT_S)
                 conn = _Conn(sock)
@@ -937,10 +1201,13 @@ class VoiceBridge:
                 reader = threading.Thread(
                     target=self._reader, args=(conn,), name="eridian-voice-reader", daemon=True
                 )
-                self._threads.append(reader)
+                self._track_thread(reader)
                 reader.start()
+                setup_failures = 0
             except Exception as exc:  # noqa: BLE001 - never let accept die
-                self._print(f"[voice] accept error: {type(exc).__name__}: {exc}\n")
+                setup_failures += 1
+                if setup_failures == 1:  # one line per streak of failing connections
+                    self._print(f"[voice] accept error: {type(exc).__name__}: {exc}\n")
                 with contextlib.suppress(Exception):
                     sock.close()
 
@@ -982,6 +1249,171 @@ class VoiceBridge:
                 self._handle_line(conn, line)
             if len(buf) > MAX_LINE_BYTES:
                 return  # oversized line with no newline yet
+
+    # ---- control socket ------------------------------------------------
+    # Newline-delimited JSON, one response line per request line. It only
+    # toggles state and reports it: nothing here can create an utterance, open a
+    # listening turn or grant anything. Replies are fixed text, never request content.
+
+    def _control_accept_loop(self) -> None:
+        server = self._control_server
+        assert server is not None
+        errors = setup_failures = 0
+        while not self._closed:
+            try:
+                sock, _ = server.accept()
+            except socket.timeout:
+                errors = 0
+                continue
+            except OSError as exc:
+                if self._closed:
+                    return  # server closed
+                errors += 1
+                if errors == 1:  # one line per streak
+                    self._print(f"[control] accept error: {type(exc).__name__}: {exc}\n")
+                if errors >= ACCEPT_MAX_ERRORS:
+                    self._control_failed()
+                    return
+                time.sleep(_POLL_S)  # transient (EMFILE...): keep serving, never spin hot
+                continue
+            errors = 0
+            try:
+                sock.settimeout(_IO_TIMEOUT_S)
+                conn = _Conn(sock)
+                with _bounded(self._lock):
+                    if self._closed:
+                        conn.close()
+                        return
+                    over_cap = len(self._control_conns) >= CONTROL_MAX_CONNECTIONS
+                    if not over_cap:
+                        self._control_conns.add(conn)
+                if over_cap:
+                    conn.close()
+                    continue
+                reader = threading.Thread(
+                    target=self._control_reader, args=(conn,), name="eridian-control-reader", daemon=True
+                )
+                self._track_thread(reader)
+                reader.start()
+                setup_failures = 0
+            except Exception as exc:  # noqa: BLE001 - never let accept die
+                setup_failures += 1
+                if setup_failures == 1:  # one line per streak of failing connections
+                    self._print(f"[control] accept error: {type(exc).__name__}: {exc}\n")
+                with contextlib.suppress(Exception):
+                    sock.close()
+
+    def _control_failed(self) -> None:
+        """The control accept loop gave up: the mute switch is gone, so fail toward not listening."""
+        with contextlib.suppress(Exception):
+            self.set_muted(True)  # a failed write still mutes in memory
+        # Remove the dead socket file (only if it is still ours) so a client gets an
+        # immediate "no such file" instead of hanging on a listener nobody serves.
+        with contextlib.suppress(OSError):
+            if self._control_path is not None and self._control_ident is not None:
+                st = os.lstat(self._control_path)
+                if stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == self._control_ident:
+                    self._control_path.unlink()
+                    self._control_bound = False
+        self._print("[control socket failed; muted]\n")
+
+    def _control_reader(self, conn: _Conn) -> None:
+        try:
+            self._control_read_lines(conn)
+        except Exception as exc:  # noqa: BLE001 - one bad connection must never kill us
+            with contextlib.suppress(Exception):
+                self._print(f"[control] connection error: {type(exc).__name__}: {exc}\n")
+        finally:
+            with contextlib.suppress(Exception):
+                with _bounded(self._lock):
+                    self._control_conns.discard(conn)
+            conn.close()
+
+    def _control_read_lines(self, conn: _Conn) -> None:
+        """Serve requests on one connection. Slow-drip safe: a line must finish within
+        `_control_idle_s` of its first byte, idle between requests is capped at the same
+        value, the connection lives at most CONTROL_LIFETIME_S and serves at most
+        CONTROL_MAX_REQUESTS requests."""
+        buf = b""
+        began = idle_since = line_began = time.monotonic()
+        served = 0
+        while not self._closed:
+            now = time.monotonic()
+            if now - began > CONTROL_LIFETIME_S:
+                return
+            if now - (line_began if buf else idle_since) > self._control_idle_s:
+                return
+            try:
+                ready, _, _ = select.select([conn.sock], [], [], _POLL_S)
+                if not ready:
+                    continue
+                data = conn.sock.recv(4096)
+            except (OSError, ValueError):
+                return
+            if not data:
+                return
+            if not buf:
+                line_began = time.monotonic()
+            buf += data
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line, buf = buf[:nl], buf[nl + 1 :]
+                if len(line) > CONTROL_MAX_LINE_BYTES:
+                    return
+                if not conn.send(self._control_response(line)):
+                    return
+                served += 1
+                if served >= CONTROL_MAX_REQUESTS:
+                    return
+                line_began = idle_since = time.monotonic()
+            if len(buf) > CONTROL_MAX_LINE_BYTES:
+                return  # oversized line with no newline yet
+
+    def _control_response(self, line: bytes) -> dict:
+        try:
+            return self._control_dispatch(line)
+        except TimeoutError:  # a wedged lock (_bounded): answer, don't drop the connection
+            return {"ok": False, "error": CONTROL_ERRORS["save"]}
+
+    def _control_dispatch(self, line: bytes) -> dict:
+        bad = {"ok": False, "error": CONTROL_BAD_REQUEST}
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return bad
+        if not isinstance(msg, dict):
+            return bad
+        op = msg.get("op")
+        if op == "status":
+            health = self.voice_state_health()
+            return {
+                "ok": True,
+                "muted": self.is_muted(),
+                "state_error": health["state_error"],
+                "saved": health["saved"],
+                "sessions": self.sessions_status(),
+            }
+        if op in ("mute", "unmute"):
+            return {"ok": True} if self.set_muted(op == "mute") else {"ok": False, "error": CONTROL_ERRORS["save"]}
+        if op in ("voice_on", "voice_off"):
+            session = msg.get("session")
+            if not isinstance(session, str) or not 0 < len(session) <= 64:
+                return bad
+            on = op == "voice_on"
+            if self.set_voice(session, on):
+                return {"ok": True}
+            with _bounded(self._lock):
+                matches = self._matches_locked(session)
+            if not matches:
+                reason = "no_session"
+            elif on and not any(c.session for c in matches):
+                reason = "no_token"
+            else:
+                reason = "save"
+            return {"ok": False, "error": CONTROL_ERRORS[reason]}
+        return bad
 
     def _handle_line(self, conn: _Conn, line: bytes) -> None:
         try:

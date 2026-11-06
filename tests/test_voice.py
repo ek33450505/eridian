@@ -1805,7 +1805,8 @@ class VoiceStateTest(VoiceTestCase):
         text = self.state_file.read_text()
         self.assertNotIn(_tok(1), text)
         doc = json.loads(text)
-        self.assertEqual(doc["version"], 1)
+        self.assertEqual(doc["version"], 2)
+        self.assertIs(doc["muted"], False)
         self.assertEqual(list(doc["off"]), [hashlib.sha256(_tok(1).encode()).hexdigest()])
         self.assertEqual(stat.S_IMODE(os.lstat(self.state_file).st_mode), 0o600)
         self.assertEqual([p.name for p in self.home.iterdir() if p.name.endswith(".tmp")], [])
@@ -1875,11 +1876,13 @@ class VoiceStateTest(VoiceTestCase):
         self.assertFalse(self.bridge.sessions_status()[0]["on"])
 
     def test_other_keys_in_the_file_are_carried_through(self) -> None:
-        self.state_file.write_text(json.dumps({"version": 1, "off": {}, "muted": True}))
+        self.state_file.write_text(json.dumps({"version": 2, "off": {}, "muted": True, "future": 7}))
         bridge = self.reopen()
         self.session(1)
         bridge.set_voice(_sid(1), False)
-        self.assertIs(json.loads(self.state_file.read_text())["muted"], True)
+        doc = json.loads(self.state_file.read_text())
+        self.assertIs(doc["muted"], True)
+        self.assertEqual(doc["future"], 7)
 
     # ---- fix round ------------------------------------------------------
 

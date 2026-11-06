@@ -36,6 +36,11 @@ def voice_socket_path() -> Path:
     return home_dir() / "voice.sock"
 
 
+def control_socket_path() -> Path:
+    """Unix socket the `eridian attach` process serves its mute / per-session voice control on; 0600."""
+    return home_dir() / "control.sock"
+
+
 def voice_state_path() -> Path:
     """Persisted per-session voice state (which sessions are OFF); written 0600."""
     return home_dir() / VOICE_STATE_NAME

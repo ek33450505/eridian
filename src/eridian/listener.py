@@ -143,6 +143,17 @@ class Listener:
             return
         self._start_turn("follow_up", no_speech_timeout_s)
 
+    def cancel(self) -> None:
+        """Discard everything in flight and return to IDLE with fresh detectors.
+
+        Drops a turn in progress (its captured audio is never transcribed), the
+        wake pre-roll and the talk-over buffers, and resets the VAD. Main thread
+        only, like process_frame; emits no event.
+        """
+        self._reset_to_idle()
+        if self._vad_reset is not None:
+            self._vad_reset()
+
     def process_frame(self, frame: bytes) -> None:
         """Feed one chunk of raw audio bytes; may call `vad` zero or several
         times (frames don't need to align to VAD_CHUNK_BYTES -- leftover
