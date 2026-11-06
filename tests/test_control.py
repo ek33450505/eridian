@@ -61,7 +61,7 @@ class ControlBase(tv.VoiceTestCase):
                 self.stt_hook()
             return self.transcript
 
-        kwargs = dict(wake_factory=wake_factory, vad=vad, stt=stt)
+        kwargs = dict(wake_factory=wake_factory, vad=vad, stt=stt, requester_check=lambda pid: None)
         kwargs.update(overrides)
         return super().make_bridge(**kwargs)
 
@@ -624,9 +624,13 @@ class ControlSocketTest(ControlBase):
         for channel in held:
             channel.send_obj({"op": "status"})
             self.assertTrue(channel.read_line()["ok"])
+        reserve = self.ctl()  # the reserved slot, held open
+        self.assertTrue(tv._wait_for(lambda: len(self.bridge._control_conns) == CONTROL_MAX_CONNECTIONS + 1))
         extra = self.ctl()
         extra.send_obj({"op": "status"})
         self.assertIsNone(extra.read_line())
+        reserve.send_obj({"op": "status"})
+        self.assertTrue(reserve.read_line()["ok"])
         held[0].close()
         self.assertTrue(
             tv._wait_for(lambda: len(self.bridge._control_conns) < CONTROL_MAX_CONNECTIONS)

@@ -106,7 +106,8 @@ is authoritative.
 Control socket (`paths.control_socket_path()`, 0600, bound like voice.sock). It is
 the mute switch, so `start()` FAILS (and releases voice.sock) if it cannot be
 bound. Newline-delimited JSON, one response line per request line, several
-requests per connection allowed; caps: CONTROL_MAX_CONNECTIONS connections,
+requests per connection allowed; caps: CONTROL_MAX_CONNECTIONS connections plus one reserved slot (a connection past the cap serves one
+mute / voice_off / status request and closes, so a flood cannot block mute),
 CONTROL_MAX_LINE_BYTES per line (longer drops the connection); a request line must
 complete within CONTROL_IDLE_S of its first byte, idle between requests is capped at
 CONTROL_IDLE_S, a connection lives at most CONTROL_LIFETIME_S and serves at most
@@ -117,6 +118,22 @@ in status is stripped of control characters and cut to CONTROL_CWD_CHARS:
     {"op":"voice_on"|"voice_off","session":"<id or pid>"} | {"op":"mute"} | {"op":"unmute"}
                      -> {"ok":true} | {"ok":false,"error":"<fixed text>"}
     anything else (unknown op, bad JSON, wrong types) -> {"ok":false,"error":"bad request"}
+
+Requester check (layer 2; voice_guard refusing the commands in Claude's Bash is layer 1).
+`voice_on` and `unmute` -- the ON-direction ops -- are refused, before any state change,
+when the requesting process descends from a Claude Code process; `mute`, `voice_off` and
+`status` are never checked. The requester is the socket peer pid (LOCAL_PEERPID /
+SO_PEERCRED, read at accept), never anything in the request. `requester_refusal` walks
+the ancestry with `/bin/ps` and refuses if any process (including the peer) is `claude`,
+`claude.exe` or lives under `@anthropic-ai/claude-code`. It FAILS CLOSED: an unreadable
+peer pid, a ps failure or timeout, an exhausted deadline, or a chain longer than
+REQUESTER_MAX_STEPS all refuse. A chain that cleanly reaches pid 1 is allowed (a user's
+terminal). `/bin/ps` missing (some Linux layouts) fails closed, so ON ops are refused there.
+Detection looks at both comm and args. The peer pid is re-read at check time and must
+equal the accept-time pid. Replies: "refused: requested from a Claude session" and
+"refused: could not verify the requester". Limit: best effort -- a process detached and
+reparented to launchd escapes it. The check is injectable (`requester_check`) for tests
+only; there is no env var or global switch.
 
 An `unmute` reply of ok means the state change was accepted. The mic device is reopened on
 the next audio frame and that may fail and re-mute, so `status` is authoritative.
@@ -241,6 +258,8 @@ import select
 import signal
 import socket
 import stat
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -276,7 +295,15 @@ CONTROL_ERRORS = {
     "no_session": "no such session",
     "no_token": "can't turn on a session without a token",
     "save": "could not save",
+    "claude": "refused: requested from a Claude session",
+    "unverified": "refused: could not verify the requester",
+    "busy": "too many connections",
 }
+REQUESTER_MAX_STEPS = 64
+REQUESTER_DEADLINE_S = 1.0
+_PS = "/bin/ps"
+_ON_OPS = ("voice_on", "unmute")
+_RESERVED_OPS = ("mute", "voice_off", "status")  # all a reserved-slot connection may do
 WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
 WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
@@ -349,6 +376,96 @@ def _bounded(lock: threading.Lock, timeout: float = _LOCK_TIMEOUT_S) -> Iterator
         lock.release()
 
 
+def _peer_pid(sock: socket.socket) -> int | None:
+    """The connected client's pid as the kernel reports it, or None."""
+    try:
+        if sys.platform == "darwin":
+            raw = sock.getsockopt(0, 2, 4)  # SOL_LOCAL, LOCAL_PEERPID
+            return struct.unpack("i", raw)[0]
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", raw)[0]
+    except (OSError, AttributeError, struct.error):
+        return None
+
+
+def _ps_out(args: list[str], timeout: float) -> str | None:
+    try:
+        out = subprocess.run([_PS, *args], capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _ps_row(pid: int, timeout: float) -> tuple[int, str, str] | None:
+    """(ppid, comm, args) for `pid` via /bin/ps, or None on any failure. `args` is a
+    separate call (it may hold spaces and newlines), sharing one `timeout` budget."""
+    end = time.monotonic() + timeout
+    head = _ps_out(["-o", "ppid=,comm=", "-p", str(pid)], timeout)
+    if head is None:
+        return None
+    parts = head.strip().split(None, 1)
+    if len(parts) != 2:
+        return None
+    left = end - time.monotonic()
+    if left <= 0:
+        return None
+    full = _ps_out(["-o", "args=", "-p", str(pid)], left)
+    if full is None:
+        return None
+    try:
+        return int(parts[0]), parts[1].strip(), full.strip()
+    except ValueError:
+        return None
+
+
+def _is_claude_text(text: str, *, first_token: bool) -> bool:
+    low = text.casefold()
+    if "@anthropic-ai/claude-code" in low or "/claude/versions/" in low:
+        return True
+    head = (low.split(None, 1) or [""])[0] if first_token else low
+    return head.rsplit("/", 1)[-1] in ("claude", "claude.exe")
+
+
+def _is_claude_proc(comm: str, args: str) -> bool:
+    return _is_claude_text(comm, first_token=False) or _is_claude_text(args, first_token=True)
+
+
+def requester_refusal(
+    pid: int | None,
+    *,
+    deadline_s: float = REQUESTER_DEADLINE_S,
+    ps_runner: Callable[[int, float], tuple[int, str, str] | None] = _ps_row,
+) -> str | None:
+    """Why a control request from `pid` must be refused, or None to allow it.
+
+    Returns a CONTROL_ERRORS key (the keys double as reason codes): "claude" if `pid` or
+    any ancestor is a Claude Code process -- comm or args (casefolded) with a basename
+    `claude`/`claude.exe`, or a path containing `@anthropic-ai/claude-code` or
+    `/claude/versions/` (native installer) -- "unverified" for every failure to decide. FAIL CLOSED:
+    pid None or <= 1, a ps failure or timeout, the deadline passing, or REQUESTER_MAX_STEPS
+    steps without reaching pid <= 1 all refuse. A chain that reaches pid 1 clean is
+    allowed. Best effort only: a process detached and reparented to launchd (pid 1)
+    no longer shows its Claude ancestor and escapes this check."""
+    if pid is None or pid <= 1:  # only a walk that reaches pid 1 from a real ancestor allows
+        return "unverified"
+    end = time.monotonic() + deadline_s
+    cur = pid
+    for _ in range(REQUESTER_MAX_STEPS):
+        if cur <= 1:
+            return None
+        left = end - time.monotonic()
+        if left <= 0:
+            return "unverified"
+        row = ps_runner(cur, left)
+        if row is None:
+            return "unverified"
+        ppid, comm, args = row
+        if _is_claude_proc(comm, args):
+            return "claude"
+        cur = ppid
+    return "unverified"
+
+
 class _Conn:
     """One channel connection: the socket plus a lock serializing its writers."""
 
@@ -356,6 +473,8 @@ class _Conn:
         self.sock = sock
         self.send_lock = threading.Lock()
         self.pid: int | None = None
+        self.reserved = False  # control conns: the extra slot; mute / voice_off / status, one request
+        self.peer_pid: int | None = None  # control conns: kernel-reported at accept; never from a request
         self.cwd = ""
         self.hello = False
         self.session = ""  # 32-hex token from hello; "" can never match an announce
@@ -400,7 +519,9 @@ class VoiceBridge:
         control_idle_s: float = CONTROL_IDLE_S,
         mic_control: Callable[[bool], None] | None = None,
         mic_stalled: Callable[[], bool] | None = None,
+        requester_check: Callable[[int | None], str | None] = requester_refusal,
     ) -> None:
+        self._requester_check = requester_check
         self._mic_control = mic_control
         self._mic_stalled = mic_stalled
         self._stall_reported = False  # main thread: the last stall state we printed
@@ -1372,11 +1493,16 @@ class VoiceBridge:
             try:
                 sock.settimeout(_IO_TIMEOUT_S)
                 conn = _Conn(sock)
+                conn.peer_pid = _peer_pid(sock)
                 with _bounded(self._lock):
                     if self._closed:
                         conn.close()
                         return
-                    over_cap = len(self._control_conns) >= CONTROL_MAX_CONNECTIONS
+                    # One slot beyond the cap is reserved for the off direction, so a flood
+                    # of idle connections can never lock out `eridian mute`.
+                    held = len(self._control_conns)
+                    over_cap = held > CONTROL_MAX_CONNECTIONS
+                    conn.reserved = held >= CONTROL_MAX_CONNECTIONS
                     if not over_cap:
                         self._control_conns.add(conn)
                 if over_cap:
@@ -1454,22 +1580,22 @@ class VoiceBridge:
                 line, buf = buf[:nl], buf[nl + 1 :]
                 if len(line) > CONTROL_MAX_LINE_BYTES:
                     return
-                if not conn.send(self._control_response(line)):
+                if not conn.send(self._control_response(line, conn)):
                     return
                 served += 1
-                if served >= CONTROL_MAX_REQUESTS:
+                if conn.reserved or served >= CONTROL_MAX_REQUESTS:
                     return
                 line_began = idle_since = time.monotonic()
             if len(buf) > CONTROL_MAX_LINE_BYTES:
                 return  # oversized line with no newline yet
 
-    def _control_response(self, line: bytes) -> dict:
+    def _control_response(self, line: bytes, conn: _Conn) -> dict:
         try:
-            return self._control_dispatch(line)
+            return self._control_dispatch(line, conn)
         except TimeoutError:  # a wedged lock (_bounded): answer, don't drop the connection
             return {"ok": False, "error": CONTROL_ERRORS["save"]}
 
-    def _control_dispatch(self, line: bytes) -> dict:
+    def _control_dispatch(self, line: bytes, conn: _Conn) -> dict:
         bad = {"ok": False, "error": CONTROL_BAD_REQUEST}
         try:
             msg = json.loads(line.decode("utf-8"))
@@ -1478,6 +1604,20 @@ class VoiceBridge:
         if not isinstance(msg, dict):
             return bad
         op = msg.get("op")
+        if conn.reserved and op not in _RESERVED_OPS:
+            return {"ok": False, "error": CONTROL_ERRORS["busy"]}
+        if op in _ON_OPS:
+            peer = _peer_pid(conn.sock)  # re-read at check time: must still be the accept-time pid
+            if peer is None or peer != conn.peer_pid:
+                reason = "unverified"
+            else:
+                reason = self._requester_check(peer)  # outside every lock, before any state change
+            if reason is not None:
+                if reason == "claude":
+                    self._print(f"[control] refused {op} from a Claude session (pid {conn.peer_pid})\n")
+                else:
+                    self._print(f"[control] refused {op} (requester unverified)\n")
+                return {"ok": False, "error": CONTROL_ERRORS[reason]}
         if op == "status":
             health = self.voice_state_health()
             return {

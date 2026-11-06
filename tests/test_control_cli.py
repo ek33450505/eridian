@@ -589,6 +589,10 @@ class EndToEndTest(tv.VoiceTestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def make_bridge(self, **overrides):
+        overrides.setdefault("requester_check", lambda pid: None)  # the tests themselves run under Claude
+        return super().make_bridge(**overrides)
+
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
