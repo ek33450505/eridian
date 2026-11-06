@@ -9,6 +9,7 @@ newline-delimited JSON. No real mic, speaker, ~/.eridian or `claude`.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -25,6 +26,7 @@ from eridian import voice_guard, wake
 from eridian.listener import VAD_CHUNK_BYTES, ListenerEvent
 from eridian.spoken import sanitize_terminal
 from eridian.voice import (
+    ALL_OFF_SPEECH,
     ANNOUNCE_LEVELS,
     ANNOUNCE_REPEAT_S,
     ANNOUNCE_TEMPLATES,
@@ -39,10 +41,16 @@ from eridian.voice import (
     WAKE_MISMATCH_SPEECH,
     VoiceBridge,
     _Conn,
+    _sid_hash,
     self_wake_guard_from_env,
 )
 
 FRAME = bytes(VAD_CHUNK_BYTES)
+
+
+def _tok(n: int) -> str:
+    """A valid 32-hex session token, distinct per n."""
+    return f"{n:032x}"
 
 
 def _wait_for(predicate, timeout: float = 2.0) -> bool:
@@ -190,6 +198,9 @@ class VoiceTestCase(unittest.TestCase):
         channel = _Channel(self.sock_path)
         self.addCleanup(channel.close)
         if hello:
+            # A token-less hello is never routable, so default to a per-pid token;
+            # pass session=None to get the token-less case.
+            kw.setdefault("session", _tok(kw.get("pid", 4242)))
             channel.hello(**kw)
         return channel
 
@@ -337,7 +348,16 @@ class WakeMismatchDirectTest(VoiceTestCase):
         self.clock.now += 61.0
         self.hello("hey rocky")
         self.assertEqual(self.player.enqueued, [WAKE_MISMATCH_SPEECH] * 2)
-        self.assertEqual(self.out.getvalue().count("[refused session"), 4)  # the warning is never rate limited
+        self.assertEqual(self.out.getvalue().count("[refused session"), 2)  # printed on the notice's timer
+
+    def test_refusal_print_shares_the_notice_timer(self) -> None:
+        for _ in range(8):  # a mismatched channel reconnecting every ~7 s
+            self.hello("hey rocky")
+            self.clock.now += 7.0
+        self.assertEqual(self.out.getvalue().count("[refused session"), 1)
+        self.clock.now += 61.0
+        self.hello("hey rocky")
+        self.assertEqual(self.out.getvalue().count("[refused session"), 2)
 
     def test_cycling_many_phrases_is_spoken_once(self) -> None:
         for i in range(20):
@@ -609,7 +629,7 @@ class FollowUpOriginTest(VoiceTestCase):
         """Block until the speech watcher has fully handled every reply sent so far."""
         # The sentinel is a second item behind the replies; the watcher reaches its
         # wait_idle only after finishing (and posting reply_done for) the one before.
-        self.bridge._speech_q.put((self.bridge._gen, False))
+        self.bridge._speech_q.put((self.bridge._gen, False, self.bridge._enq_seq))
         self.assertTrue(
             _wait_for(lambda: self.player.idle_returns >= self._base + self._items + 1)
         )
@@ -844,7 +864,7 @@ class FollowUpOriginTest(VoiceTestCase):
     def test_answer_after_an_announcement_opens_no_window(self) -> None:
         channel = self._begin()
         self._wake_turn(channel)
-        self.bridge._on_announce("finished")
+        self.bridge._on_announce("finished", _sid_hash(TOKEN))
         self._reply(channel)
         self._expect_no_window()
 
@@ -1256,12 +1276,14 @@ class AnnounceTest(_AnnounceBase):
         self.assertEqual(self.spoken(), [])
 
     def test_attached_hello_without_session_never_matches(self) -> None:
+        self.bridge._drop(self.conn)  # only token-less sessions remain; they are never the target
         self.hello(session=None)
         self.announce(session="")
         self.announce()
         self.assertEqual(self.spoken(), [])
 
     def test_attached_hello_with_invalid_session_never_matches(self) -> None:
+        self.bridge._drop(self.conn)  # only token-less sessions remain; they are never the target
         for bad in (123, "nothex", TOKEN.upper()):
             conn = self.hello(session=bad)
             self.assertEqual(conn.session, "")
@@ -1510,9 +1532,10 @@ class AnnounceTalkOverTest(unittest.TestCase):
             announce=ANNOUNCE_LEVELS["all"],
         )
         self.addCleanup(bridge.close)
+        bridge._attach(_FakeConn(), 1, "/w", TOKEN)
         player.busy = True
         self.assertEqual(bridge._talk_over_mode(), "turn")  # plain speech: talk-over on
-        bridge._on_announce("permission")
+        bridge._on_announce("permission", _sid_hash(TOKEN))
         self.assertEqual(bridge._talk_over_mode(), "off")
         self.assertEqual(player.stops, 0)
 
@@ -1560,25 +1583,145 @@ class SelfWakeGuardEnvTest(unittest.TestCase):
             )
 
 
+def _sid(n: int) -> str:
+    """The id sessions_status() reports for the session with token _tok(n)."""
+    return hashlib.sha256(_tok(n).encode()).hexdigest()[:12]
+
+
+def _quiet(channel: _Channel, timeout: float = 0.1) -> dict | None:
+    """Next line from a channel that should have nothing to say (None on timeout / EOF)."""
+    channel.sock.settimeout(timeout)
+    return channel.read_line()
+
+
 class MultiChannelTest(VoiceTestCase):
-    def test_second_hello_detaches_the_first_and_wins_routing(self) -> None:
+    def say(self, text: str = "which one") -> None:
+        self.wake()
+        self.speak(text)
+
+    def test_second_hello_keeps_the_first_connected_and_wins_routing(self) -> None:
         self.start()
         first = self.attach(pid=1)
         second = self.attach(pid=2)
-        self.assertEqual(first.read_line(), {"type": "detached"})
-        self.assertIsNone(first.read_line())  # closed after detached
-        self.wake()
-        self.speak("which one")
+        self.say()
         self.assertEqual(second.read_line(), {"type": "utterance", "text": "which one", "via": "wake"})
+        self.assertIsNone(_quiet(first))  # not detached, not addressed
+        self.assertEqual([s["target"] for s in self.bridge.sessions_status()], [True, False])
 
-    def test_replaced_connection_cannot_speak(self) -> None:
+    def test_older_on_session_reply_is_not_spoken(self) -> None:
         self.start()
         first = self.attach(pid=1)
         self.attach(pid=2)
-        with contextlib.suppress(OSError):
-            first.send_obj({"type": "reply", "text": "ghost."})
-        time.sleep(0.05)  # negative check: nothing should arrive
+        first.send_obj({"type": "reply", "text": "ghost."})
+        self.assertTrue(_wait_for(lambda: "[not spoken: session pid 1 is not the voice target]" in self.out.getvalue()))
         self.assertEqual(self.player.enqueued, [])
+        self.assertNotIn("ghost", self.out.getvalue())
+
+    def test_target_reply_is_spoken(self) -> None:
+        self.start()
+        self.attach(pid=1)
+        second = self.attach(pid=2)
+        second.send_obj({"type": "reply", "text": "Hello there."})
+        self.assertTrue(_wait_for(lambda: self.player.enqueued))
+
+    def test_routing_falls_back_when_the_target_is_turned_off(self) -> None:
+        self.start()
+        first = self.attach(pid=1)
+        second = self.attach(pid=2)
+        self.assertTrue(self.bridge.set_voice(_sid(2), False))
+        self.say("now first")
+        self.assertEqual(first.read_line(), {"type": "utterance", "text": "now first", "via": "wake"})
+        self.assertIsNone(_quiet(second))
+        self.assertTrue(self.bridge.set_voice(_sid(2), True))  # newest ON wins again
+        self.say("back")
+        self.assertEqual(second.read_line()["text"], "back")
+
+    def test_routing_falls_back_when_the_target_disconnects(self) -> None:
+        self.start()
+        first = self.attach(pid=1)
+        second = self.attach(pid=2)
+        second.close()
+        self.assertTrue(_wait_for(lambda: "[detached]" in self.out.getvalue()))
+        self.say("anyone")
+        self.assertEqual(first.read_line()["text"], "anyone")
+
+    def test_off_session_gets_nothing_and_cannot_speak(self) -> None:
+        self.start()
+        first = self.attach(pid=1)
+        self.bridge.set_voice(_sid(1), False)
+        first.send_obj({"type": "reply", "text": "muted ghost."})
+        self.assertTrue(_wait_for(lambda: "[not spoken: session pid 1 is off]" in self.out.getvalue()))
+        self.assertEqual(self.player.enqueued, [])
+        self.say()
+        self.assertIsNone(_quiet(first))
+
+    def test_all_off_says_so(self) -> None:
+        self.start()
+        self.attach(pid=1)
+        self.bridge.set_voice(_sid(1), False)
+        self.say()
+        self.assertEqual(self.player.enqueued, [ALL_OFF_SPEECH])
+        self.assertIn("[no session has voice on]", self.out.getvalue())
+
+    def test_no_sessions_keeps_the_no_session_speech(self) -> None:
+        self.start()
+        self.say()
+        self.assertEqual(self.player.enqueued, [NO_SESSION_SPEECH])
+
+    def test_tokenless_session_is_listed_but_never_routable(self) -> None:
+        self.start()
+        ch = self.attach(pid=3, session=None)
+        (status,) = self.bridge.sessions_status()
+        self.assertEqual((status["id"], status["pid"], status["on"], status["target"]), ("pid-3", 3, False, False))
+        self.assertFalse(self.bridge.set_voice("pid-3", True))
+        self.assertFalse(self.bridge.set_voice("3", True))
+        self.say()
+        self.assertIsNone(_quiet(ch))
+        self.assertEqual(self.player.enqueued, [ALL_OFF_SPEECH])
+
+    def test_same_token_reconnect_replaces_the_old_connection(self) -> None:
+        self.start()
+        old = self.attach(pid=1)
+        new = self.attach(pid=5, session=_tok(1))
+        self.assertEqual(old.read_line(), {"type": "detached"})
+        self.assertIsNone(old.read_line())  # closed after detached
+        self.assertEqual(len(self.bridge.sessions_status()), 1)
+        self.say()
+        self.assertEqual(new.read_line()["text"], "which one")
+
+    def test_target_change_resets_turn_flags_so_a_confirm_does_not_leak(self) -> None:
+        self.start()
+        first = self.attach(pid=1)
+        first.send_obj({"type": "reply", "text": "Say confirm walnut.", "kind": "confirm"})
+        self.assertTrue(_wait_for(lambda: self.bridge._confirm_pending))
+        self.attach(pid=2)
+        self.assertFalse(self.bridge._confirm_pending)
+        self.assertFalse(self.bridge._answered)
+        self.assertEqual(self.bridge._outstanding, 0)
+
+    def test_non_target_attach_keeps_flags(self) -> None:
+        self.start()
+        first = self.attach(pid=1)
+        first.send_obj({"type": "reply", "text": "Say confirm walnut.", "kind": "confirm"})
+        self.assertTrue(_wait_for(lambda: self.bridge._confirm_pending))
+        self.bridge.set_voice(_sid(1), True)  # no-op change: still the target
+        self.attach(pid=3, session=None)  # token-less: never becomes the target
+        self.assertTrue(self.bridge._confirm_pending)
+
+    def test_sessions_status_newest_first_without_raw_tokens(self) -> None:
+        self.start()
+        self.attach(pid=1, cwd="/a")
+        self.attach(pid=2, cwd="/b")
+        status = self.bridge.sessions_status()
+        self.assertEqual([(s["id"], s["pid"], s["cwd"]) for s in status], [(_sid(2), 2, "/b"), (_sid(1), 1, "/a")])
+        self.assertNotIn(_tok(1), repr(status))
+
+    def test_set_voice_by_pid_and_unknown_id(self) -> None:
+        self.start()
+        self.attach(pid=1)
+        self.assertFalse(self.bridge.set_voice("deadbeefdead", False))
+        self.assertTrue(self.bridge.set_voice("1", False))
+        self.assertFalse(self.bridge.sessions_status()[0]["on"])
 
     def test_disconnect_of_the_current_channel_prints_detached(self) -> None:
         self.start()
@@ -1588,6 +1731,507 @@ class MultiChannelTest(VoiceTestCase):
         self.wake()
         self.speak("anyone there")
         self.assertEqual(self.player.enqueued, [NO_SESSION_SPEECH])
+
+
+class MultiChannelAnnounceTest(VoiceTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+
+    def hook(self, session: str, event: str = "permission") -> None:
+        hook = self.connect(hello=False)
+        hook.send_obj({"type": "announce", "session": session, "event": event})
+        hook.close()
+        time.sleep(0.1)  # let the reader thread post (or not post) the event
+        self.bridge.process_frame(FRAME)
+
+    def test_only_the_routing_target_may_announce(self) -> None:
+        self.start()
+        self.attach(pid=1)
+        self.attach(pid=2)
+        self.bridge.set_voice(_sid(2), False)  # target is session 1; 2 is off
+        self.hook(_tok(2))  # off session
+        self.assertEqual(self.player.enqueued, [])
+        self.bridge.set_voice(_sid(2), True)  # 2 is the target again; 1 is a non-target ON session
+        self.hook(_tok(1))
+        self.assertEqual(self.player.enqueued, [])
+        self.hook(_tok(2))
+        self.assertEqual(self.player.enqueued, ["Claude needs your permission."])
+
+
+class VoiceStateTest(VoiceTestCase):
+    """Socket-free: sessions are registered straight through _attach with fake connections."""
+
+    socket_free = True
+
+    @property
+    def state_file(self) -> Path:
+        return self.home / "voice-state.json"
+
+    def session(self, n: int, bridge: VoiceBridge | None = None) -> _FakeConn:
+        conn = _FakeConn()
+        (bridge or self.bridge)._attach(conn, n, "/w", _tok(n))
+        return conn
+
+    def reopen(self) -> VoiceBridge:
+        self.bridge.close()
+        self.bridge = self.make_bridge()
+        self.addCleanup(self.bridge.close)
+        return self.bridge
+
+    def test_off_survives_a_new_bridge(self) -> None:
+        self.session(1)
+        self.session(2)
+        self.assertTrue(self.bridge.set_voice(_sid(1), False))
+        bridge = self.reopen()
+        self.session(1)
+        self.session(2)
+        self.assertEqual({s["pid"]: s["on"] for s in bridge.sessions_status()}, {1: False, 2: True})
+        self.assertIn("[session pid 1 has voice off]", self.out.getvalue())
+
+    def test_on_removes_the_persisted_entry(self) -> None:
+        self.session(1)
+        self.bridge.set_voice(_sid(1), False)
+        self.bridge.set_voice(_sid(1), True)
+        self.assertEqual(json.loads(self.state_file.read_text())["off"], {})
+
+    def test_file_has_sha256_keys_only_and_mode_0600(self) -> None:
+        self.session(1)
+        old_umask = os.umask(0)  # a permissive umask must not leak into the file mode
+        self.addCleanup(os.umask, old_umask)
+        self.bridge.set_voice(_sid(1), False)
+        text = self.state_file.read_text()
+        self.assertNotIn(_tok(1), text)
+        doc = json.loads(text)
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(list(doc["off"]), [hashlib.sha256(_tok(1).encode()).hexdigest()])
+        self.assertEqual(stat.S_IMODE(os.lstat(self.state_file).st_mode), 0o600)
+        self.assertEqual([p.name for p in self.home.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_off_entries_are_capped_at_64_dropping_the_oldest(self) -> None:
+        for n in range(1, 71):
+            self.session(n)
+            self.bridge.set_voice(_sid(n), False)
+        off = json.loads(self.state_file.read_text())["off"]
+        self.assertEqual(len(off), 64)
+        digest = lambda n: hashlib.sha256(_tok(n).encode()).hexdigest()
+        self.assertIn(digest(70), off)
+        self.assertNotIn(digest(1), off)
+
+    def test_unreadable_state_turns_every_session_off(self) -> None:
+        bad = {
+            "garbage": b"{not json",
+            "wrong top-level": b"[]",
+            "wrong version": json.dumps({"version": 9, "off": {}}).encode(),
+            "off not a dict": json.dumps({"version": 1, "off": []}).encode(),
+            "bad key": json.dumps({"version": 1, "off": {"abc": 1}}).encode(),
+            "non-numeric value": json.dumps({"version": 1, "off": {hashlib.sha256(b"x").hexdigest(): "yesterday"}}).encode(),
+            "bool value": json.dumps({"version": 1, "off": {hashlib.sha256(b"x").hexdigest(): True}}).encode(),
+        }
+        for label, data in bad.items():
+            with self.subTest(label):
+                self.state_file.write_bytes(data)
+                out = io.StringIO()
+                bridge = self.make_bridge(out=out)
+                self.addCleanup(bridge.close)
+                self.assertIn("voice-state.json is unreadable", out.getvalue())
+                self.session(1, bridge)
+                self.assertFalse(bridge.sessions_status()[0]["on"])
+                self.assertIsNone(bridge._conn)
+
+    def test_symlinked_state_file_is_treated_as_unreadable(self) -> None:
+        target = self.home / "elsewhere.json"
+        target.write_text(json.dumps({"version": 1, "off": {}}))
+        self.state_file.symlink_to(target)
+        bridge = self.reopen()
+        self.session(1)
+        self.assertFalse(bridge.sessions_status()[0]["on"])
+
+    def test_turning_one_on_recovers_but_keeps_the_others_off(self) -> None:
+        self.state_file.write_text("{broken")
+        bridge = self.reopen()
+        self.session(1)
+        self.session(2)
+        self.assertTrue(bridge.set_voice(_sid(1), True))
+        self.assertEqual({s["pid"]: s["on"] for s in bridge.sessions_status()}, {1: True, 2: False})
+        doc = json.loads(self.state_file.read_text())
+        self.assertEqual(list(doc["off"]), [hashlib.sha256(_tok(2).encode()).hexdigest()])
+        self.assertIs(bridge._conn is not None, True)
+
+    def test_failed_write_never_turns_a_session_on(self) -> None:
+        self.session(1)
+        self.bridge.set_voice(_sid(1), False)
+        with mock.patch("eridian.voice.paths.write_private_json", side_effect=OSError("disk full")):
+            self.assertFalse(self.bridge.set_voice(_sid(1), True))
+        self.assertFalse(self.bridge.sessions_status()[0]["on"])
+        self.assertIn("could not save voice state", self.out.getvalue())
+
+    def test_off_applies_even_when_the_write_fails(self) -> None:
+        self.session(1)
+        with mock.patch("eridian.voice.paths.write_private_json", side_effect=OSError("disk full")):
+            self.assertTrue(self.bridge.set_voice(_sid(1), False))
+        self.assertFalse(self.bridge.sessions_status()[0]["on"])
+
+    def test_other_keys_in_the_file_are_carried_through(self) -> None:
+        self.state_file.write_text(json.dumps({"version": 1, "off": {}, "muted": True}))
+        bridge = self.reopen()
+        self.session(1)
+        bridge.set_voice(_sid(1), False)
+        self.assertIs(json.loads(self.state_file.read_text())["muted"], True)
+
+    # ---- fix round ------------------------------------------------------
+
+    def test_health_reports_an_unsaved_off_and_recovers_on_the_next_write(self) -> None:
+        self.session(1)
+        self.assertEqual(self.bridge.voice_state_health(), {"state_error": False, "saved": True})
+        with mock.patch("eridian.voice.paths.write_private_json", side_effect=OSError("disk full")):
+            self.assertTrue(self.bridge.set_voice(_sid(1), False))
+        self.assertEqual(self.bridge.voice_state_health(), {"state_error": False, "saved": False})
+        self.assertTrue(self.bridge.set_voice(_sid(1), False))  # an OFF that now writes fine
+        self.assertEqual(self.bridge.voice_state_health(), {"state_error": False, "saved": True})
+
+    def test_health_reports_state_error_until_a_write_replaces_the_file(self) -> None:
+        self.state_file.write_text("{broken")
+        bridge = self.reopen()
+        self.session(1)
+        self.assertEqual(bridge.voice_state_health(), {"state_error": True, "saved": True})
+        bridge.set_voice(_sid(1), True)
+        self.assertEqual(bridge.voice_state_health(), {"state_error": False, "saved": True})
+
+    def test_off_is_applied_before_the_write_so_no_exception_can_skip_it(self) -> None:
+        self.session(1)
+        with mock.patch("eridian.voice.paths.write_private_json", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.bridge.set_voice(_sid(1), False)
+        self.assertFalse(self.bridge.sessions_status()[0]["on"])
+
+    def test_eviction_keeps_connected_sessions_and_drops_old_disconnected_ones(self) -> None:
+        digest = lambda i: hashlib.sha256(f"gone{i}".encode()).hexdigest()
+        live1 = hashlib.sha256(_tok(1).encode()).hexdigest()
+        off = {live1: 1.0}  # the live session's OFF is the OLDEST entry in the file
+        off.update({digest(i): 10.0 + i for i in range(64)})
+        self.state_file.write_text(json.dumps({"version": 1, "off": off}))
+        bridge = self.reopen()
+        self.session(1)
+        self.session(2)
+        bridge.set_voice(_sid(2), False)
+        kept = json.loads(self.state_file.read_text())["off"]
+        self.assertEqual(len(kept), 64)
+        self.assertIn(live1, kept)
+        self.assertIn(hashlib.sha256(_tok(2).encode()).hexdigest(), kept)
+        self.assertNotIn(digest(0), kept)  # the oldest disconnected entry went
+        self.assertNotIn(digest(1), kept)
+
+    def _wrap_writes(self, bridge: VoiceBridge, hook) -> list[int]:
+        """Call hook(call_number) just before each real state write; returns the call counter."""
+        calls: list[int] = []
+        real = bridge._write_state
+
+        def write(*a, **kw):
+            calls.append(len(calls) + 1)
+            hook(len(calls))
+            return real(*a, **kw)
+
+        bridge._write_state = write
+        return calls
+
+    def test_recovery_write_holds_no_lock(self) -> None:
+        self.state_file.write_text("{broken")
+        bridge = self.reopen()
+        self.session(1)
+        held: list[bool] = []
+        self._wrap_writes(bridge, lambda n: held.append(bridge._lock.locked()))
+        self.assertTrue(bridge.set_voice(_sid(1), True))
+        self.assertEqual(held, [False])
+
+    def test_session_connecting_mid_recovery_write_still_ends_up_off(self) -> None:
+        self.state_file.write_text("{broken")
+        bridge = self.reopen()
+        self.session(1)
+        self.session(2)
+        calls = self._wrap_writes(bridge, lambda n: self.session(3, bridge) if n == 1 else None)
+        self.assertTrue(bridge.set_voice(_sid(1), True))
+        self.assertEqual(len(calls), 2)  # redone because the first write missed session 3
+        self.assertEqual({s["pid"]: s["on"] for s in bridge.sessions_status()}, {1: True, 2: False, 3: False})
+        self.assertFalse(bridge.voice_state_health()["state_error"])
+        off = json.loads(self.state_file.read_text())["off"]
+        self.assertIn(hashlib.sha256(_tok(3).encode()).hexdigest(), off)
+
+    def test_recovery_that_keeps_racing_fails_closed(self) -> None:
+        self.state_file.write_text("{broken")
+        bridge = self.reopen()
+        self.session(1)
+        calls = self._wrap_writes(bridge, lambda n: self.session(10 + n, bridge))
+        self.assertFalse(bridge.set_voice(_sid(1), True))
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(bridge.voice_state_health()["state_error"])
+        self.assertTrue(all(not s["on"] for s in bridge.sessions_status()))
+
+    def test_close_forgets_the_sessions(self) -> None:
+        self.session(1)
+        self.bridge.close()
+        self.assertEqual(self.bridge.sessions_status(), [])
+
+    def test_short_writes_still_produce_the_whole_file(self) -> None:
+        self.session(1)
+        real_write = os.write
+        with mock.patch("eridian.paths.os.write", side_effect=lambda fd, data: real_write(fd, bytes(data[:3]))):
+            self.bridge.set_voice(_sid(1), False)
+        self.assertEqual(
+            list(json.loads(self.state_file.read_text())["off"]),
+            [hashlib.sha256(_tok(1).encode()).hexdigest()],
+        )
+
+    def test_a_fifo_at_the_state_path_is_unreadable_and_does_not_hang(self) -> None:
+        os.mkfifo(self.state_file)
+        made: list[VoiceBridge] = []
+        worker = threading.Thread(target=lambda: made.append(self.make_bridge()), daemon=True)
+        worker.start()
+        worker.join(3.0)
+        self.assertFalse(worker.is_alive(), "opening the FIFO blocked the constructor")
+        self.addCleanup(made[0].close)
+        self.session(1, made[0])
+        self.assertFalse(made[0].sessions_status()[0]["on"])
+        self.assertTrue(made[0].voice_state_health()["state_error"])
+
+
+class ReplyRaceTest(VoiceTestCase):
+    """Socket-free: a session is turned off while its reply is between the two checks."""
+
+    socket_free = True
+
+    def session(self, n: int) -> _FakeConn:
+        conn = _FakeConn()
+        self.bridge._attach(conn, n, "/w", _tok(n))
+        return conn
+
+    def test_off_between_the_checks_speaks_nothing_and_touches_no_flags(self) -> None:
+        self.session(1)
+        newer = self.session(2)
+        real_feed = self.bridge._chunker.feed
+
+        def feed(text: str):
+            out = real_feed(text)
+            self.bridge.set_voice(_sid(2), False)  # lands after the first check
+            self.bridge._outstanding, self.bridge._reply_origin = 3, "wake"  # session 1's turn state
+            return out
+
+        with mock.patch.object(self.bridge._chunker, "feed", side_effect=feed):
+            self.bridge._on_reply(newer, "Say confirm walnut. Then wait.", "confirm")
+        self.assertEqual(self.player.enqueued, [])
+        self.assertFalse(self.bridge._confirm_pending)
+        self.assertFalse(self.bridge._answered)
+        self.assertEqual((self.bridge._outstanding, self.bridge._reply_origin), (3, "wake"))
+        self.assertIn("[not spoken: session pid 2 is off]", self.out.getvalue())
+
+    def test_off_cuts_speech_owned_by_that_session_only(self) -> None:
+        self.session(1)
+        newer = self.session(2)
+        self.bridge._on_reply(newer, "One. Two. Three. Four. Five.")
+        self.assertGreaterEqual(len(self.player.enqueued), 5)
+        gen = self.bridge._gen
+        self.bridge.set_voice(_sid(1), False)  # unrelated session
+        self.assertEqual(self.player.stops, 0)
+        self.bridge.set_voice(_sid(2), False)  # the speaker
+        self.assertEqual(self.player.stops, 1)
+        self.assertGreater(self.bridge._gen, gen)
+
+    def test_retargeting_does_not_cut_speech(self) -> None:
+        older = self.session(1)
+        self.bridge._on_reply(older, "One. Two. Three.")
+        self.session(2)  # a newer session takes over routing
+        self.assertEqual(self.player.stops, 0)
+        self.bridge._drop(older)  # the speaker disconnects
+        self.assertEqual(self.player.stops, 0)
+
+
+class NoHelloTimeoutTest(VoiceTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.bridge.close()
+        self.bridge = self.make_bridge(no_hello_idle_s=0.3)
+        self.addCleanup(self.bridge.close)
+
+    def test_connection_that_never_says_hello_is_closed(self) -> None:
+        self.start()
+        idle = self.connect(hello=False)
+        idle.sock.settimeout(3.0)
+        self.assertEqual(idle.sock.recv(16), b"")  # EOF, not a timeout
+
+    def test_hello_connection_is_exempt(self) -> None:
+        self.start()
+        channel = self.attach(pid=1)
+        time.sleep(0.8)  # well past the idle limit
+        self.wake()
+        self.speak("still here")
+        self.assertEqual(channel.read_line()["text"], "still here")
+
+    def test_blank_lines_do_not_extend_the_deadline(self) -> None:
+        self.start()
+        dribble = self.connect(hello=False)
+        dribble.sock.settimeout(0.1)
+        closed = False
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and not closed:
+            try:
+                dribble.sock.sendall(b"\n")
+                closed = dribble.sock.recv(16) == b""
+            except socket.timeout:
+                pass
+            except OSError:
+                closed = True
+        self.assertTrue(closed, "a stream of blank lines kept a hello-less connection open")
+
+    def test_second_hello_on_a_connection_is_ignored(self) -> None:
+        self.start()
+        channel = self.attach(pid=1)
+        channel.hello(pid=9, session=_tok(9))
+        self.assertTrue(_wait_for(lambda: "[ignored a second hello from session pid 1]" in self.out.getvalue()))
+        self.assertEqual([(s["pid"], s["id"]) for s in self.bridge.sessions_status()], [(1, _sid(1))])
+
+
+class SpeakerSetTest(VoiceTestCase):
+    """Which sessions' speech is queued or playing, and when an OFF cuts it."""
+
+    socket_free = True
+
+    def session(self, n: int, bridge: VoiceBridge | None = None) -> _FakeConn:
+        conn = _FakeConn()
+        (bridge or self.bridge)._attach(conn, n, "/w", _tok(n))
+        return conn
+
+    def test_settle_clears_only_when_no_later_enqueue_happened(self) -> None:
+        b = self.bridge
+        with b._lock:
+            first = b._note_enqueue_locked("a" * 64)
+            second = b._note_enqueue_locked("b" * 64)
+        b._settle(first)  # the player went idle for item 1, but item 2 was enqueued after it
+        self.assertEqual(b._speakers, {"a" * 64, "b" * 64})
+        b._settle(second)
+        self.assertEqual(b._speakers, set())
+
+    def test_announce_turned_off_before_the_drain_is_not_spoken(self) -> None:
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+        self.player.stops = 0
+        self.session(1)
+        self.bridge._handle_line(
+            _FakeConn(), json.dumps({"type": "announce", "session": _tok(1), "event": "permission"}).encode()
+        )
+        self.bridge.set_voice(_sid(1), False)  # lands while the announce waits in the control queue
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, [])
+        self.assertIn("[announce skipped: permission (voice off)]", self.out.getvalue())
+
+    def test_off_landing_after_the_early_checks_still_blocks_the_announce(self) -> None:
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+        self.session(1)
+        real_clock, fired = self.bridge._clock, []
+
+        def clock() -> float:
+            if not fired:  # first clock read is after every early check, before the enqueue
+                fired.append(1)
+                self.bridge.set_voice(_sid(1), False)
+            return real_clock()
+
+        self.bridge._clock = clock
+        self.bridge._on_announce("permission", _sid_hash(_tok(1)))
+        self.assertEqual(self.player.enqueued, [])
+        self.assertEqual(self.bridge._speakers, set())
+        self.assertIn("[announce skipped: permission (voice off)]", self.out.getvalue())
+
+    def test_off_drops_the_current_targets_queued_reply_too(self) -> None:
+        older = self.session(1)
+        self.bridge._on_reply(older, "One. Two.")
+        newer = self.session(2)
+        self.bridge._on_reply(newer, "Three. Four.")  # the target's reply, queued behind A's
+        self.bridge.set_voice(_sid(1), False)
+        self.assertEqual(self.player.stops, 1)  # stop() empties the one player queue
+        self.assertEqual(self.bridge._speakers, set())
+
+    def test_own_notice_followed_by_an_off_does_not_cut(self) -> None:
+        self.session(1)
+        self.bridge.set_voice(_sid(1), False)
+        self.bridge._on_listener_event(ListenerEvent(kind="utterance", text="anyone there"))
+        self.assertEqual(self.player.enqueued, [ALL_OFF_SPEECH])
+        self.player.busy = True  # the notice is playing; no session's speech is
+        self.session(2)
+        self.bridge.set_voice(_sid(2), False)
+        self.assertEqual(self.player.stops, 0)
+
+    def test_spoken_announce_joins_the_speakers_so_off_cuts_it(self) -> None:
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+        self.player.stops = 0
+        self.session(1)
+        self.bridge._handle_line(
+            _FakeConn(), json.dumps({"type": "announce", "session": _tok(1), "event": "permission"}).encode()
+        )
+        self.bridge.process_frame(FRAME)
+        self.assertEqual(self.player.enqueued, ["Claude needs your permission."])
+        self.bridge.set_voice(_sid(1), False)
+        self.assertEqual(self.player.stops, 1)
+
+
+class SpeakerCutTest(VoiceTestCase):
+    """Real sockets and the speech watcher; the player stays 'playing' until a test frees it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bridge.close()
+        self.bridge = self.make_bridge(announce=ANNOUNCE_LEVELS["all"])
+        self.addCleanup(self.bridge.close)
+        self.addCleanup(self.player.idle.set)  # runs before close: lets the watcher finish
+        self.player.stops = 0  # closing the first bridge stopped the shared fake player
+        self.start()
+
+    def say_reply(self, channel: _Channel, text: str = "Speaking now.") -> None:
+        before = len(self.player.enqueued)
+        channel.send_obj({"type": "reply", "text": text})
+        self.assertTrue(_wait_for(lambda: len(self.player.enqueued) > before))
+
+    def test_off_after_a_newer_session_also_spoke_still_cuts(self) -> None:
+        self.player.idle.clear()
+        a = self.attach(pid=1)
+        self.say_reply(a)
+        b = self.attach(pid=2)
+        self.say_reply(b)
+        self.bridge.set_voice(_sid(1), False)
+        self.assertEqual(self.player.stops, 1)
+
+    def test_off_after_the_speaker_reconnected_with_the_same_token_still_cuts(self) -> None:
+        self.player.idle.clear()
+        a = self.attach(pid=1)
+        self.say_reply(a)
+        self.attach(pid=5, session=_tok(1))
+        self.bridge.set_voice(_sid(1), False)
+        self.assertEqual(self.player.stops, 1)
+
+    def test_off_after_the_speech_finished_and_something_else_played_does_not_cut(self) -> None:
+        a = self.attach(pid=1)
+        self.say_reply(a)  # the player is idle, so the watcher settles at once
+        self.assertTrue(_wait_for(lambda: not self.bridge._speakers))
+        self.attach(pid=2)
+        hook = self.connect(hello=False)
+        hook.send_obj({"type": "announce", "session": _tok(2), "event": "permission"})
+        hook.close()
+        self.assertTrue(self.pump_until(lambda: len(self.player.enqueued) == 2))
+        self.bridge.set_voice(_sid(1), False)
+        self.assertEqual(self.player.stops, 0)
+
+    def test_off_on_a_session_that_never_spoke_does_not_cut(self) -> None:
+        self.player.idle.clear()
+        a = self.attach(pid=1)
+        self.say_reply(a)
+        self.attach(pid=3)
+        self.bridge.set_voice(_sid(3), False)
+        self.assertEqual(self.player.stops, 0)
 
 
 class AnnounceSocketTest(VoiceTestCase):
@@ -1834,7 +2478,7 @@ class EchoTextGuardTest(VoiceTestCase):
         self.sent: list[dict] = []
         conn = _Conn(mock.Mock())
         conn.send = lambda obj: self.sent.append(obj) or True
-        self.bridge._conn = conn
+        self.bridge._attach(conn, 1, "/w", TOKEN)
         self.bridge._handle_line(
             conn, json.dumps({"type": "reply", "text": self.REPLY}).encode("utf-8")
         )
@@ -1892,7 +2536,7 @@ class EchoTextGuardTest(VoiceTestCase):
 
     def test_announcement_text_counts(self) -> None:
         self.bridge._spoken_log.clear()
-        self.bridge._on_announce("finished")
+        self.bridge._on_announce("finished", _sid_hash(TOKEN))
         spoken = self.player.enqueued[-1]
         self.turn("talk_over", spoken)
         self.assertEqual(self.sent, [])
