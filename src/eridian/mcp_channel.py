@@ -22,7 +22,7 @@ Socket protocol (newline-delimited UTF-8 JSON, lines <= 64 KB):
   channel -> voice  {"type":"reply","text":"...","kind":"ack|answer|confirm"[,"check":"..."]}
                     (`check`, confirm only: what the voice guard blocked, spoken in
                     eridian's own voice after the reply)
-  voice -> channel  {"type":"detached"}  (a newer session won; stop retrying)
+  voice -> channel  {"type":"detached"}  (a newer connection for this same session replaced this one; stop retrying)
 
 Test seams: ChannelServer takes its stdin/stdout streams, socket path and
 reconnect interval as constructor args, so tests drive it with pipes and a
@@ -383,7 +383,7 @@ class ChannelServer:
                         self._log(f"voice turn refused: {refusal}")
                         self._send_voice({"type": "reply", "text": refusal, "kind": "ack"})
         elif kind == "detached":
-            self._log("detached: a newer session attached")
+            self._log("detached: replaced by a newer connection for this session")
             self._detached.set()
 
     def _admit_voice(self, text: str, can_grant: bool = False) -> str | None:

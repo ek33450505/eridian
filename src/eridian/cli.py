@@ -16,10 +16,11 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from . import paths, persona, wake
+from . import control, paths, persona, wake
 
 
 _WAKE_CUE = "/System/Library/Sounds/Tink.aiff"
@@ -125,21 +126,42 @@ class AudioIO:
         self.talk_over = talk_over
         self.engine = engine
         self.voice_label = voice_label
+        self._mic: object | None = None  # the no-AEC MicSource, created lazily by frames()
+
+    def _source(self):
+        """The active frame source: the AEC engine, or the plain mic when there is none."""
+        if self.engine is not None:
+            return self.engine
+        if self._mic is None:
+            from . import audio
+
+            self._mic = audio.MicSource()
+        return self._mic
 
     def frames(self):
-        if self.engine is not None:
-            return self.engine.frames()
-        from . import audio
+        return self._source().frames()
 
-        return audio.frame_source()
-
-    def start(self) -> None:
+    def start(self, input_enabled: bool = True) -> None:
+        # The plain mic has no separate start: frames() opens it on first use.
         if self.engine is not None:
-            self.engine.start()
+            self.engine.start(input_enabled=input_enabled)
+        else:
+            self._source().start(input_enabled=input_enabled)
+
+    def set_input_enabled(self, enabled: bool) -> None:
+        """Open or close the mic device; frames keep flowing (silent) while it is closed."""
+        self._source().set_input_enabled(enabled)
+
+    @property
+    def stalled(self) -> bool:
+        """True while the active source yields silence because the open mic delivers nothing."""
+        return bool(self._source().stalled)
 
     def close(self) -> None:
         if self.engine is not None:
             self.engine.close()
+        elif self._mic is not None:
+            self._mic.close()
 
 
 def _say_voices() -> tuple[str, str]:
@@ -719,6 +741,197 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+_SESSION_ID_RE = re.compile(r"^(?:[0-9a-f]{12}|[0-9]{1,10}|pid-[0-9]{1,10})$")
+_NOT_SAVED_WARNING = (
+    "Voice settings aren't saved; an off session or mute may turn back on if attach restarts."
+)
+_STATE_ERROR_NOTE = (
+    "Saved voice settings were unreadable, so every session is off and the mic is "
+    "muted until you turn one on."
+)
+_UNMUTE_POLLS = 5
+_UNMUTE_POLL_S = 0.2
+_sleep = time.sleep  # seam: tests don't wait
+
+
+_PS_BUDGET_S = 3.0  # total, for the whole ancestry walk
+
+
+def _ppid_of(pid: int, deadline: float) -> int | None:
+    """Parent pid of `pid` via ps, or None when it can't be read in time."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return None
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=left, check=False,
+        ).stdout.strip()
+        return int(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _own_ancestors(deadline: float) -> list[int]:
+    """This process's ancestors, nearest first."""
+    chain: list[int] = []
+    pid = os.getppid()
+    while pid > 1 and pid not in chain and len(chain) < 64:
+        chain.append(pid)
+        nxt = _ppid_of(pid, deadline)
+        if nxt is None:
+            break
+        pid = nxt
+    return chain
+
+
+def _this_session(sessions: list) -> list[dict]:
+    """Sessions whose channel server is a child of our nearest matching ancestor."""
+    deadline = time.monotonic() + _PS_BUDGET_S
+    by_parent: dict[int, list[dict]] = {}
+    for sess in sessions:
+        if not isinstance(sess, dict):
+            continue
+        pid = sess.get("pid")
+        if not isinstance(pid, int):
+            continue
+        ppid = _ppid_of(pid, deadline)
+        if ppid is None:  # budget spent or ps failed: can't rule this session in or out
+            return []
+        by_parent.setdefault(ppid, []).append(sess)
+    for anc in _own_ancestors(deadline):
+        if anc in by_parent:
+            return by_parent[anc]
+    return []
+
+
+def _ctl_fail(message: str, rc: int = 1) -> int:
+    print(f"eridian: {message[:1].upper()}{message[1:]}", file=sys.stderr)
+    return rc
+
+
+def _ctl_status() -> dict:
+    reply = control.request({"op": "status"})
+    if reply.get("ok") is not True or not isinstance(reply.get("sessions"), list):
+        raise control.ControlError("Attach sent an unexpected status reply")
+    return reply
+
+
+def _warn_if_unsaved() -> None:
+    try:
+        reply = _ctl_status()
+    except control.ControlError:
+        return
+    if reply.get("saved") is not True:
+        print(f"eridian: warning: {_NOT_SAVED_WARNING}", file=sys.stderr)
+
+
+def _cmd_voice_status(args: argparse.Namespace) -> int:
+    del args
+    try:
+        reply = _ctl_status()
+    except control.ControlError as exc:
+        return _ctl_fail(str(exc))
+    print(f"muted: {'no' if reply.get('muted') is False else 'yes'}")
+    sessions = [s for s in reply["sessions"] if isinstance(s, dict)]
+    if not sessions:
+        print("No Claude sessions are attached.")
+    for sess in sessions:
+        print(
+            f"{'*' if sess.get('target') is True else ' '} {'on ' if sess.get('on') is True else 'off'} "
+            f"{control.clean(sess.get('id', '?'), 16)} pid {control.clean(sess.get('pid', '?'), 12)} "
+            f"{control.clean(sess.get('cwd', ''))}"
+        )
+    if reply.get("saved") is not True:
+        print(_NOT_SAVED_WARNING)
+    if reply.get("state_error") is not False:
+        print(_STATE_ERROR_NOTE)
+    return 0
+
+
+def _cmd_voice_set(args: argparse.Namespace, on: bool) -> int:
+    wanted = args.session
+    if wanted is not None and not _SESSION_ID_RE.fullmatch(wanted):
+        return _ctl_fail("Bad session id; use an id or pid from `eridian voice status`", 2)
+    try:
+        if wanted is None:
+            found = _this_session(_ctl_status()["sessions"])
+            if len(found) > 1:
+                print(
+                    "eridian: Several sessions match; pass --session "
+                    "(see eridian voice status)",
+                    file=sys.stderr,
+                )
+                return 2
+            sess = found[0] if found else None
+            if sess is None or not isinstance(sess.get("id"), str):
+                print(
+                    "eridian: Couldn't tell which session this is; pass --session "
+                    "(see eridian voice status)",
+                    file=sys.stderr,
+                )
+                return 2
+            wanted = sess["id"]
+            label = f"{control.clean(wanted, 16)} (pid {control.clean(sess.get('pid'), 12)})"
+        else:
+            label = control.clean(wanted, 16)
+        reply = control.request({"op": "voice_on" if on else "voice_off", "session": wanted})
+    except control.ControlError as exc:
+        return _ctl_fail(str(exc))
+    if reply.get("ok") is not True:
+        err = control.clean(reply.get("error", "request failed"))
+        return _ctl_fail(err, 2 if reply.get("error") == "no such session" else 1)
+    print(f"Voice {'on' if on else 'off'} for session {label}.")
+    if not on:
+        _warn_if_unsaved()
+    return 0
+
+
+def _cmd_voice_on(args: argparse.Namespace) -> int:
+    return _cmd_voice_set(args, True)
+
+
+def _cmd_voice_off(args: argparse.Namespace) -> int:
+    return _cmd_voice_set(args, False)
+
+
+def _cmd_mute(args: argparse.Namespace) -> int:
+    del args
+    try:
+        reply = control.request({"op": "mute"})
+    except control.ControlError as exc:
+        return _ctl_fail(str(exc))
+    if reply.get("ok") is not True:
+        return _ctl_fail(control.clean(reply.get("error", "request failed")))
+    print("Muted.")
+    _warn_if_unsaved()
+    return 0
+
+
+def _cmd_unmute(args: argparse.Namespace) -> int:
+    del args
+    try:
+        reply = control.request({"op": "unmute"})
+        if reply.get("ok") is not True:
+            return _ctl_fail(control.clean(reply.get("error", "request failed")))
+        # ok only means accepted: the mic reopens on the next frame and may fail and
+        # re-mute, so watch status for the whole window, not just until it first reads unmuted.
+        muted = False
+        for _ in range(_UNMUTE_POLLS):
+            _sleep(_UNMUTE_POLL_S)
+            muted = _ctl_status().get("muted") is not False  # fail safe: only a real False is unmuted
+            if muted:
+                break
+    except control.ControlError as exc:
+        return _ctl_fail(str(exc))
+    if muted:
+        return _ctl_fail(
+            "Muted again: the mic may have failed to reopen, or something muted it"
+        )
+    print("Unmuted.")
+    return 0
+
+
 def _cmd_shell_init(args: argparse.Namespace) -> int:
     del args
     exe = Path(sys.argv[0]).absolute()
@@ -1047,6 +1260,27 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="stop the background `eridian attach`").set_defaults(
         func=_cmd_stop
     )
+
+    voice_parser = sub.add_parser(
+        "voice", help="show or change per-session voice (talks to a running `eridian attach`)"
+    )
+    voice_sub = voice_parser.add_subparsers(dest="voice_command", required=True)
+    voice_sub.add_parser(
+        "status", help="show whether the mic is muted and which sessions have voice on"
+    ).set_defaults(func=_cmd_voice_status)
+    for name, func, what in (("on", _cmd_voice_on, "on"), ("off", _cmd_voice_off, "off")):
+        p = voice_sub.add_parser(name, help=f"turn voice {what} for a session")
+        p.add_argument(
+            "--session",
+            metavar="ID",
+            help="session id or pid from `eridian voice status` (default: the session "
+            "this command is run from)",
+        )
+        p.set_defaults(func=func)
+    sub.add_parser("mute", help="mute the mic (replies still play)").set_defaults(
+        func=_cmd_mute
+    )
+    sub.add_parser("unmute", help="reopen the mic").set_defaults(func=_cmd_unmute)
 
     migrate_parser = sub.add_parser(
         "migrate",

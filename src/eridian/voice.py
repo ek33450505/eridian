@@ -19,18 +19,150 @@ line drops that connection). The socket is `paths.voice_socket_path()`, 0600:
     voice -> channel   {"type":"utterance","text":"...","via":"wake"|"wake_barge_in"|"follow_up"|"talk_over"}
                        (`via` = what opened the turn; the channel lets only "wake"
                         satisfy a confirm phrase)
-                       {"type":"detached"}   (sent to the OLD connection when a
-                                              newer channel says hello; "latest
-                                              session wins", then it is closed)
+                       {"type":"detached"}   (sent to an OLD connection only when a
+                                              newer hello carries the SAME session
+                                              token, i.e. that session reconnected;
+                                              then the old one is closed)
 
     hook -> voice      {"type":"announce","session":"<32 hex>","event":"<event>"}
                        (typically a one-shot connection with NO hello: it never
                         attaches or detaches anything)
 
+Multi-attach and per-session voice (on/off): every hello'd connection stays
+connected; a new hello detaches nobody (except a same-token reconnect, above).
+Sessions are keyed by the hello `session` token and start ON. Wake / follow-up /
+talk-over utterances go to the ROUTING TARGET: the most recently attached session
+that is ON ("latest ON wins"). Older ON sessions stay connected but hear nothing
+until the newer one is turned off or disconnects, then routing falls back to the
+next most recent ON session. An OFF session is fully silent: it gets no
+utterances, its replies are not spoken (`[not spoken: ...]` is printed), and its
+announces are ignored. A reply from an ON session that is not the target is not
+spoken either. A hello with no / invalid token is tracked (listable) but is never
+routable, as if permanently OFF. Whenever the target changes the per-session turn
+flags (_answered, _confirm_pending, _outstanding, _reply_origin) are reset, so a
+pending confirmation never carries to another session. With no session at all the
+bridge says NO_SESSION_SPEECH; with sessions but none ON, ALL_OFF_SPEECH.
+
+OFF is persisted in `paths.voice_state_path()` (voice-state.json, 0600, written
+atomically) keyed by sha256(token), never the raw token, capped at 64 entries.
+A missing file means nothing is off; a corrupt / unreadable / wrong-shape file
+fails toward not listening: EVERY session is treated as OFF (`state_error`)
+until a write replaces the file. The in-process API for the control surface is
+`sessions_status()`, `set_voice()`, `set_muted()` / `is_muted()` and
+`voice_state_health()`.
+
+State file v2: `{"version":2, "off":{sha256hex: ts}, "muted":bool}`. A v1 file (no
+"muted") loads as unmuted; any other version, or a non-bool "muted", is corrupt.
+
+Mute is GLOBAL and REAL: while muted, `process_frame` still drains the control
+queue (replies and announces keep playing) but never hands a frame to the
+listener, so no wake word, VAD or STT ever runs. At each mute / unmute transition
+the main thread calls `Listener.cancel()`: a turn in progress when mute lands is
+discarded, so nothing captured before the mute is transcribed or sent, and unmute
+starts from fresh detectors. While muted the follow-up window does not open. Mute
+fails toward not listening: unreadable / corrupt state starts MUTED (and every
+session OFF); a mute is applied in memory before its write is tried (a failed
+write leaves it muted, `saved` False); an unmute needs a successful write first
+(else nothing changes and it returns False); an unmute during `state_error` uses
+the same recovery write as voice ON, which records every connected tokened
+session OFF, so recovering by unmuting never makes an OFF session audible. One
+transaction (`_change_state`) serves set_voice and set_muted. A MUTE during
+`state_error` also performs that recovery write (every connected tokened session
+recorded OFF, `muted: true`, `state_error` cleared): fail-closed, intended.
+The cancel is driven by a mute-change counter, so a quick mute->unmute between two
+frames still cancels. The same counter gives each turn a MUTE EPOCH (`_turn_mute_gen`,
+recorded when `wake` / `talk_over` / `follow_up` opens it; those events do nothing while
+muted: no cue, no barge-in, no turn). `_turn_muted_locked()` is the one rule for an
+utterance: muted now, or any mute change since the turn opened. The utterance branch
+decides everything first (echo drop, strip_echo, too-soon hold, outgoing text) with no
+prints or enqueues; then, under the session lock, applies that rule and bumps the turn
+counters; then `conn.send` is the very next statement, with no I/O between. Only after the
+send returns does any transcript text print. A muted turn prints just `[muted: not sent]`,
+touches no turn flags and sends nothing; the non-send outcomes (echo drop, own-reply,
+too-soon hold) apply the same rule before they print. The one remaining window: a mute
+landing between the in-lock check and the `conn.send` call (a few bytecodes, no I/O), and a
+frame already inside the listener; the next frame is dropped and the listener cancelled. For
+a non-send outcome, audio captured BEFORE the mute may print in the bytecodes after its check;
+nothing is sent and no post-mute audio is involved. The player's busy state keeps being
+tracked while muted, so the self-wake guard survives a mute. If the control accept loop gives
+up (ACCEPT_MAX_ERRORS consecutive failures) the mute switch is gone, so the bridge mutes
+itself and prints `[control socket failed; muted]`.
+
+The mic DEVICE is closed while muted (`mic_control`, wired by run_attach to
+`AudioIO.set_input_enabled`) so the OS mic indicator goes off; attach also starts
+with the device closed when the persisted state is muted. Frame-dropping stays
+THE guarantee: the device call is made on the main thread, after the listener
+cancel and with no lock held, and the audio engine keeps yielding (silent) frames
+while closed, since the bridge only processes control requests when a frame
+arrives. A failed close prints `[mic did not close; frames are still dropped]` and
+stays muted. An unmute reopens the device BEFORE the listener resumes; if the
+reopen fails the bridge re-mutes (persisted) and prints `[mic failed to reopen;
+muted]`, so it never reports unmuted with a dead mic. If even that re-mute raises (a wedged
+lock) the mute is forced in memory and `[mic failed to reopen; muted (not saved)]` printed;
+nothing raises out of the frame loop. An `unmute` control reply of ok means the state change
+was ACCEPTED: the device is reopened on the next frame and may fail and re-mute, so `status`
+is authoritative.
+
+Control socket (`paths.control_socket_path()`, 0600, bound like voice.sock). It is
+the mute switch, so `start()` FAILS (and releases voice.sock) if it cannot be
+bound. Newline-delimited JSON, one response line per request line, several
+requests per connection allowed; caps: CONTROL_MAX_CONNECTIONS connections plus one reserved slot (a connection past the cap serves one
+mute / voice_off / status request and closes, so a flood cannot block mute),
+CONTROL_MAX_LINE_BYTES per line (longer drops the connection); a request line must
+complete within CONTROL_IDLE_S of its first byte, idle between requests is capped at
+CONTROL_IDLE_S, a connection lives at most CONTROL_LIFETIME_S and serves at most
+CONTROL_MAX_REQUESTS requests (so a slow drip cannot hold a slot). A session `cwd`
+in status is stripped of control characters and cut to CONTROL_CWD_CHARS:
+
+    {"op":"status"}  -> {"ok":true,"muted":b,"state_error":b,"saved":b,"sessions":[...]}
+    {"op":"voice_on"|"voice_off","session":"<id or pid>"} | {"op":"mute"} | {"op":"unmute"}
+                     -> {"ok":true} | {"ok":false,"error":"<fixed text>"}
+    anything else (unknown op, bad JSON, wrong types) -> {"ok":false,"error":"bad request"}
+
+Requester check (layer 2; voice_guard refusing the commands in Claude's Bash is layer 1).
+`voice_on` and `unmute` -- the ON-direction ops -- are refused, before any state change,
+when the requesting process descends from a Claude Code process; `mute`, `voice_off` and
+`status` are never checked. The requester is the socket peer pid (LOCAL_PEERPID /
+SO_PEERCRED, read at accept), never anything in the request. `requester_refusal` walks
+the ancestry with `/bin/ps` and refuses if any process (including the peer) is `claude`,
+`claude.exe` or lives under `@anthropic-ai/claude-code`. It FAILS CLOSED: an unreadable
+peer pid, a ps failure or timeout, an exhausted deadline, or a chain longer than
+REQUESTER_MAX_STEPS all refuse. A chain that cleanly reaches pid 1 is allowed (a user's
+terminal). `/bin/ps` missing (some Linux layouts) fails closed, so ON ops are refused there.
+Detection looks at both comm and args. The peer pid is re-read at check time and must
+equal the accept-time pid. Replies: "refused: requested from a Claude session" and
+"refused: could not verify the requester". Limit: best effort -- a process detached and
+reparented to launchd escapes it. The check is injectable (`requester_check`) for tests
+only; there is no env var or global switch.
+
+An `unmute` reply of ok means the state change was accepted. The mic device is reopened on
+the next audio frame and that may fail and re-mute, so `status` is authoritative.
+
+Errors are fixed text (no such session / can't turn on a session without a token /
+could not save) and never echo the request. Nothing on this socket can create an
+utterance, open a listening turn or grant anything: it only toggles state and
+reports it. Each state change prints a terminal line.
+
+Races, stated rather than closed: no lock is held across socket I/O, so an
+utterance whose send began while its session was ON can still reach it if an OFF
+lands in that microsecond window. Speech already playing is cut when a session
+that has speech queued or playing is turned OFF, because OFF means silent: the
+bridge keeps `_speakers`, the hashes of every session that enqueued speech
+(replies, and announces it triggered) since the player last went idle after the
+latest such enqueue. OFF on a member bumps the generation and stops the player
+(which empties the single player queue, so a reply the CURRENT target queued
+behind it is dropped as well); OFF on any other session does not.
+A reply the NEW target enqueues in the microsecond between the OFF commit and the
+stop() may be cut too; that is accepted. Speech is NOT cut when routing merely
+moves on (a newer session attached, or the speaking session disconnected) --
+only an explicit OFF cuts. A connection that has not said a valid hello is closed
+NO_HELLO_IDLE_S after accept, a hard deadline no other line resets (hello'd
+connections are exempt); a second hello on a connection is ignored.
+
 Announce: a hook can make the bridge speak a short FIXED sentence
 (ANNOUNCE_TEMPLATES, e.g. "Claude finished.") without a reply. The line is
 honoured only if `session` equals (hmac.compare_digest) the `session` the
-currently attached channel sent in its hello, and `event` is enabled by the
+current routing target sent in its hello, and `event` is enabled by the
 `--announce` level; anything else is silently ignored. Nothing from the message
 is ever spoken or printed except the validated event key. The reader thread only
 posts `("announce", event)` to the control queue; the main thread decides:
@@ -53,7 +185,7 @@ unprompted answer, one landing after an announcement or barge-in, or one with
 no known origin opens none, so ambient audio can never chain windows. The
 protocol carries no turn ids, so the bridge grants a window only when exactly
 one utterance is outstanding (sent, not yet answered; reset by "finished", a
-detach or a new hello) and the credit is under REPLY_WINDOW_CREDIT_TTL_S old;
+routing-target change) and the credit is under REPLY_WINDOW_CREDIT_TTL_S old;
 any ambiguity fails closed (no window). A reset on Stop can let the answer to a
 still-queued follow_up spend a wake credit sent right after it (one short
 window, no chaining, no grant); closing that needs turn ids in the protocol. `ack` (an
@@ -115,6 +247,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import hashlib
 import hmac
 import json
 import math
@@ -125,8 +258,12 @@ import select
 import signal
 import socket
 import stat
+import struct
+import subprocess
 import sys
 import threading
+import time
+import unicodedata
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol, TextIO
 
@@ -140,6 +277,33 @@ from .voice_guard import TOKEN_RE
 
 MAX_LINE_BYTES = 64 * 1024
 NO_SESSION_SPEECH = "No Claude session is attached. Start one with eridian session."
+_RECOVERY_ATTEMPTS = 3  # set_voice / set_muted retry when a session connects during a recovery write
+NO_HELLO_IDLE_S = 5.0  # a connection with no hello is closed after this long without a complete line
+ALL_OFF_SPEECH = "Voice is off in every session. Turn one on with eridian voice on."
+MAX_OFF_ENTRIES = 64  # persisted OFF sessions; the oldest are dropped past this
+VOICE_STATE_VERSION = 2  # v1 files (no "muted") still load, as unmuted
+CONTROL_MAX_CONNECTIONS = 8
+CONTROL_MAX_LINE_BYTES = 4096
+FORCE_MUTE_LOCK_S = 1.0  # how long the last-resort mute waits for the session lock
+CONTROL_IDLE_S = 5.0  # a request line must complete this long after its first byte; idle between requests is capped too
+CONTROL_LIFETIME_S = 30.0  # absolute cap on one control connection
+CONTROL_MAX_REQUESTS = 64  # requests served on one control connection
+ACCEPT_MAX_ERRORS = 50  # consecutive accept failures (~10 s) before an accept loop gives up
+CONTROL_CWD_CHARS = 200  # status shows at most this much of a session's cwd
+CONTROL_BAD_REQUEST = "bad request"
+CONTROL_ERRORS = {
+    "no_session": "no such session",
+    "no_token": "can't turn on a session without a token",
+    "save": "could not save",
+    "claude": "refused: requested from a Claude session",
+    "unverified": "refused: could not verify the requester",
+    "busy": "too many connections",
+}
+REQUESTER_MAX_STEPS = 64
+REQUESTER_DEADLINE_S = 1.0
+_PS = "/bin/ps"
+_ON_OPS = ("voice_on", "unmute")
+_RESERVED_OPS = ("mute", "voice_off", "status")  # all a reserved-slot connection may do
 WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
 WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
@@ -193,6 +357,14 @@ class PlayerLike(Protocol):
     def close(self) -> None: ...
 
 
+_CWD_DROP_CATEGORIES = ("Cc", "Cf", "Zl", "Zp")  # control, format (e.g. U+202E), line / paragraph separators
+
+
+def _sid_hash(token: str) -> str:
+    """The persisted key for a session: the raw token is never stored."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 @contextlib.contextmanager
 def _bounded(lock: threading.Lock, timeout: float = _LOCK_TIMEOUT_S) -> Iterator[None]:
     """Acquire `lock` or raise -- a wedged lock must surface, not hang the loop."""
@@ -204,6 +376,96 @@ def _bounded(lock: threading.Lock, timeout: float = _LOCK_TIMEOUT_S) -> Iterator
         lock.release()
 
 
+def _peer_pid(sock: socket.socket) -> int | None:
+    """The connected client's pid as the kernel reports it, or None."""
+    try:
+        if sys.platform == "darwin":
+            raw = sock.getsockopt(0, 2, 4)  # SOL_LOCAL, LOCAL_PEERPID
+            return struct.unpack("i", raw)[0]
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", raw)[0]
+    except (OSError, AttributeError, struct.error):
+        return None
+
+
+def _ps_out(args: list[str], timeout: float) -> str | None:
+    try:
+        out = subprocess.run([_PS, *args], capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _ps_row(pid: int, timeout: float) -> tuple[int, str, str] | None:
+    """(ppid, comm, args) for `pid` via /bin/ps, or None on any failure. `args` is a
+    separate call (it may hold spaces and newlines), sharing one `timeout` budget."""
+    end = time.monotonic() + timeout
+    head = _ps_out(["-o", "ppid=,comm=", "-p", str(pid)], timeout)
+    if head is None:
+        return None
+    parts = head.strip().split(None, 1)
+    if len(parts) != 2:
+        return None
+    left = end - time.monotonic()
+    if left <= 0:
+        return None
+    full = _ps_out(["-o", "args=", "-p", str(pid)], left)
+    if full is None:
+        return None
+    try:
+        return int(parts[0]), parts[1].strip(), full.strip()
+    except ValueError:
+        return None
+
+
+def _is_claude_text(text: str, *, first_token: bool) -> bool:
+    low = text.casefold()
+    if "@anthropic-ai/claude-code" in low or "/claude/versions/" in low:
+        return True
+    head = (low.split(None, 1) or [""])[0] if first_token else low
+    return head.rsplit("/", 1)[-1] in ("claude", "claude.exe")
+
+
+def _is_claude_proc(comm: str, args: str) -> bool:
+    return _is_claude_text(comm, first_token=False) or _is_claude_text(args, first_token=True)
+
+
+def requester_refusal(
+    pid: int | None,
+    *,
+    deadline_s: float = REQUESTER_DEADLINE_S,
+    ps_runner: Callable[[int, float], tuple[int, str, str] | None] = _ps_row,
+) -> str | None:
+    """Why a control request from `pid` must be refused, or None to allow it.
+
+    Returns a CONTROL_ERRORS key (the keys double as reason codes): "claude" if `pid` or
+    any ancestor is a Claude Code process -- comm or args (casefolded) with a basename
+    `claude`/`claude.exe`, or a path containing `@anthropic-ai/claude-code` or
+    `/claude/versions/` (native installer) -- "unverified" for every failure to decide. FAIL CLOSED:
+    pid None or <= 1, a ps failure or timeout, the deadline passing, or REQUESTER_MAX_STEPS
+    steps without reaching pid <= 1 all refuse. A chain that reaches pid 1 clean is
+    allowed. Best effort only: a process detached and reparented to launchd (pid 1)
+    no longer shows its Claude ancestor and escapes this check."""
+    if pid is None or pid <= 1:  # only a walk that reaches pid 1 from a real ancestor allows
+        return "unverified"
+    end = time.monotonic() + deadline_s
+    cur = pid
+    for _ in range(REQUESTER_MAX_STEPS):
+        if cur <= 1:
+            return None
+        left = end - time.monotonic()
+        if left <= 0:
+            return "unverified"
+        row = ps_runner(cur, left)
+        if row is None:
+            return "unverified"
+        ppid, comm, args = row
+        if _is_claude_proc(comm, args):
+            return "claude"
+        cur = ppid
+    return "unverified"
+
+
 class _Conn:
     """One channel connection: the socket plus a lock serializing its writers."""
 
@@ -211,6 +473,8 @@ class _Conn:
         self.sock = sock
         self.send_lock = threading.Lock()
         self.pid: int | None = None
+        self.reserved = False  # control conns: the extra slot; mute / voice_off / status, one request
+        self.peer_pid: int | None = None  # control conns: kernel-reported at accept; never from a request
         self.cwd = ""
         self.hello = False
         self.session = ""  # 32-hex token from hello; "" can never match an announce
@@ -250,9 +514,26 @@ class VoiceBridge:
         self_wake_guard_s: float = SELF_WAKE_GUARD_S,
         announce: frozenset[str] = frozenset(),
         home: Path | None = None,
+        no_hello_idle_s: float = NO_HELLO_IDLE_S,
+        control_socket_path: Path | None = None,
+        control_idle_s: float = CONTROL_IDLE_S,
+        mic_control: Callable[[bool], None] | None = None,
+        mic_stalled: Callable[[], bool] | None = None,
+        requester_check: Callable[[int | None], str | None] = requester_refusal,
     ) -> None:
+        self._requester_check = requester_check
+        self._mic_control = mic_control
+        self._mic_stalled = mic_stalled
+        self._stall_reported = False  # main thread: the last stall state we printed
+        self._control_idle_s = control_idle_s
+        self._no_hello_idle_s = no_hello_idle_s
         self._home = Path(home) if home is not None else None  # resolved lazily: no mkdir at construction
         self._socket_path = Path(socket_path)
+        self._control_path: Path | None = None  # resolved lazily like the home: no mkdir at construction
+        if control_socket_path is not None:
+            self._control_path = Path(control_socket_path)
+        elif self._home is not None:
+            self._control_path = self._home / "control.sock"
         self._follow_up_s = follow_up_s
         self._talk_over = talk_over
         self._announce = announce
@@ -266,6 +547,7 @@ class VoiceBridge:
         self._no_talk_over_gen = -1  # gen whose speech (confirm) talk-over must not cut
         self._spoken_gen = -1  # gen that _spoken_text belongs to (session lock)
         self._spoken_text = ""  # reply text spoken in that gen, for the echo filter
+        self._turn_mute_gen = 0  # main thread: _mute_gen when the current turn opened
         self._turn_via = ""  # main thread: what opened the current turn (tagging / echo filter only)
         self._reply_origin = ""  # session lock: via of the sole outstanding utterance; one-shot credit for one answer
         self._reply_origin_at = 0.0  # session lock: self._clock() when the credit was set
@@ -273,7 +555,19 @@ class VoiceBridge:
         self._echo_ref = ""  # main thread: spoken text snapshotted at talk-over
         self._spoken_log: collections.deque[tuple[float, str]] = collections.deque(maxlen=24)  # session lock: (time, text) of everything we said
         self._echo_hist = ""  # main thread: spoken text a non-wake turn is checked against
-        self._conn: _Conn | None = None  # the attached (latest-hello) channel
+        self._conn: _Conn | None = None  # the routing target: newest hello'd session that is ON
+        self._sessions: list[_Conn] = []  # session lock: hello'd connections, oldest first
+        self._state_lock = threading.Lock()  # serializes voice-state changes; taken BEFORE the session lock
+        self._off: dict[str, float] = {}  # session lock: sha256(token) -> when turned off
+        self._state_extra: dict = {}  # unknown keys of voice-state.json, kept across writes
+        self._muted = False  # written under the session lock (and _state_lock); the main thread reads it every frame
+        self._mute_gen = 0  # bumped (session lock) on every mute-state change; never reset
+        self._mute_applied_gen = 0  # main thread only: the _mute_gen the listener was last cancelled for
+        self._threads_lock = threading.Lock()
+        self._state_error = False  # session lock: state file unreadable -> every session is OFF
+        self._saved = True  # session lock: False after an OFF whose write failed (file still says ON)
+        self._speakers: set[str] = set()  # session lock: _sid_hash of sessions with speech queued/playing
+        self._enq_seq = 0  # session lock: bumped on every session-attributed enqueue
         self._conns: set[_Conn] = set()
         self._closed = False
         self._followed_gen = -1  # main thread only: dedupes reply_done per generation
@@ -287,12 +581,17 @@ class VoiceBridge:
 
         self._server: socket.socket | None = None
         self._bound = False
+        self._control_server: socket.socket | None = None
+        self._control_bound = False
+        self._control_ident: tuple[int, int] | None = None  # (dev, inode) of the socket file we bound
+        self._control_conns: set[_Conn] = set()  # guarded by the session lock
         self._threads: list[threading.Thread] = []
         self._chunker = SentenceChunker()
         self._control: queue.Queue = queue.Queue()
         self._mismatch_spoken_at: float | None = None  # when we last spoke the wake-mismatch notice
         self._speech_q: queue.Queue = queue.Queue()
 
+        self._load_state()
         self._player = player_factory()
         self._listener = Listener(
             wake_factory=wake_factory,
@@ -304,11 +603,289 @@ class VoiceBridge:
             vad_reset=vad_reset,
         )
 
+    # ---- per-session voice state ---------------------------------------
+
+    def _state_file(self, create: bool) -> Path:
+        if self._home is None:
+            return paths.voice_state_path() if create else paths.home_path() / paths.VOICE_STATE_NAME
+        if create:
+            self._home.mkdir(mode=paths.HOME_MODE, parents=True, exist_ok=True)
+        return self._home / paths.VOICE_STATE_NAME
+
+    def _load_state(self) -> None:
+        """Constructor only. Missing file = nothing off; anything unusable = every session OFF."""
+        try:
+            raw = paths.read_private_json(self._state_file(create=False))
+            off = raw.get("off") if isinstance(raw, dict) else None
+            version = raw.get("version") if isinstance(raw, dict) else None
+            muted = False if version == 1 else raw.get("muted") if isinstance(raw, dict) else None  # v1 has no "muted"
+            if (
+                not isinstance(raw, dict)
+                or type(version) is not int
+                or version not in (1, VOICE_STATE_VERSION)
+                or not isinstance(muted, bool)
+                or not isinstance(off, dict)
+                or not all(
+                    isinstance(k, str) and re.fullmatch(r"[0-9a-f]{64}", k)
+                    and isinstance(v, (int, float)) and not isinstance(v, bool)
+                    for k, v in off.items()
+                )
+            ):
+                raise ValueError("unexpected shape")
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, RecursionError):
+            self._state_error = True
+            self._muted = True  # fail toward not listening
+            self._print(
+                "[voice] voice-state.json is unreadable: treating every session as off and "
+                "starting muted until a voice on/off or unmute change rewrites it\n"
+            )
+            return
+        self._off = dict(off)
+        self._muted = muted
+        # Hook for later keys: carried through every write untouched.
+        self._state_extra = {k: v for k, v in raw.items() if k not in ("version", "off", "muted")}
+
+    def _write_state(
+        self, off: dict[str, float], live: frozenset[str] = frozenset(), muted: bool = False
+    ) -> bool:
+        """Persist `off` and `muted`; False if the write failed. No lock needed.
+
+        Past MAX_OFF_ENTRIES only entries of disconnected sessions (hashes not in
+        `live`) are dropped, oldest first; a connected session's OFF is kept.
+        """
+        ranked = sorted(off.items(), key=lambda kv: (kv[0] in live, kv[1]))
+        kept = dict(ranked[-MAX_OFF_ENTRIES:])
+        doc = {**self._state_extra, "version": VOICE_STATE_VERSION, "off": kept, "muted": muted}
+        try:
+            paths.write_private_json(self._state_file(create=True), doc)
+        except (OSError, TypeError, ValueError) as exc:
+            self._print(f"[voice] could not save voice state: {type(exc).__name__}: {exc}\n")
+            return False
+        return True
+
+    def _is_off_locked(self, conn: _Conn) -> bool:
+        """Session lock held. Token-less sessions are never routable; a bad state file means all OFF."""
+        return self._state_error or not conn.session or _sid_hash(conn.session) in self._off
+
+    def _reset_turn_flags_locked(self) -> None:
+        self._answered = self._confirm_pending = False
+        self._outstanding, self._reply_origin = 0, ""
+
+    def _retarget_locked(self) -> bool:
+        """Session lock held. Point `_conn` at the newest ON session; True if it moved."""
+        new = next((c for c in reversed(self._sessions) if not self._is_off_locked(c)), None)
+        if new is self._conn:
+            return False
+        self._conn = new
+        self._reset_turn_flags_locked()  # a pending confirm must never reach another session
+        return True
+
+    @staticmethod
+    def _session_id(conn: _Conn) -> str:
+        return _sid_hash(conn.session)[:12] if conn.session else f"pid-{conn.pid}"
+
+    def sessions_status(self) -> list[dict]:
+        """One dict per hello'd connection, newest first. Never includes the raw token."""
+        with _bounded(self._lock):
+            return [
+                {
+                    "id": self._session_id(c),
+                    "pid": c.pid,
+                    "cwd": "".join(ch for ch in c.cwd if unicodedata.category(ch) not in _CWD_DROP_CATEGORIES)[:CONTROL_CWD_CHARS],
+                    "on": not self._is_off_locked(c),
+                    "target": c is self._conn,
+                }
+                for c in reversed(self._sessions)
+            ]
+
+    def voice_state_health(self) -> dict:
+        """`state_error`: the state file was unreadable (all sessions off). `saved`: False after an
+        OFF whose write failed, i.e. it would turn back on if attach restarts; True after any
+        successful write."""
+        with _bounded(self._lock):
+            return {"state_error": self._state_error, "saved": self._saved}
+
+    def _matches_locked(self, session_id: str) -> list[_Conn]:
+        """Session lock held. Connections whose id (see sessions_status) or decimal pid is `session_id`."""
+        return [
+            c for c in self._sessions
+            if self._session_id(c) == session_id or str(c.pid) == session_id
+        ]
+
+    def set_voice(self, session_id: str, on: bool) -> bool:
+        """Turn voice on/off for the session(s) with this id (see sessions_status) or decimal pid.
+
+        False if nothing matches. Rule: a failure to persist can never make a
+        session audible that the user turned off. OFF is applied in memory
+        BEFORE the write is tried, so it takes effect even if the write fails
+        (printed, and `voice_state_health()["saved"]` goes False). ON needs a
+        successful write first (else nothing changes and False is returned),
+        and a token-less session can never be turned on. A successful write
+        replaces the file, so it also clears `state_error`; because the lost
+        file may have said some connected sessions were off, every other
+        session connected at the moment of the write is written OFF
+        explicitly, so only the session being turned on becomes audible. The write
+        runs outside the lock: if a tokened session connected meanwhile and the
+        file does not cover it, the write is redone (3 attempts); if it is
+        still racing, state_error stays set, everything stays OFF and an ON
+        returns False.
+        Turning OFF the session that owns the speech in flight cuts it.
+        """
+        if not isinstance(session_id, str):
+            return False
+        return self._change_state(session_id, on, None)
+
+    def set_muted(self, muted: bool) -> bool:
+        """Mute or unmute the microphone for every session (global, persisted).
+
+        Same discipline as set_voice: MUTE lands in memory before any I/O, so it
+        holds even when the write fails (`saved` goes False). UNMUTE needs a
+        successful write first (else nothing changes and False is returned),
+        and during `state_error` it goes through the same recovery write as an
+        ON, which records every connected tokened session OFF, so unmuting never
+        makes an OFF session audible. The listener is cancelled on the main
+        thread (see _sync_mute) at each transition.
+        """
+        if not isinstance(muted, bool):
+            return False
+        return self._change_state(None, not muted, muted)
+
+    def is_muted(self) -> bool:
+        with _bounded(self._lock):
+            return self._muted
+
+    def _change_state(self, session_id: str | None, on: bool, mute: bool | None) -> bool:
+        """The snapshot / write / commit / retry transaction shared by set_voice and set_muted.
+
+        `on` is the direction that needs a write first (voice on, unmute); the
+        other direction is applied in memory before any I/O. `session_id` None
+        means no session is targeted (a mute change); `mute` None leaves mute as is.
+        """
+        changed = stop = False
+        target = None
+        matches: list[_Conn] = []
+        muted_changed = False
+        with _bounded(self._state_lock):
+            with _bounded(self._lock):
+                was_muted = self._muted
+            for _attempt in range(_RECOVERY_ATTEMPTS):
+                with _bounded(self._lock):
+                    hashes: set[str] = set()
+                    if session_id is not None:
+                        matches = self._matches_locked(session_id)
+                        hashes = {_sid_hash(c.session) for c in matches if c.session}
+                        if not matches or (on and not hashes):
+                            return False
+                    new_muted = self._muted if mute is None else mute
+                    recovering = self._state_error
+                    new_off = self._off_after_locked(hashes, on, recovering)
+                    live = self._live_hashes_locked()
+                    if not on:  # OFF / mute land in memory before any I/O can fail or raise
+                        ch, target, st = self._commit_locked(new_off, matches, on, False, None, new_muted)
+                        changed, stop = changed or ch, stop or st
+                if on or hashes or recovering or mute is not None:
+                    wrote = self._write_state(new_off, live, new_muted)  # no lock held across the write
+                else:
+                    wrote = None  # only token-less sessions: nothing to persist
+                with _bounded(self._lock):
+                    if on and not wrote:
+                        return False
+                    if recovering and wrote and not self._live_hashes_locked() <= live:
+                        continue  # a tokened session connected mid-write: the file misses it
+                    if on:
+                        ch, target, st = self._commit_locked(new_off, matches, on, True, True, new_muted)
+                        changed, stop = changed or ch, stop or st
+                    elif wrote is not None:
+                        self._saved = wrote
+                        if wrote and recovering:
+                            self._state_error = False
+                break
+            else:
+                # Still racing after every attempt: fail closed. state_error stays set, so
+                # every session stays OFF and the mic stays muted; an OFF / mute already applied stands.
+                if on:
+                    return False
+            with _bounded(self._lock):
+                muted_changed = self._muted != was_muted
+        if stop:
+            self._player.stop()  # outside the locks, like a barge-in
+        label = "on" if on else "off"
+        for c in matches:
+            self._print(f"[voice {label}: session pid {c.pid}]\n")
+        if muted_changed:
+            self._print("[muted]\n" if self._muted else "[unmuted]\n")
+        if changed:
+            self._print(
+                f"[voice target: session pid {target.pid}]\n" if target is not None
+                else "[no session has voice on]\n"
+            )
+        return True
+
+    def _note_enqueue_locked(self, shash: str | None) -> int:
+        """Session lock held, called with a session's speech about to be enqueued. Returns the
+        sequence number the speech watcher uses to know no later enqueue happened."""
+        self._enq_seq += 1
+        if shash:
+            self._speakers.add(shash)
+        return self._enq_seq
+
+    def _live_hashes_locked(self) -> frozenset[str]:
+        return frozenset(_sid_hash(c.session) for c in self._sessions if c.session)
+
+    def _off_after_locked(self, hashes: set[str], on: bool, recovering: bool) -> dict[str, float]:
+        """Session lock held. The OFF set after this change; when recovering, every other
+        connected tokened session is added (the lost file may have had them off)."""
+        new_off = dict(self._off)
+        if recovering:
+            for c in self._sessions:
+                if c.session:
+                    new_off.setdefault(_sid_hash(c.session), time.time())
+        for h in hashes:
+            if on:
+                new_off.pop(h, None)
+            else:
+                new_off.setdefault(h, time.time())
+        return new_off
+
+    def _commit_locked(
+        self,
+        new_off: dict[str, float],
+        matches: list[_Conn],
+        on: bool,
+        wrote: bool,
+        saved: bool | None,
+        muted: bool,
+    ) -> tuple[bool, "_Conn | None", bool]:
+        """Session lock held. Apply a voice change in memory; (target changed, target, cut speech)."""
+        self._off = new_off
+        if muted != self._muted:
+            self._mute_gen += 1
+        self._muted = muted
+        if wrote:
+            self._state_error = False
+        if saved is not None:
+            self._saved = saved
+        stop = False
+        if not on and self._speakers & {_sid_hash(c.session) for c in matches if c.session}:
+            if self._no_talk_over_gen == self._gen:
+                self._no_talk_over_gen = self._gen + 1
+            self._gen += 1  # stale reply_done posts for the cut speech are harmless
+            self._reply_origin = ""
+            self._speakers.clear()  # stop() empties the whole player queue
+            stop = True
+        changed = self._retarget_locked()
+        return changed, self._conn, stop
+
     # ---- lifecycle -----------------------------------------------------
 
-    def start(self) -> int:
-        """Bind the listener socket and start the threads. 0 ok, 1 refused."""
-        path = self._socket_path
+    def _bind_socket(self, path: Path) -> socket.socket | None:
+        """Bind a 0600 listening unix socket at `path`; None (reason printed) if refused.
+
+        Never unlinks anything that is not a socket, refuses while another
+        process answers on it, and removes a stale socket file.
+        """
         try:
             existing = os.lstat(path)
         except FileNotFoundError:
@@ -321,41 +898,70 @@ class VoiceBridge:
                 f"socket (mode {stat.filemode(existing.st_mode)})",
                 file=sys.stderr,
             )
-            return 1
+            return None
 
         if existing is not None:
             if _server_answers(path):
                 print(f"eridian: another attach is already running at {path}", file=sys.stderr)
-                return 1
+                return None
             path.unlink()  # stale socket from a crashed/killed attach
 
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bound = False
         try:
             # umask so the socket is never wider than 0600, even briefly; the
             # explicit chmod below stays as the belt to this pair of braces.
             old_umask = os.umask(0o177)
             try:
                 server.bind(str(path))
+                bound = True
             finally:
                 os.umask(old_umask)
-            self._bound = True
             os.chmod(path, 0o600)
             server.listen(_BACKLOG)
             server.settimeout(_POLL_S)
         except OSError as exc:
             server.close()
-            self._unlink_socket()
+            if bound:
+                with contextlib.suppress(OSError):
+                    path.unlink()
             print(f"eridian: cannot listen on {path}: {exc}", file=sys.stderr)
+            return None
+        return server
+
+    def start(self) -> int:
+        """Bind the voice and control sockets and start the threads. 0 ok, 1 refused.
+
+        The control socket is the mute switch, so attach never runs without it:
+        if it cannot be bound, the voice socket is released again and start fails.
+        """
+        server = self._bind_socket(self._socket_path)
+        if server is None:
             return 1
         self._server = server
+        self._bound = True
+        if self._control_path is None:
+            self._control_path = paths.control_socket_path()
+        control = self._bind_socket(self._control_path)
+        if control is None:
+            server.close()
+            self._server = None
+            self._unlink_socket()
+            return 1
+        self._control_server = control
+        self._control_bound = True
+        with contextlib.suppress(OSError):
+            ident = os.lstat(self._control_path)
+            self._control_ident = (ident.st_dev, ident.st_ino)
 
         for name, target in (
             ("eridian-voice-accept", self._accept_loop),
             ("eridian-voice-speech", self._speech_watcher),
+            ("eridian-control-accept", self._control_accept_loop),
         ):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
-            self._threads.append(thread)
+            self._track_thread(thread)
         return 0
 
     def close(self) -> None:
@@ -364,12 +970,16 @@ class VoiceBridge:
                 return
             self._closed = True
             self._gen += 1
-            conns = list(self._conns)
+            conns = list(self._conns) + list(self._control_conns)
             self._conn = None
+            self._sessions.clear()
         self._speech_q.put(None)
         if self._server is not None:
             with contextlib.suppress(OSError):
                 self._server.close()
+        if self._control_server is not None:
+            with contextlib.suppress(OSError):
+                self._control_server.close()
         for conn in conns:
             conn.close()
         self._player.stop()
@@ -382,21 +992,114 @@ class VoiceBridge:
         self._unlink_socket()
         self._player.close()
 
+    def _track_thread(self, thread: threading.Thread) -> None:
+        """Remember `thread` for close(); dead reader threads are dropped so connects can't grow the list."""
+        with self._threads_lock:
+            self._threads[:] = [t for t in self._threads if t.is_alive() or t is thread]
+            self._threads.append(thread)
+
     def _unlink_socket(self) -> None:
-        if not self._bound:
-            return
-        self._bound = False
-        with contextlib.suppress(OSError):
-            self._socket_path.unlink()
+        if self._bound:
+            self._bound = False
+            with contextlib.suppress(OSError):
+                self._socket_path.unlink()
+        if self._control_bound and self._control_path is not None:
+            self._control_bound = False
+            with contextlib.suppress(OSError):
+                self._control_path.unlink()
 
     # ---- main thread ---------------------------------------------------
 
+    def _sync_mute(self) -> None:
+        """Main thread. Cancel the listener whenever the mute state changed since it last ran.
+
+        Mute: a turn in progress, the wake pre-roll and the talk-over buffers are
+        discarded, so nothing captured before the mute is ever transcribed or sent.
+        Unmute: the listener restarts from fresh detectors.
+        """
+        gen = self._mute_gen
+        if gen != self._mute_applied_gen:  # a counter, so a quick mute->unmute still cancels
+            self._mute_applied_gen = gen
+            self._listener.cancel()
+            self._apply_mic_device()
+
+    def _apply_mic_device(self) -> None:
+        """Main thread, no lock held. Close the mic device while muted, reopen it on unmute.
+
+        Dropping frames is the guarantee; closing the device is the visible
+        signal (the OS mic indicator). A failed close leaves the bridge muted
+        and safe. A failed reopen re-mutes, so the bridge never reports
+        unmuted while the mic is dead; nothing here may raise out of the frame loop.
+        """
+        if self._mic_control is None:
+            return
+        try:
+            muted = self.is_muted()
+        except Exception:  # noqa: BLE001 - a wedged lock: fail toward muted, and force it
+            muted = True
+            self._force_mute()
+        if muted:
+            try:
+                self._mic_control(False)
+            except Exception:  # noqa: BLE001 - any device failure; frames are dropped regardless
+                with contextlib.suppress(Exception):
+                    self._print("[mic did not close; frames are still dropped]\n")
+            return
+        try:
+            self._mic_control(True)
+        except Exception:  # noqa: BLE001 - any device failure
+            try:
+                self.set_muted(True)
+                msg = "[mic failed to reopen; muted]\n"
+            except Exception:  # noqa: BLE001 - e.g. a wedged lock: force the mute in memory
+                self._force_mute()
+                msg = "[mic failed to reopen; muted (not saved)]\n"
+            with contextlib.suppress(Exception):
+                self._print(msg)
+
+    def _force_mute(self) -> None:
+        """Last resort: mute in memory even if the normal transaction cannot run.
+
+        Best effort under the session lock; if the lock cannot be taken in time the
+        two attribute writes still happen (each is atomic), which beats crashing the
+        frame loop or leaving a dead mic reported as unmuted.
+        """
+        got = self._lock.acquire(timeout=FORCE_MUTE_LOCK_S)
+        try:
+            self._muted = True
+            self._mute_gen += 1
+            self._saved = False
+        finally:
+            if got:
+                self._lock.release()
+
     def process_frame(self, frame: bytes) -> None:
+        self._sync_mute()
         self._drain_control()
-        self._listener.talk_over = self._talk_over_mode()
-        if self._player.busy:
+        if self._player.busy:  # kept fresh while muted: the self-wake guard must survive a mute
             self._last_busy = self._clock()
+        if self._muted:
+            self._stall_reported = False  # the device is closed: silence is expected, not a stall
+            return  # real mute: no wake word, VAD or STT ever sees this frame
+        self._sync_mute()  # an unmute landed mid-drain: start from a cancelled listener
+        if self._muted:
+            return  # that sync may itself have re-muted (the mic would not reopen)
+        self._check_stall()
+        self._listener.talk_over = self._talk_over_mode()
         self._listener.process_frame(frame)
+
+    def _check_stall(self) -> None:
+        """Main thread, unmuted only. Print once when the mic stops delivering and once when it is back."""
+        if self._mic_stalled is None:
+            return
+        try:
+            stalled = bool(self._mic_stalled())
+        except Exception:  # noqa: BLE001 - advisory only
+            return
+        if stalled != self._stall_reported:
+            self._stall_reported = stalled
+            with contextlib.suppress(Exception):
+                self._print("[mic stalled; no input]\n" if stalled else "[mic input back]\n")
 
     def _talk_over_mode(self) -> str:
         if not self._talk_over:
@@ -418,7 +1121,7 @@ class VoiceBridge:
             except queue.Empty:
                 return
             if kind == "announce":
-                self._on_announce(arg)
+                self._on_announce(*arg)
                 continue
             if kind == "wake_mismatch":
                 self._note_spoken(WAKE_MISMATCH_SPEECH)
@@ -428,6 +1131,7 @@ class VoiceBridge:
             if (
                 kind == "reply_done"
                 and self._follow_up_s > 0
+                and not self._muted
                 and self._listener.state == "IDLE"
                 and gen != self._followed_gen
                 and self._is_current(gen)
@@ -441,8 +1145,24 @@ class VoiceBridge:
             self._clock() - self._confirm_pending_at <= voice_guard.CHALLENGE_TTL_S
         )
 
-    def _on_announce(self, event: str) -> None:
-        """Main thread. `event` is already validated against the enabled templates."""
+    def _announce_ok_locked(self, shash: str) -> bool:
+        """Session lock held. The announcing session is still the routing target and not OFF."""
+        target = self._conn
+        return (
+            target is not None
+            and bool(target.session)
+            and not self._is_off_locked(target)
+            and hmac.compare_digest(_sid_hash(target.session), shash)
+        )
+
+    def _on_announce(self, event: str, shash: str) -> None:
+        """Main thread. `event` is already validated against the enabled templates; `shash` is
+        the hash of the session that sent it."""
+        with _bounded(self._lock):
+            still_ok = self._announce_ok_locked(shash)  # fast path; re-checked at the enqueue
+        if not still_ok:  # turned off / retargeted between the hook and now
+            self._print(f"[announce skipped: {event} (voice off)]\n")
+            return
         if event == "finished":
             with _bounded(self._lock):
                 answered, self._answered = self._answered, False
@@ -464,16 +1184,30 @@ class VoiceBridge:
         self._announce_last[event] = now
         template = ANNOUNCE_TEMPLATES[event]
         with _bounded(self._lock):
-            self._gen += 1
-            gen = self._gen
-            self._no_talk_over_gen = gen  # short: heard in full; the wake word still barges in
-            self._reply_origin = ""  # an answer landing after an announcement opens no window
-            self._spoken_log.append((self._clock(), template))
-            self._player.enqueue(template)  # queues behind current speech; never stop()
+            still_ok = self._announce_ok_locked(shash)  # an OFF may have landed since the fast path
+            if still_ok:
+                self._gen += 1
+                gen = self._gen
+                self._no_talk_over_gen = gen  # short: heard in full; the wake word still barges in
+                self._reply_origin = ""  # an answer landing after an announcement opens no window
+                self._spoken_log.append((self._clock(), template))
+                seq = self._note_enqueue_locked(shash)
+                self._player.enqueue(template)  # queues behind current speech; never stop()
+        if not still_ok:
+            self._print(f"[announce skipped: {event} (voice off)]\n")
+            return
         self._print(f"[announce: {event}]\n")
-        self._speech_q.put((gen, False))  # an announcement never opens a window
+        self._speech_q.put((gen, False, seq))  # an announcement never opens a window
 
     def _on_listener_event(self, event: ListenerEvent) -> None:
+        if event.kind in ("wake", "talk_over", "follow_up"):
+            # One lock section reads the flag and the counter together (every writer holds
+            # this lock), so a mute+unmute can never slip between the two reads.
+            with _bounded(self._lock):
+                muted = self._muted
+                self._turn_mute_gen = self._mute_gen  # the turn's mute epoch
+            if muted:
+                return  # no cue, no barge-in, no turn while muted
         if event.kind == "wake":
             own_voice = (
                 self._player.busy
@@ -497,67 +1231,104 @@ class VoiceBridge:
             self._echo_hist = self._recent_spoken()
             self._cue("follow_up")
         elif event.kind == "utterance":
-            text = event.text or ""
-            if (
-                self._turn_via in ("talk_over", "follow_up")
-                and self._echo_hist
-                and is_echo(text, self._echo_hist)
-            ):
-                # Drop only; never alters a grant decision. A talk-over that
-                # already stopped playback stays stopped: the player has no
-                # resume, and replaying a half-heard reply is worse than silence.
-                self._print(
-                    f"you [{self._turn_via}]: {self._redact(text)} "
-                    "[dropped: echo of own speech]\n"
-                )
+            self._on_utterance(event.text or "")
+        # wake_no_speech / dropped_empty: nothing to do
+
+    def _turn_muted_locked(self) -> bool:
+        """Session lock held. The ONE mute rule for an utterance: muted now, or any mute
+        change (even a quick mute->unmute) since the turn opened."""
+        return self._muted or self._mute_gen != self._turn_mute_gen
+
+    def _unsent(self, line: str, then: Callable[[], None] | None = None) -> None:
+        """A non-send outcome (echo drop, own-reply, too-soon hold). If the turn was muted, only
+        `[muted: not sent]` is printed. Accepted: audio captured BEFORE the mute may print in the
+        few bytecodes after this check; nothing is sent and no post-mute audio is involved."""
+        with _bounded(self._lock):
+            muted = self._turn_muted_locked()
+        if muted:
+            self._print("[muted: not sent]\n")
+            return
+        self._print(line)
+        if then is not None:
+            then()
+
+    def _on_utterance(self, text: str) -> None:
+        via = self._turn_via
+        # 1. Decide everything first: no prints, no enqueues. Lines are buffered.
+        if via in ("talk_over", "follow_up") and self._echo_hist and is_echo(text, self._echo_hist):
+            # Drop only; never alters a grant decision. A talk-over that
+            # already stopped playback stays stopped: the player has no
+            # resume, and replaying a half-heard reply is worse than silence.
+            self._unsent(f"you [{via}]: {self._redact(text)} [dropped: echo of own speech]\n")
+            return
+        removed_line = ""
+        if via == "talk_over" and self._echo_ref:
+            kept = strip_echo(text, self._echo_ref)
+            if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
+                self._unsent(f'[ignored as my own reply: "{self._redact(text)}"]\n')
                 return
-            if self._turn_via == "talk_over" and self._echo_ref:
-                kept = strip_echo(text, self._echo_ref)
-                if not re.search(r"[a-z0-9]", kept, re.IGNORECASE):
-                    self._print(f'[ignored as my own reply: "{self._redact(text)}"]\n')
-                    return
-                if kept != text:
-                    self._print(
-                        f'[removed my own words: "{self._redact(text)}" -> "{self._redact(kept)}"]\n'
-                    )
-                    text = kept
-            if self._turn_via == "wake_barge_in":
-                with _bounded(self._lock):
-                    held = self._confirm_is_pending()
-                if held:
-                    # Could be our own voice, so it can never grant; sending it
-                    # would only use up the challenge. Say why instead.
-                    self._print(
-                        "[too soon after I spoke, so not sent: wait a moment, "
-                        "then say the wake word again]\n"
-                    )
+            if kept != text:
+                removed_line = f'[removed my own words: "{self._redact(text)}" -> "{self._redact(kept)}"]\n'
+                text = kept
+        if via == "wake_barge_in":
+            with _bounded(self._lock):
+                held = self._confirm_is_pending()
+            if held:
+                # Could be our own voice, so it can never grant; sending it
+                # would only use up the challenge. Say why instead.
+                def _say_too_soon() -> None:
                     self._note_spoken(TOO_SOON_SPEECH)
                     self._player.enqueue(TOO_SOON_SPEECH, own=True)
-                    return
-            via = self._turn_via
-            tag = f" [{via}]" if via not in ("", "wake") else ""
-            self._print(f"you{tag}: {self._redact(text)}\n")
-            with _bounded(self._lock):
+
+                self._unsent(
+                    "[too soon after I spoke, so not sent: wait a moment, "
+                    "then say the wake word again]\n",
+                    _say_too_soon,
+                )
+                return
+        tag = f" [{via}]" if via not in ("", "wake") else ""
+        you_line = f"you{tag}: {self._redact(text)}\n"
+        payload = {"type": "utterance", "text": text, "via": via}
+        # 2. The final check, then the send as the very next statement: no I/O between them.
+        with _bounded(self._lock):
+            muted = self._turn_muted_locked()
+            if not muted:
                 self._gen += 1
                 conn = self._conn
+                any_sessions = bool(self._sessions)
                 # Before the send: the reply can race the lock below. The
                 # credit is bound only when exactly one turn is outstanding.
                 self._outstanding += 1
                 self._reply_origin = via if self._outstanding == 1 else ""
                 self._reply_origin_at = self._clock()
-            if conn is not None and conn.send(
-                {"type": "utterance", "text": text, "via": via}
-            ):
-                with _bounded(self._lock):
-                    self._confirm_pending = False
-                return
-            with _bounded(self._lock):
+        if muted:  # send nothing, touch no turn flags, print no transcript
+            self._print("[muted: not sent]\n")
+            return
+        # The one remaining mute window: a mute landing between the in-lock check above and
+        # this send (a few bytecodes, no I/O).
+        sent = conn is not None and conn.send(payload)
+        # 3. State that depends on the outcome is settled BEFORE any print, so a failing
+        # print can never strand it; then the transcript prints (a print failure there is dropped silently).
+        with _bounded(self._lock):
+            if sent:
+                self._confirm_pending = False
+            else:
                 self._outstanding = max(0, self._outstanding - 1)  # a failed send is not a turn
                 self._reply_origin = ""
-            self._print("[no Claude session attached]\n")
-            self._note_spoken(NO_SESSION_SPEECH)
-            self._player.enqueue(NO_SESSION_SPEECH)
-        # wake_no_speech / dropped_empty: nothing to do
+        with contextlib.suppress(Exception):
+            if removed_line:
+                self._print(removed_line)
+            self._print(you_line)
+        if sent:
+            return
+        if conn is None and any_sessions:
+            self._print("[no session has voice on]\n")
+            self._note_spoken(ALL_OFF_SPEECH)
+            self._player.enqueue(ALL_OFF_SPEECH)
+            return
+        self._print("[no Claude session attached]\n")
+        self._note_spoken(NO_SESSION_SPEECH)
+        self._player.enqueue(NO_SESSION_SPEECH)
 
     def _note_spoken(self, text: str) -> None:
         """Remember something eridian said, for the echo text guard. Session lock NOT held."""
@@ -607,13 +1378,25 @@ class VoiceBridge:
     def _accept_loop(self) -> None:
         server = self._server
         assert server is not None
+        errors = setup_failures = 0
         while not self._closed:
             try:
                 sock, _ = server.accept()
             except socket.timeout:
+                errors = 0
                 continue
-            except OSError:
-                return  # server closed
+            except OSError as exc:
+                if self._closed:
+                    return  # server closed
+                errors += 1
+                if errors == 1:  # one line per streak
+                    self._print(f"[voice] accept error: {type(exc).__name__}: {exc}\n")
+                if errors >= ACCEPT_MAX_ERRORS:
+                    self._print("[voice socket stopped accepting: no new session can attach]\n")
+                    return
+                time.sleep(_POLL_S)  # transient (EMFILE...): keep serving, never spin hot
+                continue
+            errors = 0
             try:
                 sock.settimeout(_IO_TIMEOUT_S)
                 conn = _Conn(sock)
@@ -631,10 +1414,13 @@ class VoiceBridge:
                 reader = threading.Thread(
                     target=self._reader, args=(conn,), name="eridian-voice-reader", daemon=True
                 )
-                self._threads.append(reader)
+                self._track_thread(reader)
                 reader.start()
+                setup_failures = 0
             except Exception as exc:  # noqa: BLE001 - never let accept die
-                self._print(f"[voice] accept error: {type(exc).__name__}: {exc}\n")
+                setup_failures += 1
+                if setup_failures == 1:  # one line per streak of failing connections
+                    self._print(f"[voice] accept error: {type(exc).__name__}: {exc}\n")
                 with contextlib.suppress(Exception):
                     sock.close()
 
@@ -649,7 +1435,10 @@ class VoiceBridge:
 
     def _read_lines(self, conn: _Conn) -> None:
         buf = b""
+        deadline = time.monotonic() + self._no_hello_idle_s
         while not self._closed:
+            if not conn.hello and time.monotonic() > deadline:
+                return  # no valid hello in time: a hard deadline, no line resets it
             # select + recv rather than a recv timeout: the socket's own
             # timeout is the (longer) send bound, and a recv blocked in the
             # kernel is not reliably woken by a close from another thread.
@@ -674,6 +1463,190 @@ class VoiceBridge:
             if len(buf) > MAX_LINE_BYTES:
                 return  # oversized line with no newline yet
 
+    # ---- control socket ------------------------------------------------
+    # Newline-delimited JSON, one response line per request line. It only
+    # toggles state and reports it: nothing here can create an utterance, open a
+    # listening turn or grant anything. Replies are fixed text, never request content.
+
+    def _control_accept_loop(self) -> None:
+        server = self._control_server
+        assert server is not None
+        errors = setup_failures = 0
+        while not self._closed:
+            try:
+                sock, _ = server.accept()
+            except socket.timeout:
+                errors = 0
+                continue
+            except OSError as exc:
+                if self._closed:
+                    return  # server closed
+                errors += 1
+                if errors == 1:  # one line per streak
+                    self._print(f"[control] accept error: {type(exc).__name__}: {exc}\n")
+                if errors >= ACCEPT_MAX_ERRORS:
+                    self._control_failed()
+                    return
+                time.sleep(_POLL_S)  # transient (EMFILE...): keep serving, never spin hot
+                continue
+            errors = 0
+            try:
+                sock.settimeout(_IO_TIMEOUT_S)
+                conn = _Conn(sock)
+                conn.peer_pid = _peer_pid(sock)
+                with _bounded(self._lock):
+                    if self._closed:
+                        conn.close()
+                        return
+                    # One slot beyond the cap is reserved for the off direction, so a flood
+                    # of idle connections can never lock out `eridian mute`.
+                    held = len(self._control_conns)
+                    over_cap = held > CONTROL_MAX_CONNECTIONS
+                    conn.reserved = held >= CONTROL_MAX_CONNECTIONS
+                    if not over_cap:
+                        self._control_conns.add(conn)
+                if over_cap:
+                    conn.close()
+                    continue
+                reader = threading.Thread(
+                    target=self._control_reader, args=(conn,), name="eridian-control-reader", daemon=True
+                )
+                self._track_thread(reader)
+                reader.start()
+                setup_failures = 0
+            except Exception as exc:  # noqa: BLE001 - never let accept die
+                setup_failures += 1
+                if setup_failures == 1:  # one line per streak of failing connections
+                    self._print(f"[control] accept error: {type(exc).__name__}: {exc}\n")
+                with contextlib.suppress(Exception):
+                    sock.close()
+
+    def _control_failed(self) -> None:
+        """The control accept loop gave up: the mute switch is gone, so fail toward not listening."""
+        with contextlib.suppress(Exception):
+            self.set_muted(True)  # a failed write still mutes in memory
+        # Remove the dead socket file (only if it is still ours) so a client gets an
+        # immediate "no such file" instead of hanging on a listener nobody serves.
+        with contextlib.suppress(OSError):
+            if self._control_path is not None and self._control_ident is not None:
+                st = os.lstat(self._control_path)
+                if stat.S_ISSOCK(st.st_mode) and (st.st_dev, st.st_ino) == self._control_ident:
+                    self._control_path.unlink()
+                    self._control_bound = False
+        self._print("[control socket failed; muted]\n")
+
+    def _control_reader(self, conn: _Conn) -> None:
+        try:
+            self._control_read_lines(conn)
+        except Exception as exc:  # noqa: BLE001 - one bad connection must never kill us
+            with contextlib.suppress(Exception):
+                self._print(f"[control] connection error: {type(exc).__name__}: {exc}\n")
+        finally:
+            with contextlib.suppress(Exception):
+                with _bounded(self._lock):
+                    self._control_conns.discard(conn)
+            conn.close()
+
+    def _control_read_lines(self, conn: _Conn) -> None:
+        """Serve requests on one connection. Slow-drip safe: a line must finish within
+        `_control_idle_s` of its first byte, idle between requests is capped at the same
+        value, the connection lives at most CONTROL_LIFETIME_S and serves at most
+        CONTROL_MAX_REQUESTS requests."""
+        buf = b""
+        began = idle_since = line_began = time.monotonic()
+        served = 0
+        while not self._closed:
+            now = time.monotonic()
+            if now - began > CONTROL_LIFETIME_S:
+                return
+            if now - (line_began if buf else idle_since) > self._control_idle_s:
+                return
+            try:
+                ready, _, _ = select.select([conn.sock], [], [], _POLL_S)
+                if not ready:
+                    continue
+                data = conn.sock.recv(4096)
+            except (OSError, ValueError):
+                return
+            if not data:
+                return
+            if not buf:
+                line_began = time.monotonic()
+            buf += data
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line, buf = buf[:nl], buf[nl + 1 :]
+                if len(line) > CONTROL_MAX_LINE_BYTES:
+                    return
+                if not conn.send(self._control_response(line, conn)):
+                    return
+                served += 1
+                if conn.reserved or served >= CONTROL_MAX_REQUESTS:
+                    return
+                line_began = idle_since = time.monotonic()
+            if len(buf) > CONTROL_MAX_LINE_BYTES:
+                return  # oversized line with no newline yet
+
+    def _control_response(self, line: bytes, conn: _Conn) -> dict:
+        try:
+            return self._control_dispatch(line, conn)
+        except TimeoutError:  # a wedged lock (_bounded): answer, don't drop the connection
+            return {"ok": False, "error": CONTROL_ERRORS["save"]}
+
+    def _control_dispatch(self, line: bytes, conn: _Conn) -> dict:
+        bad = {"ok": False, "error": CONTROL_BAD_REQUEST}
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return bad
+        if not isinstance(msg, dict):
+            return bad
+        op = msg.get("op")
+        if conn.reserved and op not in _RESERVED_OPS:
+            return {"ok": False, "error": CONTROL_ERRORS["busy"]}
+        if op in _ON_OPS:
+            peer = _peer_pid(conn.sock)  # re-read at check time: must still be the accept-time pid
+            if peer is None or peer != conn.peer_pid:
+                reason = "unverified"
+            else:
+                reason = self._requester_check(peer)  # outside every lock, before any state change
+            if reason is not None:
+                if reason == "claude":
+                    self._print(f"[control] refused {op} from a Claude session (pid {conn.peer_pid})\n")
+                else:
+                    self._print(f"[control] refused {op} (requester unverified)\n")
+                return {"ok": False, "error": CONTROL_ERRORS[reason]}
+        if op == "status":
+            health = self.voice_state_health()
+            return {
+                "ok": True,
+                "muted": self.is_muted(),
+                "state_error": health["state_error"],
+                "saved": health["saved"],
+                "sessions": self.sessions_status(),
+            }
+        if op in ("mute", "unmute"):
+            return {"ok": True} if self.set_muted(op == "mute") else {"ok": False, "error": CONTROL_ERRORS["save"]}
+        if op in ("voice_on", "voice_off"):
+            session = msg.get("session")
+            if not isinstance(session, str) or not 0 < len(session) <= 64:
+                return bad
+            on = op == "voice_on"
+            if self.set_voice(session, on):
+                return {"ok": True}
+            with _bounded(self._lock):
+                matches = self._matches_locked(session)
+            if not matches:
+                reason = "no_session"
+            elif on and not any(c.session for c in matches):
+                reason = "no_token"
+            else:
+                reason = "save"
+            return {"ok": False, "error": CONTROL_ERRORS[reason]}
+        return bad
+
     def _handle_line(self, conn: _Conn, line: bytes) -> None:
         try:
             msg = json.loads(line.decode("utf-8"))
@@ -683,6 +1656,9 @@ class VoiceBridge:
             return
         kind = msg.get("type")
         if kind == "hello":
+            if conn.hello:
+                self._print(f"[ignored a second hello from session pid {conn.pid}]\n")
+                return
             pid, cwd = msg.get("pid"), msg.get("cwd")
             if isinstance(pid, int) and not isinstance(pid, bool) and isinstance(cwd, str):
                 session = msg.get("session")
@@ -693,17 +1669,17 @@ class VoiceBridge:
                 if theirs != ours:
                     # Fail closed: this session would tell Claude a different wake word
                     # than the one we listen for. Stay unattached (replies are ignored).
-                    self._print(
-                        f"[refused session pid {pid}: it expects wake word {self._redact(theirs[:60])!r} "
-                        f"but this voice process listens for {ours!r}; restart one of them]\n"
-                    )
                     now = self._clock()
                     with _bounded(self._lock):
                         last = self._mismatch_spoken_at
                         speak = last is None or now - last >= WAKE_MISMATCH_REPEAT_S
                         if speak:
                             self._mismatch_spoken_at = now
-                    if speak:
+                    if speak:  # printed and spoken on one timer: a channel retrying every few s stays quiet
+                        self._print(
+                            f"[refused session pid {pid}: it expects wake word {self._redact(theirs[:60])!r} "
+                            f"but this voice process listens for {ours!r}; restart one of them]\n"
+                        )
                         self._control.put(("wake_mismatch", None))
                     return
                 self._attach(conn, pid, cwd, session if valid else "")
@@ -734,44 +1710,77 @@ class VoiceBridge:
             expected = conn.session if conn is not None else ""
             if not expected or not hmac.compare_digest(session, expected):
                 return
+            shash = _sid_hash(expected)
             if event == "finished":
                 # The Stop hook fired: Claude's turn ended, so nothing is
                 # outstanding and no credit survives -- whether or not the
                 # level speaks it, and before any skip rule can drop it.
                 self._outstanding, self._reply_origin = 0, ""
         if event in self._announce:
-            self._control.put(("announce", event))
+            self._control.put(("announce", (event, shash)))
 
     def _attach(self, conn: _Conn, pid: int, cwd: str, session: str = "") -> None:
-        conn.pid, conn.cwd, conn.hello, conn.session = pid, cwd, True, session
+        replaced = None
         with _bounded(self._lock):
-            old, self._conn = self._conn, conn
-            if old is not conn:  # the flags belong to the previous session
-                self._answered = self._confirm_pending = False
-                self._outstanding, self._reply_origin = 0, ""
-        if old is not None and old is not conn:
-            old.send({"type": "detached"})
-            old.close()
+            conn.pid, conn.cwd, conn.hello, conn.session = pid, cwd, True, session
+            if conn not in self._sessions:
+                if session:
+                    replaced = next(
+                        (c for c in self._sessions if c.session and hmac.compare_digest(c.session, session)),
+                        None,
+                    )
+                if replaced is not None:  # the same session reconnected
+                    self._sessions.remove(replaced)
+                self._sessions.append(conn)
+            self._retarget_locked()
+            off = self._is_off_locked(conn)
+        if replaced is not None:
+            replaced.send({"type": "detached"})
+            replaced.close()
         self._print(f"[attached: session pid {pid} in {cwd}]\n")
+        if not session:
+            self._print(f"[session pid {pid} sent no valid token: voice stays off for it]\n")
+        elif off:
+            self._print(f"[session pid {pid} has voice off]\n")
 
     def _drop(self, conn: _Conn) -> None:
         conn.close()
         with _bounded(self._lock):
             self._conns.discard(conn)
             was_current = self._conn is conn
+            was_session = conn in self._sessions
+            if was_session:
+                self._sessions.remove(conn)
             if was_current:
                 self._conn = None
-                self._outstanding, self._reply_origin = 0, ""
+                self._reset_turn_flags_locked()
+            if was_session:
+                self._retarget_locked()
+            target = self._conn
             closed = self._closed
         if was_current and not closed:
             self._print("[detached]\n")
+            if target is not None:
+                self._print(f"[voice target: session pid {target.pid}]\n")
+
+    def _not_spoken_reason_locked(self, conn: _Conn) -> str | None:
+        """Session lock held. None if `conn` may speak; "" if it is unknown (stay silent);
+        else why its reply is not spoken."""
+        if conn is self._conn:
+            return None
+        if conn not in self._sessions:
+            return ""  # a replaced / never-hello'd connection has no voice
+        return "is off" if self._is_off_locked(conn) else "is not the voice target"
 
     def _on_reply(
         self, conn: _Conn, text: str, kind: str = "answer", check: str | None = None
     ) -> None:
         with _bounded(self._lock):
-            if conn is not self._conn:
-                return  # a replaced / never-hello'd connection has no voice
+            why = self._not_spoken_reason_locked(conn)
+        if why is not None:
+            if why:
+                self._print(f"[not spoken: session pid {conn.pid} {why}]\n")
+            return
         if check is not None:
             self._print(f"eridian: {check}\n")
         self._print(f"claude: {text}\n")
@@ -783,46 +1792,63 @@ class VoiceBridge:
                 self._chunker.reset()
                 check_sentences = self._chunker.feed(check) + self._chunker.flush()
         with _bounded(self._lock):
-            gen = self._gen
-            if kind != "ack":
-                self._answered = True
-            if kind not in ("answer", "ack"):
-                self._confirm_pending = True
-                self._confirm_pending_at = self._clock()
-                self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
-            if self._spoken_gen != gen:
-                self._spoken_gen, self._spoken_text = gen, ""
-            self._spoken_text += " ".join(check_sentences + sentences) + " "
-            self._spoken_log.append((self._clock(), " ".join(check_sentences + sentences)))
-            # One-shot credit bound when the utterance was sent: only the first
-            # answer to a wake-word turn opens a window. ack keeps the credit;
-            # every other kind (answer, confirm, unknown) spends it, fail closed.
-            opens_window = (
-                kind == "answer"
-                and self._reply_origin in WAKE_TURN_VIAS
-                and self._clock() - self._reply_origin_at <= REPLY_WINDOW_CREDIT_TTL_S
-            )
-            if kind != "ack":
-                self._reply_origin = ""
-                self._outstanding = max(0, self._outstanding - 1)
-            for sentence in check_sentences:
-                self._player.enqueue(sentence, own=True)
-            for sentence in sentences:
-                self._player.enqueue(sentence)
+            # Re-check: an OFF / retarget may have landed since the check above.
+            why = self._not_spoken_reason_locked(conn)
+            if why is None:
+                gen = self._gen
+                seq = self._note_enqueue_locked(_sid_hash(conn.session) if conn.session else None)
+                if kind != "ack":
+                    self._answered = True
+                if kind not in ("answer", "ack"):
+                    self._confirm_pending = True
+                    self._confirm_pending_at = self._clock()
+                    self._no_talk_over_gen = gen  # set before enqueuing: never "turn"
+                if self._spoken_gen != gen:
+                    self._spoken_gen, self._spoken_text = gen, ""
+                self._spoken_text += " ".join(check_sentences + sentences) + " "
+                self._spoken_log.append((self._clock(), " ".join(check_sentences + sentences)))
+                # One-shot credit bound when the utterance was sent: only the first
+                # answer to a wake-word turn opens a window. ack keeps the credit;
+                # every other kind (answer, confirm, unknown) spends it, fail closed.
+                opens_window = (
+                    kind == "answer"
+                    and self._reply_origin in WAKE_TURN_VIAS
+                    and self._clock() - self._reply_origin_at <= REPLY_WINDOW_CREDIT_TTL_S
+                )
+                if kind != "ack":
+                    self._reply_origin = ""
+                    self._outstanding = max(0, self._outstanding - 1)
+                for sentence in check_sentences:
+                    self._player.enqueue(sentence, own=True)
+                for sentence in sentences:
+                    self._player.enqueue(sentence)
+        if why is not None:
+            if why:
+                self._print(f"[not spoken: session pid {conn.pid} {why}]\n")
+            return
         if kind == "confirm":
             self._print(f'[confirmation needed: when I finish, say "{wake.current().phrase}" and the phrase]\n')
-        self._speech_q.put((gen, opens_window))
+        self._speech_q.put((gen, opens_window, seq))
 
     # ---- speech watcher thread -----------------------------------------
+
+    def _settle(self, seq: int) -> None:
+        """The player is idle and `seq` was the latest session enqueue when its item was posted.
+        If no later enqueue bumped the counter, nobody has speech queued any more; otherwise
+        that later enqueue's own item clears the set."""
+        with _bounded(self._lock):
+            if seq == self._enq_seq:
+                self._speakers.clear()
 
     def _speech_watcher(self) -> None:
         while True:
             item = self._speech_q.get()
             if item is None:
                 return
-            gen, opens_window = item
+            gen, opens_window, seq = item
             while not self._closed:
                 if self._player.wait_idle(_POLL_S):
+                    self._settle(seq)
                     # Only an answer to a wake-word turn opens the open-mic window.
                     if opens_window:
                         self._control.put(("reply_done", gen))
@@ -911,6 +1937,8 @@ def run_attach(
         talk_over=io.talk_over,
         self_wake_guard_s=self_wake_guard_from_env(),
         announce=ANNOUNCE_LEVELS[announce],
+        mic_control=io.set_input_enabled,
+        mic_stalled=lambda: io.stalled,
     )
     pid = os.getpid()
 
@@ -932,7 +1960,7 @@ def run_attach(
             flush=True,
         )
         try:
-            io.start()
+            io.start(input_enabled=not bridge.is_muted())
         except Exception as exc:  # noqa: BLE001 - any device/engine failure
             print(cli.AUDIO_START_ERROR.format(exc=exc), file=sys.stderr)
             return 1
