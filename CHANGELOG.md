@@ -4,6 +4,31 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-06 — Per-session voice on/off and real mute
+
+Live test: pending (Ed). Nothing in this entry has been run live yet.
+
+**Added**
+- `eridian voice on|off [--session ID]` turns voice on or off for one Claude session; `eridian voice status` lists sessions with a `*` on the current wake-turn target. `--session` takes the 12-hex id or the pid from `voice status`. Without it, the session the command runs from is found by process ancestry, and an ambiguous match asks for `--session`.
+- `eridian mute` and `eridian unmute`. Unmute confirms that the mic really reopened.
+- `<home>/control.sock` (0600): a newline-delimited JSON socket for `status`, `voice_on`, `voice_off`, `mute` and `unmute`. `attach` refuses to start without it. Nothing on it can create an utterance, open a turn or grant a confirm.
+- While muted, `attach` closes the mic device so the macOS mic indicator can go off (not yet verified live). Replies keep playing. `attach` starts with the mic closed when the saved state is muted.
+
+**Changed**
+- Multi-attach: every session that sends `hello` stays connected. Wake-word turns go to the most recently attached session with voice on. A new `hello` no longer detaches the others; `{"type":"detached"}` is sent only when a `hello` carries the same session token as a live connection (a reconnect).
+- Sessions start with voice on. An off session gets no utterances, its replies aren't spoken, and its announcements are ignored. Turning off the session whose speech is playing stops that speech.
+- Per-session on/off is saved in `<home>/voice-state.json` (keys are SHA-256 of the session token, never the raw token; mode 0600; at most `MAX_OFF_ENTRIES` entries). Version 2 of that file also stores mute; version 1 loads as unmuted. An unreadable or corrupt state file makes every session off, and starts muted.
+- Mute is real: while muted, mic frames are dropped before the wake word, VAD and STT. A turn in progress when mute lands is discarded, and its transcript is never sent or printed (only `[muted: not sent]`).
+- When sessions exist but none is on, `attach` says `ALL_OFF_SPEECH`. A connection that hasn't sent a valid `hello` within `NO_HELLO_IDLE_S` (5 s) is closed. A `hello` without a valid token is listed but can't get voice.
+- If the mic stalls, `attach` prints `[mic stalled; no input]` once and `[mic input back]` when input returns. If the mic fails to reopen on unmute, `attach` mutes again and prints `[mic failed to reopen; muted]`.
+
+**Security**
+- The control socket has limits: `CONTROL_MAX_CONNECTIONS` (8) plus one reserved connection that serves only `mute`, `voice_off` and `status`; 4096-byte lines; a 5 s per-line and idle deadline; 30 s lifetime; 64 requests per connection. If its accept loop fails for good, `attach` mutes itself and removes the socket.
+- The `eridian` client refuses a socket that isn't owned by you, checks the server's uid, and has a total deadline per request.
+- `voice_guard` (layer 1) refuses, on every turn, any Bash command that could turn voice on or unmute, including any command whose text names `control.sock`. It is a string-matching deterrent, not a hard boundary. Turning voice off stays allowed.
+- `attach` (layer 2) refuses `voice_on` and `unmute` on the control socket when the requesting process descends from Claude Code (`refused: requested from a Claude session`). If the requester can't be verified, it fails closed (`refused: could not verify the requester`). A process deliberately reparented to launchd escapes this check.
+- Side effect: `! eridian unmute` typed into a Claude prompt is refused. Use a plain terminal. The menu-bar app is planned as a separate PR.
+
 ### 2026-11-05 — Renamed from undertone to eridian; follow-up window fix
 
 Entries below this one are kept as released, under the old name.

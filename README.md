@@ -106,6 +106,17 @@ eval "$(~/Projects/personal/eridian/.venv/bin/eridian shell-init zsh)"
 ```
 This defines a `claude` function that runs `eridian launch -- "$@"`. In an interactive terminal it starts `eridian attach` in the background if none is answering (log: `~/.eridian/attach.log`; model load takes a moment), then runs `eridian session`. Everything else goes to plain `claude` unchanged: `ERIDIAN_AUTOLAUNCH=0`, stdin or stdout not a terminal, `-p`/`--print`, `-h`/`--help`, `-v`/`--version`, `--settings`, `--bare`, `--safe-mode`, and claude's own subcommands (`mcp`, `doctor`, `update`, ...). `command claude` bypasses the function. `eridian stop` ends the background attach (SIGTERM; it checks the process is an eridian attach first).
 
+### Voice controls: per-session on/off and mute
+
+Every Claude session you start with `eridian session` stays attached to `eridian attach`. Wake-word turns go to the most recently attached session with voice on; sessions start with voice on. Run these from a plain terminal while `attach` is running:
+- `eridian voice status`: shows whether the mic is muted, then each attached session with `on`/`off`, its id, pid and folder. `*` marks the session that wake-word turns go to.
+- `eridian voice on|off [--session ID]`: turns voice on or off for one session. `ID` is the id or pid from `voice status`. Without `--session`, it uses the session the command runs from (found by process ancestry); if that is ambiguous, it asks for `--session`.
+- `eridian mute` / `eridian unmute`: mute the mic (replies still play). Unmute checks that the mic really reopened.
+
+An off session is silent: it gets no utterances, its replies aren't spoken, and its announcements are ignored. Turning off the session whose speech is playing stops that speech. Mute is real: while muted, nothing you say is sent, and the mic device is closed so the macOS mic indicator can go off (not yet verified live). Per-session settings are saved in `~/.eridian/voice-state.json` under hashes of the session tokens. eridian refuses requests from Claude to turn voice on or unmute the mic (including `eridian voice on` and `eridian unmute` typed into a Claude prompt); turning voice off is allowed. This is best effort, not a hard boundary: see SECURITY.md §6a. A menu-bar app for these controls is planned as a separate PR.
+
+Live test of these controls: pending.
+
 ### Standalone voice conversation (Path B)
 
 `eridian chat [--no-beep] [--no-aec] [--resume] [--follow-up SECONDS] [--tts {kokoro,say}]`
@@ -190,7 +201,7 @@ Voice turns keep full session power but are unverified input. A hard control (`v
 
 - **Confirmation hint:** the new phrase is `[confirmation needed: when I finish, say "hey jarvis" and the phrase]`, clarifying that a silent period before the wake word is required.
 
-- **Announcements:** `eridian attach` speaks fixed templates ("Claude finished.", "Claude needs your permission.", etc.) when Claude ends a turn or asks for permission, and only for the session it is attached to. They use the same speech path as replies (one text scrub, plus the acoustic self-screen with Kokoro), and never include Claude's text. The `--announce` flag controls them. No announcement opens the follow-up window: a session's Stop hook fires after every turn, so a window there would let room speech chain turns. A follow-up turn can't grant a confirmation, and "Claude finished." is suppressed while a confirm is pending.
+- **Announcements:** `eridian attach` speaks fixed templates ("Claude finished.", "Claude needs your permission.", etc.) when Claude ends a turn or asks for permission, and only from the session that wake-word turns go to (an attached session with voice on). They use the same speech path as replies (one text scrub, plus the acoustic self-screen with Kokoro), and never include Claude's text. The `--announce` flag controls them. No announcement opens the follow-up window: a session's Stop hook fires after every turn, so a window there would let room speech chain turns. A follow-up turn can't grant a confirmation, and "Claude finished." is suppressed while a confirm is pending.
 
 ### Path B: standalone `eridian chat`
 
