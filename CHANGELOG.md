@@ -8,6 +8,11 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 Live test: pending (Ed). Nothing in this entry has been run live yet.
 
+**Breaking**
+- A newer session no longer detaches the older one; every session stays attached, and wake turns go to the newest one with voice on. Use `eridian voice off` to silence the others.
+- `eridian attach` refuses to start if it can't create `<home>/control.sock`.
+- `voice-state.json` is new (version 2). Older builds never read it; there's nothing to migrate.
+
 **Added**
 - `eridian voice on|off [--session ID]` turns voice on or off for one Claude session; `eridian voice status` lists sessions with a `*` on the current wake-turn target. `--session` takes the 12-hex id or the pid from `voice status`. Without it, the session the command runs from is found by process ancestry, and an ambiguous match asks for `--session`.
 - `eridian mute` and `eridian unmute`. Unmute confirms that the mic really reopened.
