@@ -88,6 +88,21 @@ tracked while muted, so the self-wake guard survives a mute. If the control acce
 up (ACCEPT_MAX_ERRORS consecutive failures) the mute switch is gone, so the bridge mutes
 itself and prints `[control socket failed; muted]`.
 
+The mic DEVICE is closed while muted (`mic_control`, wired by run_attach to
+`AudioIO.set_input_enabled`) so the OS mic indicator goes off; attach also starts
+with the device closed when the persisted state is muted. Frame-dropping stays
+THE guarantee: the device call is made on the main thread, after the listener
+cancel and with no lock held, and the audio engine keeps yielding (silent) frames
+while closed, since the bridge only processes control requests when a frame
+arrives. A failed close prints `[mic did not close; frames are still dropped]` and
+stays muted. An unmute reopens the device BEFORE the listener resumes; if the
+reopen fails the bridge re-mutes (persisted) and prints `[mic failed to reopen;
+muted]`, so it never reports unmuted with a dead mic. If even that re-mute raises (a wedged
+lock) the mute is forced in memory and `[mic failed to reopen; muted (not saved)]` printed;
+nothing raises out of the frame loop. An `unmute` control reply of ok means the state change
+was ACCEPTED: the device is reopened on the next frame and may fail and re-mute, so `status`
+is authoritative.
+
 Control socket (`paths.control_socket_path()`, 0600, bound like voice.sock). It is
 the mute switch, so `start()` FAILS (and releases voice.sock) if it cannot be
 bound. Newline-delimited JSON, one response line per request line, several
@@ -102,6 +117,9 @@ in status is stripped of control characters and cut to CONTROL_CWD_CHARS:
     {"op":"voice_on"|"voice_off","session":"<id or pid>"} | {"op":"mute"} | {"op":"unmute"}
                      -> {"ok":true} | {"ok":false,"error":"<fixed text>"}
     anything else (unknown op, bad JSON, wrong types) -> {"ok":false,"error":"bad request"}
+
+An `unmute` reply of ok means the state change was accepted. The mic device is reopened on
+the next audio frame and that may fail and re-mute, so `status` is authoritative.
 
 Errors are fixed text (no such session / can't turn on a session without a token /
 could not save) and never echo the request. Nothing on this socket can create an
@@ -247,6 +265,7 @@ MAX_OFF_ENTRIES = 64  # persisted OFF sessions; the oldest are dropped past this
 VOICE_STATE_VERSION = 2  # v1 files (no "muted") still load, as unmuted
 CONTROL_MAX_CONNECTIONS = 8
 CONTROL_MAX_LINE_BYTES = 4096
+FORCE_MUTE_LOCK_S = 1.0  # how long the last-resort mute waits for the session lock
 CONTROL_IDLE_S = 5.0  # a request line must complete this long after its first byte; idle between requests is capped too
 CONTROL_LIFETIME_S = 30.0  # absolute cap on one control connection
 CONTROL_MAX_REQUESTS = 64  # requests served on one control connection
@@ -379,7 +398,12 @@ class VoiceBridge:
         no_hello_idle_s: float = NO_HELLO_IDLE_S,
         control_socket_path: Path | None = None,
         control_idle_s: float = CONTROL_IDLE_S,
+        mic_control: Callable[[bool], None] | None = None,
+        mic_stalled: Callable[[], bool] | None = None,
     ) -> None:
+        self._mic_control = mic_control
+        self._mic_stalled = mic_stalled
+        self._stall_reported = False  # main thread: the last stall state we printed
         self._control_idle_s = control_idle_s
         self._no_hello_idle_s = no_hello_idle_s
         self._home = Path(home) if home is not None else None  # resolved lazily: no mkdir at construction
@@ -876,6 +900,57 @@ class VoiceBridge:
         if gen != self._mute_applied_gen:  # a counter, so a quick mute->unmute still cancels
             self._mute_applied_gen = gen
             self._listener.cancel()
+            self._apply_mic_device()
+
+    def _apply_mic_device(self) -> None:
+        """Main thread, no lock held. Close the mic device while muted, reopen it on unmute.
+
+        Dropping frames is the guarantee; closing the device is the visible
+        signal (the OS mic indicator). A failed close leaves the bridge muted
+        and safe. A failed reopen re-mutes, so the bridge never reports
+        unmuted while the mic is dead; nothing here may raise out of the frame loop.
+        """
+        if self._mic_control is None:
+            return
+        try:
+            muted = self.is_muted()
+        except Exception:  # noqa: BLE001 - a wedged lock: fail toward muted, and force it
+            muted = True
+            self._force_mute()
+        if muted:
+            try:
+                self._mic_control(False)
+            except Exception:  # noqa: BLE001 - any device failure; frames are dropped regardless
+                with contextlib.suppress(Exception):
+                    self._print("[mic did not close; frames are still dropped]\n")
+            return
+        try:
+            self._mic_control(True)
+        except Exception:  # noqa: BLE001 - any device failure
+            try:
+                self.set_muted(True)
+                msg = "[mic failed to reopen; muted]\n"
+            except Exception:  # noqa: BLE001 - e.g. a wedged lock: force the mute in memory
+                self._force_mute()
+                msg = "[mic failed to reopen; muted (not saved)]\n"
+            with contextlib.suppress(Exception):
+                self._print(msg)
+
+    def _force_mute(self) -> None:
+        """Last resort: mute in memory even if the normal transaction cannot run.
+
+        Best effort under the session lock; if the lock cannot be taken in time the
+        two attribute writes still happen (each is atomic), which beats crashing the
+        frame loop or leaving a dead mic reported as unmuted.
+        """
+        got = self._lock.acquire(timeout=FORCE_MUTE_LOCK_S)
+        try:
+            self._muted = True
+            self._mute_gen += 1
+            self._saved = False
+        finally:
+            if got:
+                self._lock.release()
 
     def process_frame(self, frame: bytes) -> None:
         self._sync_mute()
@@ -883,10 +958,27 @@ class VoiceBridge:
         if self._player.busy:  # kept fresh while muted: the self-wake guard must survive a mute
             self._last_busy = self._clock()
         if self._muted:
+            self._stall_reported = False  # the device is closed: silence is expected, not a stall
             return  # real mute: no wake word, VAD or STT ever sees this frame
         self._sync_mute()  # an unmute landed mid-drain: start from a cancelled listener
+        if self._muted:
+            return  # that sync may itself have re-muted (the mic would not reopen)
+        self._check_stall()
         self._listener.talk_over = self._talk_over_mode()
         self._listener.process_frame(frame)
+
+    def _check_stall(self) -> None:
+        """Main thread, unmuted only. Print once when the mic stops delivering and once when it is back."""
+        if self._mic_stalled is None:
+            return
+        try:
+            stalled = bool(self._mic_stalled())
+        except Exception:  # noqa: BLE001 - advisory only
+            return
+        if stalled != self._stall_reported:
+            self._stall_reported = stalled
+            with contextlib.suppress(Exception):
+                self._print("[mic stalled; no input]\n" if stalled else "[mic input back]\n")
 
     def _talk_over_mode(self) -> str:
         if not self._talk_over:
@@ -1705,6 +1797,8 @@ def run_attach(
         talk_over=io.talk_over,
         self_wake_guard_s=self_wake_guard_from_env(),
         announce=ANNOUNCE_LEVELS[announce],
+        mic_control=io.set_input_enabled,
+        mic_stalled=lambda: io.stalled,
     )
     pid = os.getpid()
 
@@ -1726,7 +1820,7 @@ def run_attach(
             flush=True,
         )
         try:
-            io.start()
+            io.start(input_enabled=not bridge.is_muted())
         except Exception as exc:  # noqa: BLE001 - any device/engine failure
             print(cli.AUDIO_START_ERROR.format(exc=exc), file=sys.stderr)
             return 1

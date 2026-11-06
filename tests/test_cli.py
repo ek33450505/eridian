@@ -443,8 +443,9 @@ class FakeEngine:
     def wait_drained(self, timeout: float | None = None) -> bool:
         return True
 
-    def start(self) -> None:
+    def start(self, input_enabled: bool = True) -> None:
         self.started = True
+        self.input_enabled = input_enabled
 
     def close(self) -> None:
         self.closed = True

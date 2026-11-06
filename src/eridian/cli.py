@@ -125,21 +125,42 @@ class AudioIO:
         self.talk_over = talk_over
         self.engine = engine
         self.voice_label = voice_label
+        self._mic: object | None = None  # the no-AEC MicSource, created lazily by frames()
+
+    def _source(self):
+        """The active frame source: the AEC engine, or the plain mic when there is none."""
+        if self.engine is not None:
+            return self.engine
+        if self._mic is None:
+            from . import audio
+
+            self._mic = audio.MicSource()
+        return self._mic
 
     def frames(self):
-        if self.engine is not None:
-            return self.engine.frames()
-        from . import audio
+        return self._source().frames()
 
-        return audio.frame_source()
-
-    def start(self) -> None:
+    def start(self, input_enabled: bool = True) -> None:
+        # The plain mic has no separate start: frames() opens it on first use.
         if self.engine is not None:
-            self.engine.start()
+            self.engine.start(input_enabled=input_enabled)
+        else:
+            self._source().start(input_enabled=input_enabled)
+
+    def set_input_enabled(self, enabled: bool) -> None:
+        """Open or close the mic device; frames keep flowing (silent) while it is closed."""
+        self._source().set_input_enabled(enabled)
+
+    @property
+    def stalled(self) -> bool:
+        """True while the active source yields silence because the open mic delivers nothing."""
+        return bool(self._source().stalled)
 
     def close(self) -> None:
         if self.engine is not None:
             self.engine.close()
+        elif self._mic is not None:
+            self._mic.close()
 
 
 def _say_voices() -> tuple[str, str]:
