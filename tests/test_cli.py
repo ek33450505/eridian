@@ -49,8 +49,8 @@ class RetiredCommandsTest(CliTestCase):
         self.assertEqual(
             sorted(sub.choices),
             [
-                "attach", "channel", "chat", "launch", "listen", "migrate", "models",
-                "safe-phrase", "session", "shell-init", "stop",
+                "attach", "channel", "chat", "launch", "listen", "migrate", "models", "mute",
+                "safe-phrase", "session", "shell-init", "stop", "unmute", "voice",
             ],
         )
 
