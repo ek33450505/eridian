@@ -6,7 +6,7 @@
 ## The short version
 
 - **No new hub.** Claude Code + MCP already is the hub; eridian is the voice front end into it. "Connecting my apps" means vetted MCP servers or Shortcuts, plus a voice-safety tier for them (Phase 8).
-- **No full desktop app.** A small signed Swift menu-bar helper owns the microphone permission, keeps `eridian attach` running, shows state, and adds mute and push-to-talk (Phase 7). Bundling Python + MLX + onnxruntime into a notarized app isn't worth it. cast-desktop may get a read-only voice status panel later.
+- **No full desktop app.** A small Swift menu-bar app *controls* voice: per-session on/off and a global real mute (Phase 7, revised 2026-11-05). It doesn't launch or supervise `eridian attach`; the `shell-init` autolaunch starts that from the terminal. Bundling Python + MLX + onnxruntime into a notarized app isn't worth it. cast-desktop may get a read-only voice status panel later.
 - **First, Jarvis speaks first** (Phase 6). It announces when Claude finishes or needs you, then opens the no-wake-word follow-up window. That's the clearest gap against VoiceMode and Superwhisper, and it needs no new permissions.
 
 ## Ground rules (every session)
@@ -16,7 +16,7 @@
 - Mutation-test every new control: break it, see its test fail, restore.
 - Verify every commit with `git cat-file -t` / `git log` (the commit agent has reported commits that didn't exist).
 - Agent-written docs: grep every code span, then **read the prose** — on 2026-10-02 all 120 spans checked out and the prose still had 15 errors.
-- Claude's sandbox blocks unix-socket binds, `/tmp` writes and MLX, so `tests.test_voice`, `tests.test_mcp_channel` and `tests.test_stt` run only on Ed's side (`! uv run python -m unittest discover -s tests`). Live tests are always Ed's.
+- The full suite now runs in Claude's session too (`.venv/bin/python -m unittest discover -s tests`, 1212 OK on 2026-11-06); run single test files only through `discover`, since `tests/test_00_hermetic_env.py` scrubs `ERIDIAN_*` only there. Live tests are always Ed's.
 - After any protocol, hook or instruction change, restart **both** `eridian attach` and `eridian session`.
 
 ## Session map
@@ -25,8 +25,8 @@
 |---|---|---|
 | S0 | Finish Phase 4b | PR merged after Ed's live test |
 | S1 | Phase 6: Jarvis speaks first | Ed types a long task, walks away, hears "Claude finished", asks a follow-up without the wake word |
-| S2 | Phase 7a: helper spike + core | Spike go; the helper supervises `attach` and shows its state |
-| S3 | Phase 7b: push-to-talk, mute, launch at login | Live: hotkey turn works, mute really stops the mic, helper survives re-login |
+| S2 | Phase 7a: voice control plane (Python) | ✓ Built 2026-11-05/06: multi-attach, `control.sock`, real mute, CLI, guard refusals |
+| S3 | Phase 7b: menu-bar app | Spike go; live (Ed): one session on and one off, mute turns the mic indicator off, no background conversation gets in |
 | S4 | Phase 8a: voice-safety tier for app tools | Read-only tools run on a voice turn; side-effect tools need a confirm whose prompt eridian, not Claude, describes |
 | S5 | Phase 8b: first integrations | Live: calendar question, reminder (with confirm), music, "what did I spend today?" |
 
@@ -78,11 +78,27 @@ Design changes from the spike and review: `PermissionRequest` (→ permission / 
 - 6.3: docs (README, CHANGELOG, SECURITY, architecture, this plan).
 - ✓ Live test by Ed: passed 2026-10-03.
 
-## Phase 7 — menu-bar helper (S2–S3)
+## Phase 7 — voice controls and menu-bar app (S2–S3)
 
-**Why.** Today the terminal app holds the microphone permission, nothing restarts `attach` after a crash or re-login, and there's no visual state, mute or push-to-talk.
+**Revised (Ed, 2026-11-05).** Ed wants to test voice in chosen sessions without the others interfering. This replaces the original helper design below.
+- **Sessions start voice-ON**, and Ed turns individual sessions off and on. The newest attached session with voice on gets wake turns. An OFF session is fully silent: no turns, no spoken replies, no announcements, and turning it off cuts its speech in flight.
+- **Global real mute.** Mic frames are dropped before the wake word, VAD and STT, and the mic device is closed while muted so the macOS indicator goes off. A failed or unreadable state fails toward not-listening.
+- **The app only controls.** A SwiftUI `MenuBarExtra` (`LSUIElement`) lists sessions with an on/off switch each, plus the mute master switch, over `<home>/control.sock`. It doesn't launch or supervise `attach`. The original mic-permission rationale (a helper owning the mic and starting `attach` at login) is **superseded by U1 autolaunch**: `eridian shell-init` starts `attach` from the terminal, which keeps the mic permission.
+- **CLI backup:** `eridian voice on|off|status [--session]` and `eridian mute|unmute`.
+- **Claude can't turn voice on or unmute**, on any turn. There are two layers: `voice_guard` refuses the command forms in Claude's Bash (a string-matching deterrent), and `attach` refuses `voice_on`/`unmute` when the requesting process descends from Claude Code. Turning things off stays allowed. Honest limit: Claude runs as the same user, and a deliberately detached process escapes the ancestry check.
+- **Dropped:** a typed `/rocky` slash command (Ed, 2026-11-05).
 
-**Design.**
+**Built on `feature/voice-controls` (2026-11-05/06), each unit reviewed by `code-reviewer` and `security`, with its controls mutation-tested:**
+- ✓ A1 (`261841a`): multi-attach, per-session on/off, OFF persisted in `voice-state.json`.
+- ✓ A2 (`a53f14e`): `control.sock` and real mute (frame drop; a turn in flight at mute time is never sent).
+- ✓ A2b (`bd7dcbc`): the mic device closed while muted.
+- ✓ A3 (`c5a3e54`): the CLI.
+- ✓ B1 (`fdbd33b`): the `voice_guard` refusals.
+- ✓ B2 (`cf6845f`): the attach-side ancestry refusal.
+- C: the menu-bar app. Spike first (below, minus the supervise/restart checks), then the core. Swift work goes through `backend-writer`; Ed does the GUI checks.
+- Live test (Ed): remove `ERIDIAN_AUTOLAUNCH=0`; one session on and one off; mute turns the mic indicator off; no background conversation gets in; unplug the mic while attached and check that mute and unmute still work.
+
+**Original design (2026-10-02), kept for the spike and push-to-talk notes:**
 - `macos/EridianHelper/`: a SwiftUI `MenuBarExtra` app, `LSUIElement`, with `NSMicrophoneUsageDescription` in its Info.plist. **Without that key, macOS denies a child's mic request silently** (the child's request is charged to the parent app).
 - The helper spawns and supervises `eridian attach` (restart with backoff) and shows listening / speaking / muted / stopped; menu items Start/Stop, Mute, Voice (Kokoro / say), Quit.
 - A control socket in `attach`, `<home>/control.sock` (0600), JSON lines: `status`, `mute`, `unmute`, `ptt_down`, `ptt_up`, with state events pushed back. **Mute is real:** mic frames are dropped before the wake word, VAD and STT, not merely ignored.
@@ -92,7 +108,19 @@ Design changes from the spike and review: `PermissionRequest` (→ permission / 
 
 **Spike (first hour of S2, go/no-go, from the research).** A ~60-line Swift app that runs `uv run eridian attach` with Start/Stop and alive/dead in the menu bar. Go if: exactly one mic prompt, naming the helper; System Settings lists the helper, not Terminal; the mic still works with Terminal quit; no new prompt after re-login; a `kill -9` of the child is restarted in under 5 s.
 
-**Units.** 7.1 control socket in `attach` (Python) + tests. 7.2 Swift helper: supervise, menu, status. 7.3 push-to-talk + mute end to end. 7.4 `eridian helper install|uninstall` (LaunchAgent) + docs.
+**Units (original).** 7.1 control socket in `attach` (done as A2). 7.2 Swift helper: supervise, menu, status (now control only, unit C). 7.3 push-to-talk + mute end to end (mute done; push-to-talk not scheduled). 7.4 `eridian helper install|uninstall` (LaunchAgent; only if the app should start at login).
+
+## Rocky persona v1 (after Phase 7, its own PR)
+
+Ed, 2026-11-05: Rocky's personality should run through the whole chat, not just the spoken replies. Today `ERIDIAN_PERSONA=rocky` (`src/eridian/persona.py`) only shapes spoken replies.
+- Typed answers in an `eridian session` also in Rocky's style.
+- A deeper character: backstory, humor, greetings, reactions to wins and failures, and knowing Ed.
+- eridian's own fixed lines (announcement templates, the no-session / all-off / mute notices) in Rocky's voice.
+- Stays plain: code, paths, numbers, diffs, confirm prompts, and the "eridian blocked: …" read-back in the own voice.
+
+## Before the repo goes public
+
+Ed, 2026-11-05: a full review phase of the repo, docs and README before it goes public. Check every doc against the code (code spans and prose, per the ground rules), remove stale plans and personal paths, refresh SECURITY.md for the voice controls, and get a whole-repo `pr-reviewer` / `security` pass.
 
 ## Phase 8 — app hub v1 (S4–S5)
 
@@ -182,15 +210,11 @@ Start eridian Phase 6 (Jarvis speaks first). Read docs/plan-phases-6-8.md (Phase
 THEN: 1 h spike — dump real Stop/Notification hook payloads; decide the announce transport (one-shot announce line on voice.sock vs via the channel). Bring Ed the design before building. Ceremony: native plan mode, backend-writer per unit, code-reviewer + security, mutation-test controls, verify commits with git.
 ```
 
-**S2 (Phase 7a):**
-```
-Start eridian Phase 7 (menu-bar helper). Read docs/plan-phases-6-8.md (Phase 7) and docs/research/2026-10-02-jarvis/q1-desktop-app.md. PRE-FLIGHT as usual.
-THEN: the 1 h Swift spike and its go/no-go list (mic prompt names the helper; works with Terminal quit; survives re-login; kill -9 restart < 5 s). Ed runs the GUI steps. If go: units 7.1 (control socket) and 7.2 (helper core).
-```
+**S2 (Phase 7a):** ✓ done (A1–B2 on `feature/voice-controls`).
 
 **S3 (Phase 7b):**
 ```
-Continue eridian Phase 7: push-to-talk (via "ptt", non-granting unless Ed decided otherwise), real mute, LaunchAgent install/uninstall, docs. Security review on the control socket and ptt turns. Live test by Ed.
+Continue eridian Phase 7: the SwiftUI menu-bar app (unit C). Read docs/plan-phases-6-8.md (Phase 7, revised) and the control.sock protocol in src/eridian/voice.py's docstring. The app only controls: session list with on/off switches and a mute master switch over control.sock; it never launches attach. Spike first (one prompt-free control round-trip; status polling; Ed runs the GUI steps), then the core. Swift via backend-writer; code-reviewer + security. Live test by Ed.
 ```
 
 **S4 (Phase 8a):**
