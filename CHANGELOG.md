@@ -4,6 +4,12 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-09 — Rocky persona for the typed chat
+
+**Added**
+- `python -P -m eridian.persona sessionstart --under DIR`: a Claude Code SessionStart hook that adds `TYPED_ROCKY_BLOCK` to the session's context when the session's cwd is inside `DIR`, and prints nothing otherwise. It always exits 0 once its arguments parse, so it can't block a session. Register it in your Claude Code settings yourself; eridian doesn't install it.
+- `TYPED_ROCKY_BLOCK`: full Rocky speech in conversational turns, the same character with standard grammar in dense technical turns. Code, paths, numbers, commands, concerns, approval questions and anything written to disk or sent outside the chat stay plain English. The spoken `ROCKY_BLOCK` and `ERIDIAN_PERSONA` are unchanged.
+
 ### 2026-11-06 — Per-session voice on/off and real mute
 
 Live test: pending (Ed). Nothing in this entry has been run live yet.
