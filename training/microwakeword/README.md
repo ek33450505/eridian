@@ -1,6 +1,6 @@
 # microWakeWord training setup
 
-Unit A of training a custom "hey rocky" wake word model for
+Training a custom "hey rocky" wake word model for
 `pymicro-wakeword` (`MicroWakeWord.from_config`). `setup.sh` builds the
 training environment and downloads the datasets, following the official
 [basic training notebook](https://github.com/kahrendt/microWakeWord/blob/main/notebooks/basic_training_notebook.ipynb).
@@ -27,6 +27,8 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
   redoes its pip install if the existing clone differs. Unset, the clone is
   left as is (it is not pinned).
 - Audio decoding uses `soundfile` and `datasets<4`; no ffmpeg needed.
+
+**Trust:** training is trust-on-first-use. `setup.sh` downloads upstream code and datasets, and some are unpinned: it clones microWakeWord's default branch unless `MWW_REF` is set, clones the `mps-support` branch of `PIPER_REPO` (`setup.sh:182`), and fetches data from Hugging Face `resolve/main` URLs.
 
 ## Licenses
 
@@ -97,8 +99,8 @@ phonetic variants), `negatives` (5000 confusables over 10 phrases, 500 each:
 held-out "hey rocky", false accepts on confusables and speech, and a suggested
 `probability_cutoff`. Rerun it any time:
 
-    ~/Projects/personal/eridian/.venv/bin/python -I \
-        training/microwakeword/smoke_test.py --root ~/Datasets/eridian-training/mww
+    .venv/bin/python -I \
+        training/microwakeword/smoke_test.py --root $MWW_ROOT
 
 Edit `micro.probability_cutoff` in `hey_rocky.json` (higher = fewer false
 accepts, more misses) and rerun. If the speech set is synthetic `say` audio the
@@ -110,10 +112,10 @@ Synthetic voices miss how you actually say the phrases. Record real ones and
 train on them:
 
 1. Stop eridian first, or saying the wake word 50 times wakes it:
-   `~/Projects/personal/eridian/.venv/bin/eridian stop`
+   `.venv/bin/eridian stop`
 2. Record (about 50 takes per phrase):
 
-       ~/Projects/personal/eridian/.venv/bin/python -I training/microwakeword/record_clips.py
+       .venv/bin/python -I training/microwakeword/record_clips.py
 
    Clips land in `$MWW_ROOT/real/positives/hey_rocky/` and
    `$MWW_ROOT/real/confusables/<phrase>/` (hey_rock, hey_rocks, hey_rocco,
