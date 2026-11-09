@@ -859,6 +859,74 @@ class EnsureAttachTest(CliTestCase):
             cli._ensure_attach()
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
+    def _spawn_with_log(self, content: bytes) -> Path:
+        from eridian import voice
+
+        log = paths.attach_log_path()
+        log.write_bytes(content)
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen", return_value=mock.Mock(pid=9)),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            cli._ensure_attach()
+        return log
+
+    def test_log_at_threshold_rotates_and_keeps_content(self) -> None:
+        old = b"x" * cli._ATTACH_LOG_ROTATE_BYTES
+        log = self._spawn_with_log(old)
+        rotated = log.with_name("attach.log.1")
+        self.assertEqual(rotated.read_bytes(), old)
+        self.assertEqual(log.stat().st_size, 0)
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+
+    def test_rotation_replaces_older_rotated_log(self) -> None:
+        log = paths.attach_log_path()
+        log.with_name("attach.log.1").write_text("ancient")
+        self._spawn_with_log(b"y" * cli._ATTACH_LOG_ROTATE_BYTES)
+        self.assertEqual(
+            log.with_name("attach.log.1").read_bytes(), b"y" * cli._ATTACH_LOG_ROTATE_BYTES
+        )
+
+    def test_log_below_threshold_is_not_rotated(self) -> None:
+        old = b"x" * (cli._ATTACH_LOG_ROTATE_BYTES - 1)
+        log = self._spawn_with_log(old)
+        self.assertEqual(log.read_bytes(), old)
+        self.assertFalse(log.with_name("attach.log.1").exists())
+
+    def test_failed_rotation_warns_and_spawn_proceeds(self) -> None:
+        from eridian import voice
+
+        log = paths.attach_log_path()
+        log.write_bytes(b"x" * cli._ATTACH_LOG_ROTATE_BYTES)
+        log.with_name("attach.log.1").mkdir()  # os.replace onto a directory fails
+        err = io.StringIO()
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen", return_value=mock.Mock(pid=9)) as popen,
+            contextlib.redirect_stderr(err),
+        ):
+            cli._ensure_attach()
+        self.assertIn("could not rotate", err.getvalue())
+        popen.assert_called_once()
+
+    def test_oversized_symlinked_log_is_not_rotated_or_followed(self) -> None:
+        from eridian import voice
+
+        target = Path(self._tmp.name) / "victim"
+        target.write_bytes(b"k" * cli._ATTACH_LOG_ROTATE_BYTES)
+        log = paths.attach_log_path()
+        log.symlink_to(target)
+        with (
+            mock.patch.object(voice, "_server_answers", return_value=False),
+            mock.patch.object(cli.subprocess, "Popen"),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            cli._ensure_attach()
+        self.assertTrue(log.is_symlink())
+        self.assertFalse(log.with_name("attach.log.1").exists())
+        self.assertEqual(target.read_bytes(), b"k" * cli._ATTACH_LOG_ROTATE_BYTES)
+
     def test_symlinked_log_warns_and_does_not_raise(self) -> None:
         from eridian import voice
 

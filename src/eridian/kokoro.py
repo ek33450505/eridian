@@ -32,7 +32,7 @@ MODEL_REPO = "onnx-community/Kokoro-82M-v1.0-ONNX"
 MODEL_REVISION = "1939ad2a8e416c0acfeecc08a694d14ef25f2231"
 MODEL_FILE = "onnx/model.onnx"
 TOKENIZER_FILE = "tokenizer.json"
-# Ed's pick; screen test 2026-10-02 over 200 sentences: 0 ordinary blocked, 10/11 homophone attacks blocked
+# Chosen by a screen test (2026-10-02) over 200 sentences: 0 ordinary blocked, 10/11 homophone attacks blocked
 # (am_michael: 2 blocked, 11/11).
 DEFAULT_VOICE = "am_adam"
 VOICE_ENV = "ERIDIAN_KOKORO_VOICE"

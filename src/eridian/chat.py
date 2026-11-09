@@ -1,4 +1,4 @@
-"""The Path B conversation loop: wake word -> Claude -> spoken reply -> follow-up.
+"""The hands-free conversation loop: wake word -> Claude -> spoken reply -> follow-up.
 
 `ChatSession` wires the listener (wake word / VAD / STT), a `ClaudeBrain`
 (a long-lived `claude` child), a `SentenceChunker` and a `SpeechQueue` into

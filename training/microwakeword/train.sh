@@ -150,7 +150,7 @@ gen() {
 	log "generate $count x '$text' -> $dir/$name"
 	safe_rm_subdir "${dir#"$MWW_ROOT/"}/$name"
 	# torch >= 2.6 defaults torch.load to weights_only=True, which rejects piper's
-	# pickled checkpoint. Ed approved the full unpickle on 2026-11-04 for this
+	# pickled checkpoint. The full unpickle was approved by the maintainer on 2026-11-04 for this
 	# hash-pinned file only: set on this one command, never exported.
 	TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 "$PY" "$PIPER_DIR/generate_samples.py" "$text" \
 		--max-samples "$count" \
