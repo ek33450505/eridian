@@ -20,6 +20,8 @@ docker build -t eridian-oww:latest training/
 **Build time:** ~5-10 minutes (first build; subsequent builds use layer caching)
 **Image size:** **3.58 GB** (significantly reduced via dependency reordering — see Deviations below)
 
+**Trust:** the image is built from upstream git tags and GitHub release assets (`training/Dockerfile`) with no checksum check. `scipy` and `pyyaml` are unpinned (`training/Dockerfile:58-59`), and training downloads datasets when it runs, so training is trust-on-first-use.
+
 ## Running the Smoke Test
 
 Verify the image is working:

@@ -4,7 +4,7 @@
 
 The default "hey jarvis" wake phrase ships pretrained in pymicro-wakeword (built-in model, Apache-2.0 licensed code). **No training is required** to use eridian.
 
-If you want to train a custom phrase (e.g., "hey eridian", "alexa", "hey claude"), the `training/` Docker image provides an optional environment for that work.
+If you want to train a custom phrase (e.g., "hey eridian", "alexa", "hey claude"), the `training/` Docker image provides an optional environment for that work. To train a wake word that eridian can load, use the microWakeWord path in `training/microwakeword/`; see [Custom Model Integration](#custom-model-integration) below.
 
 ## What the Image Is
 
@@ -47,12 +47,12 @@ This script will:
 
 ## Data Locations
 
-Example from Ed's machine (2026-10-01):
+Example layout from one run (2026-10-01). `$DATA_DIR` stands for any host directory you choose (for example `export DATA_DIR="$HOME/wakeword-data"`):
 
 | Item | Location | Size |
 |---|---|---|
-| Negative features (adversarial background) | `~/Datasets/openwakeword/` | ~17 GB |
-| Training work directory | `~/Datasets/eridian-training/` | varies |
+| Negative features (adversarial background) | `$DATA_DIR/openwakeword/` | ~17 GB |
+| Training work directory | `$DATA_DIR/eridian-training/` | varies |
 | Docker TTS model | (downloaded at build, cached in image) | ~600 MB |
 | Feature models (embedding + melspectrogram) | (downloaded at build, cached in image) | ~50 MB |
 
@@ -60,8 +60,8 @@ Mount your data directory at `/work/data` and output directory at `/work/models`
 
 ```bash
 docker run --rm -it \
-  -v ~/Datasets/eridian-training:/work/data \
-  -v ~/Datasets/eridian-training/models:/work/models \
+  -v $DATA_DIR/eridian-training:/work/data \
+  -v $DATA_DIR/eridian-training/models:/work/models \
   eridian-oww:latest \
   bash
 ```
@@ -91,7 +91,7 @@ This image is the only part of the repo that downloads training data. It does so
 
 **During training:** datasets and phonemizer data are downloaded, as your training script specifies.
 
-eridian's runtime (`eridian chat`, `listen`, `serve`) never downloads training data.
+eridian's runtime (`eridian chat`, `listen`) never downloads training data.
 
 ## Known Nits
 
@@ -107,16 +107,12 @@ Earlier versions had models in `/opt/openwakeword/resources/models/` (flat), but
 
 3.58 GB is large (PyTorch + dependencies dominate). For production inference of a trained model, extract the ONNX file to a minimal inference container.
 
-## Custom Model Integration: Bring Your Own
+## Custom Model Integration
 
-A custom wake phrase trained in this image remains separate from eridian's default. To use it:
+eridian loads a custom wake word from a microWakeWord manifest. Set `ERIDIAN_WAKE_MODEL` to the absolute path of the manifest JSON (a leading `~` is fine). It then replaces the default "hey jarvis" everywhere: the detector, the acoustic self-screen, the text scrub, transcript stripping, and the channel's instructions. The manifest's `wake_word` sets the phrase, and its `model` names a `.tflite` file in the same folder. A set-but-invalid manifest is an error at startup, never a silent fall back to the default.
 
-1. Export the trained model as ONNX (openWakeWord handles this)
-2. Wire it into eridian. **This is not integrated, and it isn't on the current roadmap.** Phase 4 only mentions an optional second-stage verifier model, if "hey jarvis" turns out to false-accept.
+The microWakeWord path in [`training/microwakeword/`](../training/microwakeword/README.md) produces such a pair. Its install step writes `out/hey_rocky.tflite` and `out/hey_rocky.json` under `MWW_ROOT`, so:
 
-Currently, eridian uses pymicro-wakeword's built-in "Hey Jarvis" model. A custom model would need:
-- Integration point in `eridian/cli.py:_make_wake_factory()`
-- ONNX runtime setup (currently only pymicro-wakeword is loaded)
-- Model path configuration (via env var or config file)
+    ERIDIAN_WAKE_MODEL=$MWW_ROOT/out/hey_rocky.json eridian chat
 
-The training image works today. Wiring a trained model into eridian is not yet planned.
+The openWakeWord image in this directory exports ONNX models, and eridian does not load those. Its wake loader, `MicroWakeWord.from_config` in pymicro-wakeword, reads microWakeWord manifests only.

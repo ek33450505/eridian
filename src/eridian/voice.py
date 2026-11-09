@@ -3,7 +3,7 @@ Code Channel MCP server (mcp_channel.py) on the other.
 
 `eridian attach` runs this process. "hey jarvis" plus a spoken question is
 transcribed on-device and sent to the attached channel as an `utterance`; the
-channel injects it into Ed's interactive Claude Code session, Claude answers by
+channel injects it into the user's interactive Claude Code session, Claude answers by
 calling the channel's `reply` tool, and the channel sends the text back as a
 `reply` line, which this process speaks and then opens a follow-up window.
 

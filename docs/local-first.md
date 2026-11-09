@@ -13,16 +13,16 @@ This is the deep version of the README's lead section. eridian's promise is: **n
 ### 1. **`eridian models fetch`**
 A one-time Hugging Face download includes:
 - `mlx-community/parakeet-tdt-0.6b-v3` (STT, ~2.5 GB): model file 2,508,288,736 bytes (`model.safetensors`)
-- `onnx-community/Kokoro-82M-v1.0-ONNX` (TTS, pinned revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, Phase 4b): fp32 `onnx/model.onnx`, tokenizer, and voice files. Each is checked against a SHA-256 pinned in `src/eridian/kokoro.py` whenever it loads from the cache
+- `onnx-community/Kokoro-82M-v1.0-ONNX` (TTS, pinned revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`): fp32 `onnx/model.onnx`, tokenizer, and voice files. Each is checked against a SHA-256 pinned in `src/eridian/kokoro.py` whenever it loads from the cache
 
-In normal operation, `stt.py` does `os.environ.setdefault("HF_HUB_OFFLINE", "1")` at import time, before parakeet is imported. `kokoro.py` does the same before importing onnxruntime. That keeps the Hub offline on every start, unless you set `HF_HUB_OFFLINE` yourself. Without that flag, `from_pretrained` contacts the Hub on every startup even with a warm local cache (discovered in Phase 0).
+In normal operation, `stt.py` does `os.environ.setdefault("HF_HUB_OFFLINE", "1")` at import time, before parakeet is imported. `kokoro.py` does the same before importing onnxruntime. That keeps the Hub offline on every start, unless you set `HF_HUB_OFFLINE` yourself. Without that flag, `from_pretrained` contacts the Hub on every startup even with a warm local cache (discovered in early testing).
 
 The `fetch_model()` function temporarily lifts the offline flag ONLY for the one-time download; loading never contacts the Hub again. At runtime, the model is loaded with `local_files_only=True`.
 
 ### 2. **The `claude` Child** (Path B) and **Claude Code Session** (Path A)
 In Path B, the persistent `claude -p` process in `eridian chat` connects to api.anthropic.com. In Path A, a running Claude Code session receives voice transcripts via the MCP channel. Both authenticate however your `claude` already does; eridian adds no key of its own. Transcribed text and anything Claude reads from your files leave here.
 
-### 2b. **onnxruntime Telemetry (Phase 4b)**
+### 2b. **onnxruntime Telemetry**
 onnxruntime 1.30's macOS wheel embeds Microsoft's 1DS telemetry client (`mobile.events.data.microsoft.com`). `src/eridian/kokoro.py` FORCES `ORT_DISABLE_TELEMETRY=1` before onnxruntime is imported and calls `onnxruntime.disable_telemetry_events()`. With the variable set, ORT no longer even initializes its telemetry device ID. The force-disable is verified in the offline check.
 
 ### 3. **Optional: `training/` Docker Image**
@@ -46,9 +46,9 @@ Run `bash scripts/verify-offline.sh`.
 2. Runs `.venv/bin/python scripts/offline_check.py <clip> <out.aiff>` inside a macOS `sandbox-exec` profile that **denies all network access** with the policy `(version 1)(allow default)(deny network*)`
 3. Inside that sandbox, feeds the real wake word detector, VAD, and STT through `Listener` with a simulated clock
 4. Calls `say -o` to render a reply to an AIFF file
-5. **Echo cancellation check (Phase 4):** Simulates room echo on the rendered reply and runs it through the real `AudioProcessingModule` (WebRTC AEC3). Asserts ERLE ≥ 20 dB and that residual speech is too short to trigger talk-over.
-6. **Kokoro check (Phase 4b):** Asserts that importing `eridian.kokoro` forced `ORT_DISABLE_TELEMETRY=1`, then renders a fixed sentence from the local model cache (espeak-ng → onnxruntime), reports the time to first audio, and writes it to `<out>-kokoro.wav` (16 kHz mono 16-bit).
-7. **Kokoro self-screen check (Phase 4b):** Renders "hey jarvice" (a homophone that passes the text scrub) and an ordinary sentence with Kokoro. A fresh `ScreenedSink` with the real wake detector must block the first and play the second.
+5. **Echo cancellation check:** Simulates room echo on the rendered reply and runs it through the real `AudioProcessingModule` (WebRTC AEC3). Asserts ERLE ≥ 20 dB and that residual speech is too short to trigger talk-over.
+6. **Kokoro check:** Asserts that importing `eridian.kokoro` forced `ORT_DISABLE_TELEMETRY=1`, then renders a fixed sentence from the local model cache (espeak-ng → onnxruntime), reports the time to first audio, and writes it to `<out>-kokoro.wav` (16 kHz mono 16-bit).
+7. **Kokoro self-screen check:** Renders "hey jarvice" (a homophone that passes the text scrub) and an ordinary sentence with Kokoro. A fresh `ScreenedSink` with the real wake detector must block the first and play the second.
 8. Asserts:
    - Network canary fails (TCP to 1.1.1.1 and DNS lookup both blocked)
    - Wake word fired exactly once
@@ -102,7 +102,7 @@ This is a snapshot of one session, not a proof for all sessions. Run it yourself
 
 ## What "Local-First" Does NOT Cover
 
-"Local-first" here covers the audio. The **text** of each turn still goes to Anthropic, because the brain is Claude. A fully local loop is Phase 5 (`--offline`, planned), an opt-in local brain (Ollama `gpt-oss:20b`).
+"Local-first" here covers the audio. The **text** of each turn still goes to Anthropic, because the brain is Claude. A fully local loop with a local brain is not implemented. The only brain in the code is `ClaudeBrain` (`src/eridian/brain.py:114`).
 
 ## Privacy Notes
 

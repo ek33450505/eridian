@@ -1,7 +1,7 @@
 """Smoke-test the trained hey_rocky model with pymicro-wakeword.
 
-Run with the eridian repo venv (has pymicro-wakeword), not the training venv:
-  ~/Projects/personal/eridian/.venv/bin/python -I smoke_test.py --root $MWW_ROOT
+From the repo root, run with the eridian repo venv (has pymicro-wakeword), not the training venv:
+  .venv/bin/python -I training/microwakeword/smoke_test.py --root $MWW_ROOT
 
 Sets:
   (a) held-out piper "hey rocky" clips        -> should detect

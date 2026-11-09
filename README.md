@@ -16,7 +16,7 @@ eridian lets you talk with Claude without typing: microphone → wake word → s
 
 ### One-time network actions (the only Hugging Face contact)
 
-- `eridian models fetch` downloads the STT model (~2.5 GB) and the Kokoro voice (57 files) from Hugging Face once. After that, `HF_HUB_OFFLINE=1` is forced at import, so the Hub is never contacted again.
+- `eridian models fetch` downloads the STT model (~2.5 GB) and the Kokoro voice (57 files) from Hugging Face once. After that, `HF_HUB_OFFLINE=1` is set at import unless you already set it yourself, so eridian does not contact the Hub again.
 - The optional `training/` Docker image downloads datasets and checkpoints when built or used.
 - Everything else: local or Claude-only.
 
@@ -54,7 +54,7 @@ Measured 2026-10-01 during a WebSearch turn: the eridian Python process had **ze
 ## What it looks like
 
 ```
-eridian chat: working in /Users/edkubiak/Projects/personal/eridian
+eridian chat: working in /path/to/your/project
 Claude can read and search files under it and search the web; it cannot run commands or edit files.
 Say 'hey jarvis'. Ctrl-C to quit.
 you: Let's start a new greenfield project.
@@ -64,9 +64,19 @@ Sure, happy to start something new. What do you want to build, and do you have a
 
 ## Quick start
 
-Requirements: macOS on Apple Silicon, `uv`, Claude Code logged in, and microphone permission for your terminal app. For Evan (Enhanced), go to System Settings → Accessibility → Spoken Content → System Voice → Manage Voices → English (US) → Evan. For Kokoro, install espeak-ng via Homebrew.
+Requirements:
+
+- macOS on Apple Silicon (speech-to-text runs on MLX)
+- Python 3.12 or newer (`pyproject.toml` sets `requires-python = ">=3.12"`; `.python-version` pins 3.13, which `uv` installs if needed)
+- `uv` (see the uv installation docs)
+- The `claude` CLI on your `PATH`, logged in. eridian was written against Claude Code 2.1.311 (the `claude` subcommand list in `src/eridian/cli.py` comes from that version's `claude --help`).
+- Microphone permission for your terminal app
+
+For Evan (Enhanced), go to System Settings → Accessibility → Spoken Content → System Voice → Manage Voices → English (US) → Evan. For Kokoro, install espeak-ng via Homebrew.
 
 ```bash
+git clone https://github.com/ek33450505/eridian.git
+cd eridian
 brew install espeak-ng
 uv sync
 uv run eridian models fetch     # one-time ~2.5 GB download (STT + Kokoro voice)
@@ -93,16 +103,16 @@ uv run eridian attach [--no-beep] [--no-aec] [--announce {all,permission,off}] [
 
 **Terminal 2:** from **your project directory**, start an interactive Claude Code session wired to receive voice turns. Use the venv's executable, because `uv run` only works inside the eridian checkout:
 ```bash
-~/Projects/personal/eridian/.venv/bin/eridian session [claude args ...]
+/path/to/eridian/.venv/bin/eridian session [claude args ...]
 ```
 
-This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --dangerously-load-development-channels server:eridian --allowedTools mcp__eridian__reply`, with the voice-turn hard control (`voice_guard`) injected via `--settings`. Your voice input from Terminal 1 arrives as `← eridian: <text>`, and Claude can call the `reply` tool to speak answers. eridian announces when Claude finishes or needs your permission; announcements never open the follow-up window. The command generates a session token and refuses `--settings`, `--settings=…`, `--bare` and `--safe-mode`, since each would override the guard.
+This launches `claude --mcp-config '<inline json>' --settings '<inline json>' --dangerously-load-development-channels server:eridian --allowedTools mcp__eridian__reply`, with the voice-turn hard control (`voice_guard`) injected via `--settings`. The `--dangerously-load-development-channels server:eridian` flag is what loads the eridian channel into the session. Your voice input from Terminal 1 arrives as `← eridian: <text>`, and Claude can call the `reply` tool to speak answers. eridian announces when Claude finishes or needs your permission; announcements never open the follow-up window. The command generates a session token and refuses `--settings`, `--settings=…`, `--bare` and `--safe-mode`, since each would override the guard.
 
 #### Autolaunch
 
 To start voice automatically whenever you run `claude` in an interactive terminal, add this to `~/.zshrc`:
 ```bash
-eval "$(~/Projects/personal/eridian/.venv/bin/eridian shell-init zsh)"
+eval "$(/path/to/eridian/.venv/bin/eridian shell-init zsh)"
 ```
 This defines a `claude` function that runs `eridian launch -- "$@"`. In an interactive terminal it starts `eridian attach` in the background if none is answering (log: `~/.eridian/attach.log`; model load takes a moment), then runs `eridian session`. Everything else goes to plain `claude` unchanged: `ERIDIAN_AUTOLAUNCH=0`, stdin or stdout not a terminal, `-p`/`--print`, `-h`/`--help`, `-v`/`--version`, `--settings`, `--bare`, `--safe-mode`, and claude's own subcommands (`mcp`, `doctor`, `update`, ...). `command claude` bypasses the function. `eridian stop` ends the background attach (SIGTERM; it checks the process is an eridian attach first).
 
@@ -113,9 +123,9 @@ Every Claude session you start with `eridian session` stays attached to `eridian
 - `eridian voice on|off [--session ID]`: turns voice on or off for one session. `ID` is the id or pid from `voice status`. Without `--session`, it uses the session the command runs from (found by process ancestry); if that is ambiguous, it asks for `--session`.
 - `eridian mute` / `eridian unmute`: mute the mic (replies still play). Unmute checks that the mic really reopened.
 
-An off session is silent: it gets no utterances, its replies aren't spoken, and its announcements are ignored. Turning off the session whose speech is playing stops that speech. Mute is real: while muted, nothing you say is sent, and the mic device is closed so the macOS mic indicator can go off (not yet verified live). Per-session settings are saved in `~/.eridian/voice-state.json` under hashes of the session tokens. eridian refuses requests from Claude to turn voice on or unmute the mic (including `eridian voice on` and `eridian unmute` typed into a Claude prompt); turning voice off is allowed. This is best effort, not a hard boundary: see SECURITY.md §6a. A menu-bar app for these controls is planned as a separate PR.
+An off session is silent: it gets no utterances, its replies aren't spoken, and its announcements are ignored. Turning off the session whose speech is playing stops that speech. Mute is real: while muted, nothing you say is sent, and the mic device is closed so the macOS mic indicator can go off (not yet verified on live hardware). Per-session settings are saved in `~/.eridian/voice-state.json` under hashes of the session tokens. eridian refuses requests from Claude to turn voice on or unmute the mic (including `eridian voice on` and `eridian unmute` typed into a Claude prompt); turning voice off is allowed. This is best effort, not a hard boundary: see SECURITY.md §6a. A menu-bar app for these controls is planned.
 
-Live test of these controls: pending.
+These controls have not yet been verified on live hardware.
 
 ### Standalone voice conversation (Path B)
 
@@ -140,6 +150,23 @@ Live test of these controls: pending.
 By default eridian listens for "hey jarvis". To use your own trained microWakeWord model, set `ERIDIAN_WAKE_MODEL` to the absolute path of its manifest json (a leading `~` is fine). The `.tflite` file named by its `model` key must sit next to it. The manifest's directory is resolved first, so a symlinked directory is accepted, but the manifest and model files themselves must not be symlinks. Both files and that directory must be owned by you and not writable by group or other. At startup eridian validates them and copies them into a private directory under `~/.eridian/wake-model/`; every detector (the listener's and the self-screen's per-chunk ones) is then built from that copy, never from the source. A damaged copy is rebuilt; a symlinked one is refused. A bad manifest stops startup with an error; it never falls back to "hey jarvis".
 
 The manifest's `wake_word` becomes the phrase everywhere (detector, self-screen, spoken-text scrub, transcript stripping, hints, Claude's instructions) and its last word is the assistant's name. Replies never say the full phrase. For a multi-word phrase the bare name (say "rocky") is not scrubbed from replies; Claude is told to avoid it, and the acoustic self-screen blocks audio that fires the detector. A single-word phrase is scrubbed whole. `attach` refuses a `session` whose wake phrase differs from its own. Training steps: `training/microwakeword/README.md`.
+
+## Optional: Rocky persona for typed chat
+
+`python -P -m eridian.persona sessionstart --under DIR` is a Claude Code SessionStart hook. When the session's working directory is inside `DIR` (an absolute path), it adds a short Rocky persona block to Claude's context. Otherwise it prints nothing. Once its arguments parse, it always exits 0, so it cannot block a session. Run it with the eridian venv's Python (`/path/to/eridian/.venv/bin/python`) so the `eridian` package is importable.
+
+eridian does not install this hook. Register it yourself as a SessionStart hook in your Claude Code settings if you want it. It is separate from `ERIDIAN_PERSONA`, which only affects spoken replies.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "timeout": 5,
+        "command": "/path/to/eridian/.venv/bin/python -P -m eridian.persona sessionstart --under /path/to/your/projects"}]}
+    ]
+  }
+}
+```
 
 ## Architecture
 
@@ -189,11 +216,11 @@ Every text that eridian speaks goes through `speaker.prepare_speech` before any 
 
 ### Acoustic self-screen (Kokoro only)
 
-Homophones ("hey jarviss", "djarvis", "jarvice") pass the text scrub but fire the wake detector when spoken by Kokoro. `screen.ScreenedSink` wraps the echo-cancellation playback path (AEC on only; `--no-aec` bypasses this): before each speaker chunk plays, a fresh wake detector (cutoff `0.8`; live detector fires at 0.97) runs on the last 2 s of played audio plus lookahead silence. A firing chunk is dropped, with `[skipped speech that sounded like the wake word]`. Calibration: 0/200 ordinary sentences blocked; 67/80 homophone attack clips blocked. Fails closed: any detector error blocks the chunk.
+Homophones ("hey jarviss", "djarvis", "jarvice") pass the text scrub but fire the wake detector when spoken by Kokoro. `screen.ScreenedSink` wraps the echo-cancellation playback path (AEC on only; `--no-aec` bypasses this): before each speaker chunk plays, a fresh wake detector (cutoff `0.8`; live detector fires at 0.97) runs on the last 2 s of played audio plus lookahead silence. A firing chunk is dropped, with `[skipped speech that sounded like the wake word]`. Calibration: 0/200 ordinary sentences blocked; 66/80 homophone attack clips blocked. Fails closed: any detector error blocks the chunk.
 
 ### Path A: voice into a Claude Code session
 
-Voice turns keep full session power but are unverified input. A hard control (`voice_guard.py`) gates tool calls during spoken turns. Built-in read tools, read-only shell commands, test runs and five read-only cast-record MCP tools (`cast_decisions`, `cast_incidents`, `cast_cost`, `cast_sessions`, `cast_ask`) run ungated on a voice turn; every other tool call needs a confirm. For destructive, irreversible or outward-facing actions, Claude makes the tool call first; after the voice guard refuses it, Claude sends a `reply` tool with `kind="confirm"`. If you have set a safe phrase (`eridian safe-phrase`), you confirm by saying the wake word, then your phrase. Claude never sees the phrase; it gets `[safe phrase]`. Without one, Claude asks you to say the wake word, then "confirm <word1> <word2>" with two uncommon nouns. The listener strips the wake word from every transcript, so Claude receives "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. Both words must be at least 3 letters, uncommon, and fresh (not used before in the session); one attempt, valid 300 s. Any other message cancels the challenge. On a successful confirm, gated calls are allowed for the rest of the turn. Before Claude's confirm prompt, eridian says what its guard blocked ("eridian blocked: …") in its own voice, a second voice Claude's replies never use (`af_heart` for Kokoro, `Samantha` for `say`). The read-back uses fixed words, short names and location classes, never argument values. It reports what was blocked; it does not limit what the confirm then allows. The confirm flow is enforced by hooks injected into the session; see [`SECURITY.md`](SECURITY.md) §7a for the gating rules and residual risks.
+Voice turns keep full session power but are unverified input. A hard control (`voice_guard.py`) gates tool calls during spoken turns. Built-in read tools, read-only shell commands, test runs and five read-only MCP tools from an optional local MCP server named `cast-record` (`cast_decisions`, `cast_incidents`, `cast_cost`, `cast_sessions`, `cast_ask`) run ungated on a voice turn. The names are an exact-name allowlist in `voice_guard.py`, so they have no effect unless you register a server with that name (`cast-record` is the maintainer's own tooling and is not part of eridian); every other tool call needs a confirm. For destructive, irreversible or outward-facing actions, Claude makes the tool call first; after the voice guard refuses it, Claude sends a `reply` tool with `kind="confirm"`. If you have set a safe phrase (`eridian safe-phrase`), you confirm by saying the wake word, then your phrase. Claude never sees the phrase; it gets `[safe phrase]`. Without one, Claude asks you to say the wake word, then "confirm <word1> <word2>" with two uncommon nouns. The listener strips the wake word from every transcript, so Claude receives "confirm <word1> <word2>". The words must come immediately after "confirm"; case and punctuation are ignored. Both words must be at least 3 letters, uncommon, and fresh (not used before in the session); one attempt, valid 300 s. Any other message cancels the challenge. On a successful confirm, gated calls are allowed for the rest of the turn. Before Claude's confirm prompt, eridian says what its guard blocked ("eridian blocked: …") in its own voice, a second voice Claude's replies never use (`af_heart` for Kokoro, `Samantha` for `say`). The read-back uses fixed words, short names and location classes, never argument values. It reports what was blocked; it does not limit what the confirm then allows. The confirm flow is enforced by hooks injected into the session; see [`SECURITY.md`](SECURITY.md) §7a for the gating rules and residual risks.
 
 - **Confirm by wake word only:** every utterance carries a `via` field (`wake`, `wake_barge_in`, `follow_up`, or `talk_over`). Only an exact wake-word turn (`via: "wake"`, detected during silence) can satisfy a confirm challenge. A wake word heard while eridian is speaking, or within 1–10 s after (configurable via `ERIDIAN_SELF_WAKE_GUARD_S`, default 1.0 s), lands as `via: "wake_barge_in"` and cannot grant gated calls—fail-closed. Talk-over and follow-up turns also cannot grant gated calls. While a confirm is pending, such a too-early wake turn isn't sent at all: eridian says "That was too soon after I spoke…" and the confirm stays pending, so wait a moment after it stops speaking. This prevents ambient audio, eridian's own speech leaking through echo cancellation imperfection, or Kokoro homophones from bypassing the guard.
 
@@ -238,22 +265,26 @@ Code changes belong in Path A (a real session with its full tools and guards), n
 
 **Optional training:** `training/` contains an optional Docker image for training custom wake phrases. Uses openWakeWord 0.6.0: code Apache-2.0, but pretrained models and **any trained model are CC BY-NC-SA 4.0 (non-commercial)**. See [`training/README.md`](training/README.md).
 
-## Status and roadmap
+## Roadmap
 
-| Phase | What | State |
-|---|---|---|
-| **0** | measurement spike (latency, CPU, false-accept rate) | ✓ done |
-| **1** | spoken replies in real Claude Code sessions via Stop hook | ✓ retired, replaced by Phase 3 |
-| **2a** | listening core: `eridian listen` prints JSON events, `eridian models fetch` | ✓ done |
-| **2b** | `eridian chat [--no-beep] [--resume] [--follow-up SECONDS]` (standalone voice REPL) | ✓ done |
-| **D** | documentation: this README, local-first, architecture, training, SECURITY, CHANGELOG, offline check | ✓ done (refreshed at each phase end) |
-| **3** | voice into *running* Claude Code sessions (Channel MCP server + reply tool) | ✓ done (PR #4) |
-| **4a** | echo cancellation via livekit AEC + talking over replies without wake word | ✓ done (live-tested 2026-10-02 (MacBook Pro speakers and mic, one room)) |
-| **4b** | Kokoro voice | ✓ done (live-tested 2026-10-02) |
-| **6** | Jarvis speaks first: spoken "Claude finished" / "needs your permission" via Stop and PermissionRequest hooks | ✓ built (live test pending) |
-| **5** | opt-in `--offline` brain (Ollama `gpt-oss:20b`); entire loop works with Wi-Fi off | planned |
+Shipped (details in [`CHANGELOG.md`](CHANGELOG.md)):
 
-For the full research and component justification: see [`docs/plan.md`](docs/plan.md).
+- Standalone voice conversation (`eridian chat`) and voice into a running Claude Code session (`eridian attach` + `eridian session`)
+- Echo cancellation and talk-over, so you can interrupt a reply without the wake word
+- Kokoro voice, with `say` as the fallback
+- Announcements when Claude finishes or needs your permission
+- Voice-safety tier: confirm read-back and an optional safe phrase
+- Per-session voice on/off and a real mute
+- Rocky persona: `ERIDIAN_PERSONA` for spoken replies, and the optional typed-chat hook
+
+Next:
+
+- A menu-bar app for voice controls
+- Rocky-voice fixed spoken lines
+
+On hold: an opt-in offline brain (a local model instead of Claude), so the whole loop works with Wi-Fi off. No code exists for it yet.
+
+Push-to-talk is not scheduled.
 
 ## Testing
 
@@ -270,6 +301,8 @@ Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word 
 - `ERIDIAN_AUTOLAUNCH` — set to `0` to make `eridian launch` (and the `shell-init` function) run plain `claude`
 - `ERIDIAN_SESSION` (set by `eridian session`) — session token passed to the channel via MCP config and to hooks; internal use only
 - `ERIDIAN_VOICE` — voice name for `say` (e.g., `"Daniel"`); empty string uses system voice
+- `ERIDIAN_KOKORO_EFFECT` — `chord` layers +4 and +7 semitone copies over the reply voice; unset, empty, `off` or `none` means no effect, and any other value is rejected. Never applied to eridian's own voice
+- `ERIDIAN_KOKORO_PITCH` — semitone shift of the reply voice, a number from -6 to 6 (unset or empty means 0); other values are rejected. Never applied to eridian's own voice
 - `ERIDIAN_KOKORO_OWN_VOICE` — Kokoro voice for eridian's own words, the confirm read-back (default `af_heart`); it must differ from `ERIDIAN_KOKORO_VOICE` (and from every voice in a blend), or `attach` and `chat` refuse to start
 - `ERIDIAN_KOKORO_VOICE` — voice name for Kokoro (e.g., `am_michael`, `bm_george`; default `am_adam`)
 - `ERIDIAN_OWN_VOICE` — `say` voice for eridian's own words (default `Samantha`); it must differ from `ERIDIAN_VOICE`, or `attach` and `chat` refuse to start
@@ -284,7 +317,6 @@ Plus `bash scripts/verify-offline.sh` for the offline pipeline check: wake word 
 - [`docs/local-first.md`](docs/local-first.md) — data-flow audit, verify scripts, one-time network actions
 - [`docs/architecture.md`](docs/architecture.md) — design rationale, module breakdown, protocol details
 - [`docs/training.md`](docs/training.md) — custom wake phrase training with Docker
-- [`docs/plan.md`](docs/plan.md) — research, component picks, and phase breakdown
 - [`SECURITY.md`](SECURITY.md) — safety model, sandbox details, threat model
 - [`CHANGELOG.md`](CHANGELOG.md) — version history
 - [`training/README.md`](training/README.md) — wake-phrase training setup

@@ -4,6 +4,14 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-09 — Pre-public cleanup
+
+**Changed**
+- `~/.eridian/attach.log` (which holds spoken transcripts) is rotated to `attach.log.1` when it is 1 MB or more at the next background launch, so at most one older generation is kept. A failed rotation prints a warning and the launch continues.
+- Docs no longer contain personal paths, private project names or internal planning notes. The phase plans and research notes moved out of the repo; README has a short Roadmap instead. README gained install-from-scratch steps, and SECURITY.md now covers the attach log and the persona hook.
+- `pyproject.toml` gained `readme`, classifiers and the repository URL.
+- The training-model equivalence test reads its model directory from `MWW_ROOT` and skips when it is unset.
+
 ### 2026-11-09 — Rocky persona for the typed chat
 
 **Added**
@@ -12,7 +20,7 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ### 2026-11-06 — Per-session voice on/off and real mute
 
-Live test: pending (Ed). Nothing in this entry has been run live yet.
+Live test: pending. Nothing in this entry has been run live yet.
 
 **Breaking**
 - A newer session no longer detaches the older one; every session stays attached, and wake turns go to the newest one with voice on. Use `eridian voice off` to silence the others.
@@ -53,7 +61,7 @@ Entries below this one are kept as released, under the old name.
 
 ### 2026-11-04 — Echo text guard (live test: own voice heard as `you:`)
 
-Live test (Ed, MacBook speakers, echo cancellation on): after Claude read out the weather, attach printed `you: Humidity is ninety-four percent.` and `you: Humidity's ninety three percent right now.`, which Ed never said. Claude then asked whether the microphone was hearing it. **Live test of the fix: pending.**
+Live test (MacBook speakers, echo cancellation on): after Claude read out the weather, attach printed `you: Humidity is ninety-four percent.` and `you: Humidity's ninety three percent right now.`, which the maintainer never said. Claude then asked whether the microphone was hearing it. **Live test of the fix: pending.**
 
 **Added**
 - Echo text guard: a talk-over or follow-up turn (never a wake-word turn) whose transcript mostly repeats what undertone itself just said is dropped and printed as `you [talk_over]: … [dropped: echo of own speech]`. It covers replies, read-backs and announcements, compares numbers as digits ("ninety three" matches "93") and ignores a swapped word. It is checked only if the turn opened while undertone was speaking or within 3 s after, against speech from the last 60 s. It only drops turns; confirm rules are unchanged. A talk-over that had already stopped playback leaves the reply stopped.
@@ -64,7 +72,7 @@ Live test (Ed, MacBook speakers, echo cancellation on): after Claude read out th
 
 ### 2026-10-03 — Confirm with your own safe phrase (Phase 8a follow-up)
 
-Changes made after Ed's Phase 8a live test. **Live test: pending.**
+Changes made after the Phase 8a live test. **Live test: pending.**
 
 **Added**
 - `undertone safe-phrase` sets your own fixed confirm phrase (1–3 words, at least 2 words or 8 letters). It reads the phrase twice with hidden input and refuses to run without an interactive terminal. `--clear` goes back to fresh two-word confirms, and `--status` says whether a phrase is set. Restart `undertone attach` and `undertone session` after changing it.
@@ -75,7 +83,7 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 **Changed**
 - The read-back now plays **before** Claude's confirm prompt, so the last thing you hear is your cue to answer.
 - The blocked-call list survives a voice turn that doesn't grant. It is cleared on a grant or a typed turn, so a re-asked confirm still reads back what was blocked.
-- The channel instructions name the five read-only cast-record tools and tell Claude to prefer them over shell commands. In the live test, Claude had reached for `just` recipes, which the guard blocks.
+- The channel instructions name the five read-only tools of the optional `cast-record` MCP server and tell Claude to prefer them over shell commands. In the live test, Claude had reached for `just` recipes, which the guard blocks.
 
 **Security**
 - On a voice turn the guard now refuses any read or search of undertone's own folder (`<home>`) or a folder above it, even after a confirm: `Read`, `Grep`, `Glob`, `LS`, and shell commands that name it or run from a folder at or above it. `undertone session` also adds a Claude Code deny rule for reading `safe_phrase.json`.
@@ -84,11 +92,11 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 
 ### 2026-10-03 — Phase 8a: voice-safety tier for app tools
 
-**Live test (Ed, 2026-10-03):** the read-back was heard in the second voice and read accurately; a file-create confirm granted. Confirms said while undertone was still speaking, or within 1 s after, were refused without telling him why; Claude answered a cost question with shell recipes instead of the cast-record tools. Both are addressed in the follow-up above. Full suite on `bcdcb9d` (Ed): 633 OK, 1 skipped.
+**Live test (2026-10-03):** the read-back was heard in the second voice and read accurately; a file-create confirm granted. Confirms said while undertone was still speaking, or within 1 s after, were refused without telling the user why; Claude answered a cost question with shell recipes instead of the cast-record tools. Both are addressed in the follow-up above. Full suite on `bcdcb9d`: 633 OK, 1 skipped.
 
 **Added**
-- Read-only MCP tier: five cast-record tools (`mcp__cast-record__cast_decisions`, `mcp__cast-record__cast_incidents`, `mcp__cast-record__cast_cost`, `mcp__cast-record__cast_sessions`, `mcp__cast-record__cast_ask`) run ungated on a voice turn. Listed in `voice_guard.READ_ONLY_MCP_TOOLS` as an exact-name allowlist in code (not config), because a typed turn could edit a config file to widen the voice gate. Vetted read-only: the cast-record server opens cast.db with `mode=ro`, uses parameterized queries, and has no SQL tool.
-- Undertone's own voice: a second TTS voice for words undertone writes itself, which Claude's replies never use. Kokoro `af_heart` (env `UNDERTONE_KOKORO_OWN_VOICE`; constants `OWN_VOICE_ENV`, `DEFAULT_OWN_VOICE` in kokoro.py), or `say` `Samantha` (env `UNDERTONE_OWN_VOICE`). Name-checked and SHA-256 verified like the reply voice. Ed chose a distinct voice because Claude can imitate any words, but not a voice.
+- Read-only MCP tier: five tools of the optional `cast-record` MCP server (`mcp__cast-record__cast_decisions`, `mcp__cast-record__cast_incidents`, `mcp__cast-record__cast_cost`, `mcp__cast-record__cast_sessions`, `mcp__cast-record__cast_ask`) run ungated on a voice turn. Listed in `voice_guard.READ_ONLY_MCP_TOOLS` as an exact-name allowlist in code (not config), because a typed turn could edit a config file to widen the voice gate. Vetted read-only: the maintainer checked that the cast-record server opens its database with `mode=ro`, uses parameterized queries, and has no SQL tool.
+- Undertone's own voice: a second TTS voice for words undertone writes itself, which Claude's replies never use. Kokoro `af_heart` (env `UNDERTONE_KOKORO_OWN_VOICE`; constants `OWN_VOICE_ENV`, `DEFAULT_OWN_VOICE` in kokoro.py), or `say` `Samantha` (env `UNDERTONE_OWN_VOICE`). Name-checked and SHA-256 verified like the reply voice. The maintainer chose a distinct voice because Claude can imitate any words, but not a voice.
 - Blocked-call record: when `voice_guard` denies a call on a voice turn, a short description is stored in the session state file (tool kind, program and file names, location classes, host names, but no argument values). It is written after the deny, best-effort, so the deny always stands. Keeps the last `MAX_BLOCKED` = 3 entries (each ≤ `MAX_WHAT_CHARS` = 160 chars) and counts evictions in `blocked_more`. Cleared on each new voice or typed turn; entries older than 300 s are ignored.
 - Read-back in undertone's own voice: on a confirm reply, `voice_guard.read_back()` is attached as a `check` field on the reply line. `attach` speaks it after Claude's words, in undertone's own voice, and prints `undertone: <text>`. The `check` field is honoured only on a confirm, up to `MAX_CHECK_CHARS` = 600. Forms: `undertone blocked: <a>; and <b>`, then `, and N more blocked call(s)` when entries were evicted; or `undertone has not blocked anything yet.`; or `undertone could not read back what it blocked.` if state is unreadable. Vocabulary: fixed words only; names (at most 2 words, ≤20 chars) or `a long name`; location classes (`in this project`, `in your home folder`, `in the project git or Claude settings`, etc.); hosts as `a site under X` or `an international address` or `an IP address`. Never spoken or stored: argument values, MCP argument keys or values, commit messages, free text. `with N arguments` marks omissions. `overwriting` vs `appending to` for redirects. Complex shell commands read `a complex shell command starting with <prog>`; wrappers (sudo, env, xargs, timeout, `sh -c`, `find -exec`) name the program they run; up to 3 commands are named and the rest counted (`, and N more commands`); URLs and scp/ssh remotes in arguments read `to <host>` / `to a remote computer <host>`. The tool result tells Claude what was read back.
 - Channel instructions changed: for destructive, irreversible or outward-facing actions requested by voice, Claude now makes the tool call first; after the voice guard refuses it, Claude sends `kind="confirm"`.
@@ -99,16 +107,16 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 **Security**
 - Two security review rounds, 2026-10-03. Fixed: H1 (evicted entries vanished silently, and the first wording, "This will run: …", overclaimed for a turn-wide grant), M1 (Claude-chosen free words spoken in the own voice), M2 (unflagged omissions), M3 (secrets spoken and stored), N1 (URLs read as project files), L1 (`>` and `>>` sounded the same), L3 (a homograph host). Accepted residuals: short names (at most 2 words) are still Claude-chosen; an MCP server registered under the name `cast-record` (e.g. in a project `.mcp.json`) would get the ungated tier, because the hook sees only the tool name (accepted: an approved MCP server already runs arbitrary code at startup).
 - Self-screen measurement (18 homophones and 20 ordinary sentences through `ScreenedSink` with the real wake detector, 2026-10-03): `am_adam` 14/18 blocked, 0/20 ordinary blocked; `af_heart` 14/18 blocked, 0/20 ordinary blocked. Own voice screened no worse than reply voice.
-- Grant unchanged: a spoken confirm still unlocks every gated call for the rest of the turn (up to 300 s). Ed decided this on 2026-10-03 and declined binding the grant to the read-back calls. So the read-back reports what was blocked but does not limit what the confirm allows; a prompt-injected Claude can still get a harmless call confirmed and then run others inside the grant.
+- Grant unchanged: a spoken confirm still unlocks every gated call for the rest of the turn (up to 300 s). The maintainer decided this on 2026-10-03 and declined binding the grant to the read-back calls. So the read-back reports what was blocked but does not limit what the confirm allows; a prompt-injected Claude can still get a harmless call confirmed and then run others inside the grant.
 
 **Status**
-- Built and reviewed 2026-10-03, without Ed (he asked for a phase needing no voice testing that evening).
-- Ed still to do: full test suite (`uv run python -m unittest discover -s tests`), because socket tests can't run in Claude's sandbox; a live test: a voice question using a cast-record tool runs with no confirm, and a voice request for a gated action produces Claude's confirm prompt followed by the read-back in undertone's own voice, and the two voices are easy to tell apart.
+- Built and reviewed 2026-10-03.
+- Still to do: full test suite (`uv run python -m unittest discover -s tests`), because socket tests can't run in Claude's sandbox; a live test: a voice question using a cast-record tool runs with no confirm, and a voice request for a gated action produces Claude's confirm prompt followed by the read-back in undertone's own voice, and the two voices are easy to tell apart.
 - Phase 8a's plan item "list the exact tool names the 8b candidates expose" (che-ical-mcp) is NOT done; it moves to 8b.
 
 ### 2026-10-02 — Phase 6: Jarvis speaks first
 
-**Live test: passed (Ed, 2026-10-03).**
+**Live test: passed (2026-10-03).**
 
 **Added**
 - `undertone attach` now tells you when Claude finishes or needs you, using fixed spoken templates: "Claude finished." (a turn ended: `Stop`), "Claude needs your permission." (a permission dialog), "Claude has a question for you." (`AskUserQuestion`), "Claude's plan is ready." (`ExitPlanMode`) and "Claude stopped with an error." (a turn ended on an API error: `StopFailure`).
@@ -127,10 +135,10 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 
 ### 2026-10-02 — Phase 4b: Kokoro voice
 
-**Live test (2026-10-02, Ed):** with both `undertone session` and `undertone attach` restarted, Ed ran the checklist: banner `Voice: Kokoro (am_adam).`, Kokoro replies, talk-over, a confirm answered after the prompt finished, no self-trigger, and `--tts say` / `--no-aec` — "nothing odd, works great" (reported by Ed; per-step output not captured). The full suite ran 499 tests OK and `scripts/verify-offline.sh` passed 10/10 with the network denied.
+**Live test (2026-10-02):** with both `undertone session` and `undertone attach` restarted, The maintainer ran the checklist: banner `Voice: Kokoro (am_adam).`, Kokoro replies, talk-over, a confirm answered after the prompt finished, no self-trigger, and `--tts say` / `--no-aec` — "nothing odd, works great" (reported by the maintainer; per-step output not captured). The full suite ran 499 tests OK and `scripts/verify-offline.sh` passed 10/10 with the network denied.
 
 **Added**
-- Kokoro-82M ONNX resident TTS engine (phoneme-based; 0.05 s + 0.085 s/second of audio on idle M4 Max). Default voice: `am_adam`, Ed's pick from the samples; through the full playback path the self-screen blocked 0/200 ordinary sentences with it, against 2/200 with `am_michael`. Override with `UNDERTONE_KOKORO_VOICE` (e.g., `am_michael`, `bm_george`). Download via `undertone models fetch` (57 files, model + tokenizer + voice bins). Model pinned to `onnx-community/Kokoro-82M-v1.0-ONNX` revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, fp32 `onnx/model.onnx` (~325 MB). Model weights: Apache-2.0. Runtime: onnxruntime 1.30 (CPU-only; CoreML was no faster and used 2× memory). MIT license.
+- Kokoro-82M ONNX resident TTS engine (phoneme-based; 0.05 s + 0.085 s/second of audio on idle M4 Max). Default voice: `am_adam`, the maintainer's pick from the samples; through the full playback path the self-screen blocked 0/200 ordinary sentences with it, against 2/200 with `am_michael`. Override with `UNDERTONE_KOKORO_VOICE` (e.g., `am_michael`, `bm_george`). Download via `undertone models fetch` (57 files, model + tokenizer + voice bins). Model pinned to `onnx-community/Kokoro-82M-v1.0-ONNX` revision `1939ad2a8e416c0acfeecc08a694d14ef25f2231`, fp32 `onnx/model.onnx` (~325 MB). Model weights: Apache-2.0. Runtime: onnxruntime 1.30 (CPU-only; CoreML was no faster and used 2× memory). MIT license.
 - G2P (grapheme-to-phoneme) via espeak-ng, run as a separate subprocess (text on stdin), never linked. GPL-3.0-or-later; installed via Homebrew.
 - Telemetry defense: `ORT_DISABLE_TELEMETRY=1` forced before onnxruntime import (Microsoft's 1DS telemetry client in the wheel is blocked).
 - `UNDERTONE_ESPEAK_CMD` env var for tests; `UNDERTONE_TEST_REAL_KOKORO` (tests only; opt-in real-model smoke test).
@@ -162,7 +170,7 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 
 **Added**
 - `DuplexAudio` (duplex.py): full-duplex sounddevice `RawStream` (16 kHz mono int16, 10 ms blocks). Pairs each mic frame with the speaker frame it just wrote. WebRTC AEC3 via livekit's `AudioProcessingModule(echo_cancellation=True, noise_suppression=True, high_pass_filter=True)`: the speaker frame goes to `process_reverse_stream`, then the mic frame to `process_stream`. The delay hint is the stream's input+output latency or 40 ms if unknown. Offline simulation (2026-10-01): ERLE ≈ 35 dB, Silero VAD fired on residual in 0/217 chunks (vs 189/217 without AEC), user voice still detected at max probability 0.9999, ~60 µs per 10 ms frame.
-- **Live test (2026-10-02, real speech, MacBook Pro speakers and mic):** undertone did not talk itself into a turn while playing a full reply. Talk-over fired on the user's voice, and a wake-word "confirm lemon canyon" granted a delete (`guard.log`: `pretooluse granted Bash`). The first build lost the user's words (the whole talk-over turn was dropped as echo), let a talked-over confirm prompt cut off its phrase, and sent "A Jarvis." as a turn; all three were fixed and the re-test worked (reported by Ed; per-step output not captured).
+- **Live test (2026-10-02, real speech, MacBook Pro speakers and mic):** undertone did not talk itself into a turn while playing a full reply. Talk-over fired on the user's voice, and a wake-word "confirm lemon canyon" granted a delete (`guard.log`: `pretooluse granted Bash`). The first build lost the user's words (the whole talk-over turn was dropped as echo), let a talked-over confirm prompt cut off its phrase, and sent "A Jarvis." as a turn; all three were fixed and the re-test worked (reported by the maintainer; per-step output not captured).
 - `RenderedSpeechQueue` (player.py): renders each sentence with `say -o <file> --file-format=WAVE --data-format=LEI16@16000` to a private temp dir (prefix `undertone-tts-`, mode 0700; file deleted after reading). Rendering time: 0.62 s for a 4.7 s sentence (measured 2026-10-01). Sentences render ahead so playback is gapless. `SpeechQueue` (direct `say`) remains for `--no-aec`.
 - Talk-over (AEC on only): sustained speech stops playback without the wake word — 10 consecutive 32 ms VAD chunks at probability ≥ 0.6 (`ListenerConfig.talk_over_threshold=0.6`, `talk_over_min_s=0.3`). Your speech becomes your next turn; `talk_over_preroll_s=0.5` keeps your first words. Exception: talk-over is off during a confirm prompt (or a reply of unknown kind), so the phrase is always heard in full; the wake word still interrupts it, and you answer with the wake word plus the phrase. (The first version stopped the prompt, and in the 2026-10-02 live test that cut off the phrase.) In `chat`, talk-over also interrupts Claude's in-flight turn.
 - Hard control (`via` field): every utterance carries `via` = `wake` | `follow_up` | `talk_over`. `voice_guard.record_voice(..., can_grant=False)` lets ONLY a wake-word turn (`via: "wake"`, exact match) satisfy a confirm challenge. Any voice turn still uses up the one attempt. Enforced end to end through the channel and PreToolUse hook. An old `undertone attach` paired with a new session sends no `via`, so confirmations fail closed.
@@ -229,7 +237,7 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 - `undertone session [claude args...]`: runs `claude --mcp-config ~/.undertone/channel.mcp.json --dangerously-load-development-channels server:undertone --allowedTools mcp__undertone__reply`.
 
 **Security**
-- Voice turns keep full session power but are unverified input (Ed's decision: confirm risky actions). Before anything destructive, irreversible or outward-facing, Claude sends a `kind=confirm` reply and asks the user to say the wake word, then "confirm <two fresh uncommon words>". The listener strips the wake word from every transcript, so Claude accepts "confirm walnut lantern" with the words immediately after "confirm". "Yes" is a refusal.
+- Voice turns keep full session power but are unverified input (the maintainer's decision: confirm risky actions). Before anything destructive, irreversible or outward-facing, Claude sends a `kind=confirm` reply and asks the user to say the wake word, then "confirm <two fresh uncommon words>". The listener strips the wake word from every transcript, so Claude accepts "confirm walnut lantern" with the words immediately after "confirm". "Yes" is a refusal.
 - `attach` opens the no-wake-word follow-up window only after an `answer`, never after an `ack` or a `confirm`, so ambient audio can't answer a confirmation.
 - undertone never speaks its own wake word. `speaker.build_say_argv` runs `spoken.sanitize_for_tts`, which strips invisible characters, removes every `[`/`]` (`say` inline commands), and replaces any spoken or obfuscated "hey jarvis"/"jarvis" with "the wake word".
 - No permission relay is declared. Reply text is capped at 4000 chars, and `<`/`>` are stripped from utterances.
@@ -296,7 +304,7 @@ Changes made after Ed's Phase 8a live test. **Live test: pending.**
 ### 2026-09-30 — Phase 0: research and measurement
 
 **Added**
-- Research plan and component picks (`docs/plan.md`). The wake phrase is "hey jarvis", which ships pretrained, so no training is needed.
+- Research plan and component picks (`docs/plan.md`, since moved out of the repo). The wake phrase is "hey jarvis", which ships pretrained, so no training is needed.
 - Measurements:
   - wake word: 6/6 detected and 0 false accepts in a 30-minute live run;
   - STT median: 87 ms on a real voice;

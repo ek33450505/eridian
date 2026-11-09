@@ -1,6 +1,6 @@
 """Split a stream of text deltas into speakable, sentence-sized chunks.
 
-Pure, stdlib-only, no I/O (see tests/test_chunker.py). Phase 2b streams
+Pure, stdlib-only, no I/O (see tests/test_chunker.py). The conversation loop streams
 Claude's reply as arbitrary text fragments; SentenceChunker buffers them and
 emits each sentence the moment its trailing whitespace arrives, so the first
 sentence can be spoken while the rest is still generating.

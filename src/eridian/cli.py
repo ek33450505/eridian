@@ -74,6 +74,7 @@ class WorkdirError(Exception):
     """The private chat workspace can't be used safely."""
 
 
+_ATTACH_LOG_ROTATE_BYTES = 1_000_000  # attach.log rotates once, at spawn
 _SENSITIVE_HOME_DIRS = ("Documents", "Desktop", "Downloads")
 
 
@@ -680,6 +681,15 @@ def _spawn_attach_locked(voice) -> None:
         if pid is not None and _pid_is_attach(pid):
             return
         log_path = paths.attach_log_path()
+        try:
+            oversized = log_path.lstat().st_size >= _ATTACH_LOG_ROTATE_BYTES
+        except OSError:
+            oversized = False  # absent or unstattable: just open it
+        if oversized:
+            try:
+                os.replace(log_path, log_path.with_name(log_path.name + ".1"))
+            except OSError as exc:
+                print(f"eridian: could not rotate {log_path}: {exc}", file=sys.stderr)
         log_fd = os.open(
             log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600
         )

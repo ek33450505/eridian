@@ -1,8 +1,8 @@
 """Record your own "hey rocky" clips for evaluating (and optionally training) the
 wake word model.
 
-Run in your own terminal with the eridian repo venv:
-  ~/Projects/personal/eridian/.venv/bin/python -I training/microwakeword/record_clips.py
+Run in your own terminal from the repo root with the eridian repo venv:
+  .venv/bin/python -I training/microwakeword/record_clips.py
 
 Clips land in <root>/real/positives/<phrase>/NNNN.wav and
 <root>/real/confusables/<phrase>/NNNN.wav (16 kHz mono 16-bit PCM WAV, 4-digit
@@ -51,8 +51,9 @@ TIPS = [
 BANNER = """\
 Recording real clips for the wake word model.
 
-  - Stop eridian first, or the wake word will wake it while you record:
-      ~/Projects/personal/eridian/.venv/bin/eridian stop
+  - Stop eridian first, or the wake word will wake it while you record
+    (from the repo root):
+      .venv/bin/eridian stop
   - Vary distance (close / arm's length / across the room) and volume.
   - Confusables ("hey rock", "hey rocco", ...) matter as much as "hey rocky".
   - Keys: Enter = record, r = redo the last take, s = skip phrase, q = quit.

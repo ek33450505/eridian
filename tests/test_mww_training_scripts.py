@@ -5,6 +5,7 @@ model: smoke_test only needs pymicro_wakeword importable (the repo venv).
 """
 
 import importlib.util
+import os
 import tempfile
 import unittest
 import wave
@@ -371,7 +372,7 @@ class ReportFormattingTest(unittest.TestCase):
         self.assertRegex(lines[2], r"hey_rock\s+false accepts=1/1")
 
 
-MODEL_ROOT = Path("/Users/edkubiak/Datasets/eridian-training/mww")
+MODEL_ROOT = Path(os.environ.get("MWW_ROOT", "/nonexistent-mww-root"))
 
 
 @unittest.skipUnless((MODEL_ROOT / "out" / "hey_rocky.tflite").exists(), "trained model not present")

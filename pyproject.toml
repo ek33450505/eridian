@@ -4,6 +4,13 @@ version = "0.1.0"
 description = "Hands-free, local-first voice conversation with Claude Code on macOS."
 requires-python = ">=3.12"
 license = "Apache-2.0"
+readme = "README.md"
+classifiers = [
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Environment :: Console",
+]
 dependencies = [
     "numpy",
     "sounddevice",
@@ -13,6 +20,9 @@ dependencies = [
     "livekit>=1.1.20,<2",
     "onnxruntime>=1.30,<2",
 ]
+
+[project.urls]
+Repository = "https://github.com/ek33450505/eridian"
 
 [project.scripts]
 eridian = "eridian.cli:main"
