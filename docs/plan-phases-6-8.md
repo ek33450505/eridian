@@ -118,6 +118,8 @@ Ed, 2026-11-05: Rocky's personality should run through the whole chat, not just 
 - eridian's own fixed lines (announcement templates, the no-session / all-off / mute notices) in Rocky's voice.
 - Stays plain: code, paths, numbers, diffs, confirm prompts, and the "eridian blocked: …" read-back in the own voice.
 
+**E1 done (2026-11-09):** the typed chat is in Rocky style in any session, voice or not, through a SessionStart hook (`python -P -m eridian.persona sessionstart --under DIR`). Ed's scope is every repo under his personal projects folder, with work repos left out; the hook goes in his user settings, outside this repo. Dense technical turns keep the character but use normal grammar. Still open: eridian's fixed spoken lines in Rocky's voice, paused with the voice work.
+
 ## Before the repo goes public
 
 Ed, 2026-11-05: a full review phase of the repo, docs and README before it goes public. Check every doc against the code (code spans and prose, per the ground rules), remove stale plans and personal paths, refresh SECURITY.md for the voice controls, and get a whole-repo `pr-reviewer` / `security` pass.
