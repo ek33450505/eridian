@@ -6,6 +6,7 @@ real claude are involved.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import io
@@ -195,7 +196,10 @@ def voice_prompt(text: str) -> str:
 def run_main(argv, payload="", home=None):
     out, err = io.StringIO(), io.StringIO()
     stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
-    rc = vg.main(argv, stdin=stdin, stdout=out, stderr=err)
+    # argparse writes usage errors and --help to sys.stderr/sys.stdout, not the injected
+    # streams. Swallow them so the console stays quiet.
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        rc = vg.main(argv, stdin=stdin, stdout=out, stderr=err)
     return rc, out.getvalue(), err.getvalue()
 
 
@@ -1805,21 +1809,26 @@ class ControlRefusalTests(GuardTestCase):
         self.assertEqual(self.decide("voice", "eridian voice off"), vg.DENY_REASON.format(tool="Bash"))
 
     def test_scan_time_is_bounded(self):
+        # Guards against super-linear (catastrophic) scanning, not absolute speed.
+        # CPU time (process_time) ignores scheduler stalls under parallel load; the
+        # ceiling is well above the normal per-call cost and low enough that a quadratic
+        # scan over these inputs exceeds it.
         import time as _time
+        limit = 0.1
         shapes = ["{}", "echo {}", "A='{}", "eridian unmute {}", "echo `{}", "eridian voice on; {}"]
         for n in (100, 1000, 5000):
             for opener in ("$(", "`", "<(", "(("):
                 for shape in shapes:
                     command = shape.format(opener * n)
                     with self.subTest(n=n, command=command[:30]):
-                        start = _time.perf_counter()
+                        start = _time.process_time()
                         vg.control_reason("Bash", {"command": command})
-                        self.assertLess(_time.perf_counter() - start, 0.05)
+                        self.assertLess(_time.process_time() - start, limit)
         for command in ("echo " + "a " * 10000, "eridian " + "a " * 10000, "nc " * 7000):
             with self.subTest(size=len(command)):
-                start = _time.perf_counter()
+                start = _time.process_time()
                 vg.control_reason("Bash", {"command": command})
-                self.assertLess(_time.perf_counter() - start, 0.05)
+                self.assertLess(_time.process_time() - start, limit)
 
     def test_limits_fail_closed(self):
         self.assertEqual(vg.control_reason("Bash", {"command": "eridian " + "$(true) " * 17}),

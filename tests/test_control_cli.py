@@ -46,6 +46,9 @@ class _FakeServer:
             except OSError:
                 return
             self._conns.append(conn)
+            if self._stop.is_set():
+                conn.close()
+                return
             threading.Thread(target=self._one, args=(conn,), daemon=True).start()
 
     def _one(self, conn: socket.socket) -> None:
@@ -83,6 +86,8 @@ class _FakeServer:
         self._stop.set()
         with contextlib.suppress(OSError):
             self.sock.close()
+        # Wait for the accept loop so a connection accepted during shutdown is in _conns.
+        self.thread.join(timeout=2)
         for c in self._conns:
             with contextlib.suppress(OSError):
                 c.close()
