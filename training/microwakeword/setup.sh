@@ -7,9 +7,15 @@
 #   MWW_ROOT  install root; absolute, strictly under $HOME (see lib.sh). `--check-root` validates it and exits.
 #            setup.sh is the only script that creates the root/sentinel, and only
 #            for a new or empty dir; a non-empty dir without the sentinel is refused.
-#   MWW_REF   git ref of kahrendt/microWakeWord to check out. If the existing
-#             clone is at a different commit, it is checked out and the core pip
-#             step is redone. Unset: the existing clone is left as is.
+#   MWW_REF   git ref of kahrendt/microWakeWord to check out (default: the pinned
+#             commit below). If the existing clone is at a different commit, it is
+#             checked out and the core pip step is redone.
+#   PIPER_REF git ref of kahrendt/piper-sample-generator (default: pinned commit).
+#             MWW_REF or PIPER_REF replaces the default pin for that repo.
+#
+# Every download and checkout is pinned to an immutable revision; downloads are
+# also checked against SHA-256 (verify_sha256), git checkouts are commit-pinned only. The pins are the ones that trained the
+# maintainer's model, verified 2026-11-09.
 #
 # Decode path: no ffmpeg/torchcodec. `datasets<4` (only used to stream the MIT
 # RIRs, as the notebook does) and soundfile (libsndfile >= 1.1 reads mp3/flac)
@@ -19,7 +25,8 @@
 # it is for non-commercial personal use only.
 set -euo pipefail
 
-MWW_REF="${MWW_REF:-}"
+MWW_REF="${MWW_REF:-4665173cd35f1cff9a61e06fc427f124766c488e}"
+PIPER_REF="${PIPER_REF:-b5b36e266576693ea47db129fbfe6bbc06164762}"
 MIN_FREE_KB=$((60 * 1024 * 1024))
 
 # Root guard, sentinel and safe_rm_* helpers live in lib.sh.
@@ -28,7 +35,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
 mww_init setup "$@"
 
-NOTEBOOK_URL="https://raw.githubusercontent.com/kahrendt/microWakeWord/main/notebooks/basic_training_notebook.ipynb"
+NOTEBOOK_URL="https://raw.githubusercontent.com/kahrendt/microWakeWord/4665173cd35f1cff9a61e06fc427f124766c488e/notebooks/basic_training_notebook.ipynb"
+NOTEBOOK_SHA256="c3b5e1eb339ffd7893209dfa1ca0373abcdd54378d4533f109601cead87a6726"
 MWW_REPO="https://github.com/kahrendt/microWakeWord"
 PIPER_REPO="https://github.com/kahrendt/piper-sample-generator"
 PIPER_MODEL_URL="https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt"
@@ -39,10 +47,20 @@ PIPER_MODEL_SHA256="e95ee53770bf598c354a6e6dbfc95ccb259aeeb501d35a86be8a767429ab
 # The PyPI universal2 wheel replaces the notebook's macOS fork, which no longer builds with current clang; it is the version pymicro-wakeword pulls in for eridian's runtime.
 PYMICRO_FEATURES_SPEC="pymicro-features==2.0.2"
 AUDIO_METADATA_SPEC="git+https://github.com/whatsnowplaying/audio-metadata@d4ebb238e6a401bb1a5aaaac60c9e2b3cb30929f"
-AUDIOSET_URL="https://huggingface.co/datasets/agkphysics/AudioSet/resolve/main/data/bal_train/09.parquet"
-FMA_URL="https://huggingface.co/datasets/mchl914/fma_xsmall/resolve/main/fma_xs.zip"
-NEG_URL_ROOT="https://huggingface.co/datasets/kahrendt/microwakeword/resolve/main"
+# Hugging Face files are fetched at commit revisions, never a moving branch ref.
+AUDIOSET_URL="https://huggingface.co/datasets/agkphysics/AudioSet/resolve/0c609e8302cf139307f639c57652032af0a88041/data/bal_train/09.parquet"
+AUDIOSET_SHA256="1121a990b52fdc9805adf9e6d704cc053c7fed02b5ce6f5b83cf73d3e9eccad7"
+FMA_URL="https://huggingface.co/datasets/mchl914/fma_xsmall/resolve/bfef24fd1e1334e4631b917c98e0dbc3dd653ab2/fma_xs.zip"
+FMA_SHA256="e5876c13cfb0f7ef668327c75d1c40bc4a2ed9d5b8e62ce383d093319c9ff663"
+NEG_URL_ROOT="https://huggingface.co/datasets/kahrendt/microwakeword/resolve/0da95f94302ca2f4aae3b18fc6560fa6d2bba3d1"
 NEG_FILES=(dinner_party.zip dinner_party_eval.zip no_speech.zip speech.zip)
+# Same order as NEG_FILES (parallel array; macOS /bin/bash 3.2 has no associative arrays).
+NEG_SHA256S=(
+	18a0885d595ced7faa73736a8680206f5ba6e80113ca3e6ce43130e510aac18f
+	e08e23a5e654dd4415a1c41a4b6cd02d1f983c821512367ad937bac1aeed8299
+	722dbcc967275c64c9581ecb85729549830a9094ce605ee22b2ddab9dbabf3c8
+	68b6b811b347b8321169f9e75ea2b9be73245943b4470af9532ca288d9f1b3cc
+)
 
 VENV="$MWW_ROOT/venv"
 PY="$VENV/bin/python"
@@ -68,27 +86,43 @@ die() {
 	exit 1
 }
 
-# Download to a .part file (resumable), then rename.
-fetch() {
-	local url="$1" dest="$2"
-	if [[ -s "$dest" ]]; then
-		log "skip download (exists): $dest"
-		return 0
+# Check <file> against an expected SHA-256. On mismatch the file is removed (so a
+# rerun refetches) and the script dies. <file> must be under MWW_ROOT.
+verify_sha256() {
+	local file="$1" want="$2" sum
+	[[ "$want" =~ ^[0-9a-f]{64}$ ]] || die "bad expected sha256 for $file"
+	sum="$(shasum -a 256 "$file")" || die "cannot hash $file"
+	sum="${sum%% *}"
+	if [[ "$sum" != "$want" ]]; then
+		safe_rm_subdir "${file#"$MWW_ROOT"/}"
+		die "sha256 mismatch for $file (got $sum, want $want); removed it, rerun to refetch"
 	fi
-	log "download: $url"
-	curl -fL --retry 3 -C - -o "$dest.part" "$url"
-	mv "$dest.part" "$dest"
+	log "sha256 ok: ${file##*/}"
 }
 
-# Download a zip into downloads/ and validate it; a corrupt one is removed and
-# fetched once more before giving up. $2 is a bare filename.
+# Download to a .part file (resumable), rename, then verify against $3 (SHA-256).
+# An existing file is verified too, not trusted, and is not downloaded again.
+fetch() {
+	local url="$1" dest="$2" sha="$3"
+	if [[ -s "$dest" ]]; then
+		log "skip download (exists): $dest"
+	else
+		log "download: $url"
+		curl -fL --retry 3 -C - -o "$dest.part" "$url"
+		mv "$dest.part" "$dest"
+	fi
+	verify_sha256 "$dest" "$sha"
+}
+
+# Download a zip into downloads/, verify its SHA-256 and validate it; a corrupt
+# one is removed and fetched once more before giving up. $2 is a bare filename.
 fetch_zip() {
-	local url="$1" name="$2" dest="$MWW_ROOT/downloads/$2"
-	fetch "$url" "$dest"
+	local url="$1" name="$2" sha="$3" dest="$MWW_ROOT/downloads/$2"
+	fetch "$url" "$dest" "$sha"
 	if ! unzip -tq "$dest" >/dev/null 2>&1; then
 		log "corrupt zip, refetching: $name"
 		safe_rm_download "$name"
-		fetch "$url" "$dest"
+		fetch "$url" "$dest" "$sha"
 		unzip -tq "$dest" >/dev/null 2>&1 || die "zip still corrupt after refetch: $name"
 	fi
 }
@@ -120,13 +154,7 @@ else
 fi
 
 # --- 2. notebook copy -----------------------------------------------------
-if [[ -s "$MWW_ROOT/notebook.ipynb" ]]; then
-	log "skip notebook copy (exists)"
-else
-	log "save notebook copy"
-	curl -fsSL --retry 3 -o "$MWW_ROOT/notebook.ipynb.part" "$NOTEBOOK_URL"
-	mv "$MWW_ROOT/notebook.ipynb.part" "$MWW_ROOT/notebook.ipynb"
-fi
+fetch "$NOTEBOOK_URL" "$MWW_ROOT/notebook.ipynb" "$NOTEBOOK_SHA256"
 
 # --- 3. microWakeWord code ------------------------------------------------
 MWW_DIR="$MWW_ROOT/microWakeWord"
@@ -135,7 +163,7 @@ if [[ ! -d "$MWW_DIR/.git" ]]; then
 	git clone "$MWW_REPO" "$MWW_DIR" 2>&1 | tee -a "$LOG"
 	if [[ -n "$MWW_REF" ]]; then
 		log "checkout MWW_REF=$MWW_REF"
-		git -C "$MWW_DIR" checkout "$MWW_REF" 2>&1 | tee -a "$LOG"
+		git -C "$MWW_DIR" checkout --detach "$MWW_REF" 2>&1 | tee -a "$LOG"
 		safe_rm_subdir .done-pip-core
 	fi
 else
@@ -150,7 +178,7 @@ else
 		have="$(git -C "$MWW_DIR" rev-parse HEAD)"
 		if [[ "$want" != "$have" ]]; then
 			log "MWW_REF differs (have $have, want $want); checking out and redoing core pip step"
-			git -C "$MWW_DIR" checkout "$MWW_REF" 2>&1 | tee -a "$LOG"
+			git -C "$MWW_DIR" checkout --detach "$MWW_REF" 2>&1 | tee -a "$LOG"
 			safe_rm_subdir .done-pip-core
 		fi
 	fi
@@ -183,17 +211,23 @@ if [[ ! -d "$PIPER_DIR/.git" ]]; then
 else
 	log "skip clone (exists): $PIPER_DIR"
 fi
+if [[ -n "$PIPER_REF" ]]; then
+	want="$(git -C "$PIPER_DIR" rev-parse --verify --quiet "$PIPER_REF^{commit}" || true)"
+	if [[ -z "$want" ]]; then
+		git -C "$PIPER_DIR" fetch --all --tags 2>&1 | tee -a "$LOG"
+		want="$(git -C "$PIPER_DIR" rev-parse --verify --quiet "$PIPER_REF^{commit}" || true)"
+	fi
+	[[ -n "$want" ]] || die "PIPER_REF '$PIPER_REF' not found in $PIPER_DIR"
+	if [[ "$want" != "$(git -C "$PIPER_DIR" rev-parse HEAD)" ]]; then
+		log "checkout PIPER_REF=$PIPER_REF"
+		git -C "$PIPER_DIR" checkout --detach "$PIPER_REF" 2>&1 | tee -a "$LOG"
+	fi
+fi
 log "piper-sample-generator commit: $(git -C "$PIPER_DIR" rev-parse HEAD)"
 mkdir -p "$PIPER_DIR/models"
 PIPER_MODEL="$PIPER_DIR/models/en_US-libritts_r-medium.pt"
-fetch "$PIPER_MODEL_URL" "$PIPER_MODEL"
-# Checked on every run, including when the file was already present.
-piper_sum="$(shasum -a 256 "$PIPER_MODEL")" || die "cannot hash $PIPER_MODEL"
-if [[ "${piper_sum%% *}" != "$PIPER_MODEL_SHA256" ]]; then
-	safe_rm_subdir "piper-sample-generator/models/en_US-libritts_r-medium.pt"
-	die "piper model sha256 mismatch (got ${piper_sum%% *}); removed it, rerun to refetch"
-fi
-log "piper model sha256 ok"
+# Verified on every run, including when the file was already present.
+fetch "$PIPER_MODEL_URL" "$PIPER_MODEL" "$PIPER_MODEL_SHA256"
 
 if [[ -e "$MWW_ROOT/.done-pip-piper" ]]; then
 	log "skip piper pip install (marker exists)"
@@ -256,7 +290,7 @@ PYEOF
 if [[ -e "$MWW_ROOT/.done-audioset_16k" ]]; then
 	log "skip audioset_16k (done)"
 else
-	fetch "$AUDIOSET_URL" "$DATA_TMP/audioset_bal_train_09.parquet"
+	fetch "$AUDIOSET_URL" "$DATA_TMP/audioset_bal_train_09.parquet" "$AUDIOSET_SHA256"
 	log "convert audioset parquet -> audioset_16k"
 	mkdir -p "$MWW_ROOT/audioset_16k"
 	"$PY" -I -c "$PY_COMMON
@@ -304,7 +338,7 @@ fi
 if [[ -e "$MWW_ROOT/.done-fma_16k" ]]; then
 	log "skip fma_16k (done)"
 else
-	fetch_zip "$FMA_URL" fma_xs.zip
+	fetch_zip "$FMA_URL" fma_xs.zip "$FMA_SHA256"
 	if [[ ! -d "$MWW_ROOT/fma/fma_small" ]]; then
 		log "extract fma"
 		safe_rm_subdir .tmp-extract-fma
@@ -341,13 +375,14 @@ fi
 
 # HF negatives (pre-generated spectrogram features). *_background zips skipped.
 mkdir -p "$MWW_ROOT/negative_datasets"
-for fname in "${NEG_FILES[@]}"; do
+for i in "${!NEG_FILES[@]}"; do
+	fname="${NEG_FILES[$i]}"
 	marker="$MWW_ROOT/negative_datasets/.done-$fname"
 	if [[ -e "$marker" ]]; then
 		log "skip negatives (done): $fname"
 		continue
 	fi
-	fetch_zip "$NEG_URL_ROOT/$fname" "$fname"
+	fetch_zip "$NEG_URL_ROOT/$fname" "$fname" "${NEG_SHA256S[$i]}"
 	log "unzip: $fname"
 	unzip -q -o "$DATA_TMP/$fname" -d "$MWW_ROOT/negative_datasets"
 	touch "$marker"

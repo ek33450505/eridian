@@ -23,12 +23,12 @@ torch) live in `$MWW_ROOT/cache`, not `~/.cache`.
   validate the root and exit without creating anything.
 - Disk use: about 25-40 GB.
 - Log: `$MWW_ROOT/logs/setup.log` (includes the microWakeWord commit).
-- Optional: `MWW_REF=<git ref>` checks out that ref of microWakeWord and
-  redoes its pip install if the existing clone differs. Unset, the clone is
-  left as is (it is not pinned).
+- Optional: `MWW_REF=<git ref>` replaces the default pinned commit of
+  microWakeWord. The ref is checked out and the pip install is redone if the
+  existing clone differs. Unset, the pinned commit is checked out.
 - Audio decoding uses `soundfile` and `datasets<4`; no ffmpeg needed.
 
-**Trust:** training is trust-on-first-use. `setup.sh` downloads upstream code and datasets, and some are unpinned: it clones microWakeWord's default branch unless `MWW_REF` is set, clones the `mps-support` branch of `PIPER_REPO` (`setup.sh:182`), and fetches data from Hugging Face `resolve/main` URLs.
+**Trust:** every download in `setup.sh` is pinned to a revision and checked against SHA-256 (`verify_sha256`): the notebook, the piper model, and the AudioSet, FMA and negative-dataset files on Hugging Face. The microWakeWord and piper-sample-generator git checkouts are pinned to commits (`MWW_REF`, `PIPER_REF`) but not SHA-256 checked. The pins match the downloads used to train the maintainer's model on 2026-11-09. Setting `MWW_REF` or `PIPER_REF` replaces the default pin for that repo, so the override is not covered by the pin. pip installs are not hash-pinned.
 
 ## Licenses
 

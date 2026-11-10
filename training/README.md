@@ -20,7 +20,7 @@ docker build -t eridian-oww:latest training/
 **Build time:** ~5-10 minutes (first build; subsequent builds use layer caching)
 **Image size:** **3.58 GB** (significantly reduced via dependency reordering — see Deviations below)
 
-**Trust:** the image is built from upstream git tags and GitHub release assets (`training/Dockerfile`) with no checksum check. `scipy` and `pyyaml` are unpinned (`training/Dockerfile:58-59`), and training downloads datasets when it runs, so training is trust-on-first-use.
+**Trust:** the image pins the openWakeWord and piper-sample-generator git checkouts to commits (`training/Dockerfile:19-24`) and checks the piper model and the openWakeWord feature models against SHA-256 (`sha256sum -c`). These pins are trust-on-first-use from 2026-11-09, not training-proven. pip packages are not hash-pinned, and `scipy` and `pyyaml` are unpinned (`training/Dockerfile:65-66`). The Docker training scripts' own runtime downloads were not reviewed. (The separate microWakeWord path, `training/microwakeword/`, SHA-256 checks its dataset downloads.)
 
 ## Running the Smoke Test
 

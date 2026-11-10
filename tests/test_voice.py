@@ -109,7 +109,11 @@ class _Channel:
     def __init__(self, path: Path) -> None:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(2.0)
-        self.sock.connect(str(path))
+        try:
+            self.sock.connect(str(path))
+        except OSError:
+            self.sock.close()
+            raise
         self._buf = b""
 
     def send_obj(self, obj: dict) -> None:
