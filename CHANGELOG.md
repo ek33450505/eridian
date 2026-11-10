@@ -4,6 +4,14 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-10 — No open mic while a confirm is pending
+
+**Fixed**
+- An `answer` still playing when Claude sent a `confirm` could open the no-wake-word follow-up window right after the confirm prompt; anything heard there was sent as a `follow_up` turn and used up the confirm challenge. It could never grant. The window now never opens while a confirm is pending (checked when the reply is credited and again when the window would open).
+
+**Changed**
+- While a confirm is pending, `follow_up` and `talk_over` turns are not sent; eridian says "A confirmation is waiting. Say the wake word, then the phrase." in its own voice. Plain wake-word turns are sent as before. Previously a non-echo talk-over turn was sent during a pending confirm.
+
 ### 2026-11-09 — Pre-public cleanup
 
 **Changed**

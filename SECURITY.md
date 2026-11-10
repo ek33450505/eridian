@@ -118,7 +118,7 @@ The start-up header prints the effective working directory and, when it substitu
 - **No module shadowing:** Claude Code starts the channel as `python -P -m eridian.cli channel`. `-P` keeps the session's working directory off `sys.path`, so a hostile checkout can't shadow eridian's modules.
 - **Input/output limits:** `reply` text over 4000 characters is rejected. Inbound utterances have `<` and `>` stripped before they are sent to the session, so a transcript can't close or forge the `<channel>` tag it arrives in.
 - **stdout is JSON-RPC only:** logs go to a 0600 `channel.log` and never include transcripts or reply text.
-- **No follow-up window after confirm:** `attach` opens the no-wake-word follow-up window only after the first `answer` reply to a wake-word turn. After an `ack` or a `confirm`, the user must say the wake word again, so ambient audio can't answer a confirmation question.
+- **No follow-up window after confirm:** `attach` opens the no-wake-word follow-up window only after the first `answer` reply to a wake-word turn, and never while a confirm is pending (checked when the reply is credited and again when the window would open). A follow-up or talk-over turn heard while a confirm is pending is not sent, so ambient audio can't answer a confirmation question or use up its challenge; only a plain wake-word turn can. A turn that has already passed this check when a confirm lands can still be sent; it can't grant.
 - **Confirmation is now a hard control:** see "Voice-turn guard (`voice_guard.py`)" below.
 
 ### Acoustic Self-Screen

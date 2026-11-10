@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from eridian import voice as voice_module
 from eridian import voice_guard, wake
 from eridian.listener import VAD_CHUNK_BYTES, ListenerEvent
 from eridian.spoken import sanitize_terminal
@@ -30,6 +31,7 @@ from eridian.voice import (
     ANNOUNCE_LEVELS,
     ANNOUNCE_REPEAT_S,
     ANNOUNCE_TEMPLATES,
+    CONFIRM_NEEDS_WAKE_SPEECH,
     ECHO_GUARD_S,
     ECHO_HISTORY_S,
     MAX_CHECK_CHARS,
@@ -611,6 +613,88 @@ class ReplyKindTest(VoiceTestCase):
         self.assertEqual(self.cues, [])
         self.player.idle.set()
         self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
+
+    def _wake_credit(self) -> None:
+        self.bridge._reply_origin = "wake"
+        self.bridge._reply_origin_at = self.clock()
+
+    def test_answer_while_confirm_pending_opens_no_follow_up(self) -> None:
+        self.start()
+        channel = self.attach()
+        self._send(channel, kind="confirm")
+        self._settle_watcher()
+        self._wake_credit()  # a fresh wake turn, confirm still pending
+        with mock.patch.object(
+            self.bridge._speech_q, "put", wraps=self.bridge._speech_q.put
+        ) as put:
+            self._send(channel, kind="answer")
+            self.assertTrue(_wait_for(lambda: put.called))
+        (item,), _ = put.call_args
+        _gen, opens_window, _seq = item
+        self.assertFalse(opens_window)  # gate (a), independent of the open-time gate
+        self._no_follow_up()
+
+    def test_answer_after_confirm_challenge_expired_opens_follow_up(self) -> None:
+        self.start()
+        channel = self.attach()
+        self._send(channel, kind="confirm")
+        self._settle_watcher()
+        self.clock.now += voice_guard.CHALLENGE_TTL_S + 1
+        self._wake_credit()
+        self._send(channel, kind="answer")
+        self.assertTrue(self.pump_until(lambda: self.cues == ["follow_up"]))
+
+    def test_confirm_landing_before_reply_done_drains_blocks_the_window(self) -> None:
+        self.start()
+        channel = self.attach()
+        self._wake_credit()
+        self.player.idle.clear()  # the answer is still being spoken
+        self._send(channel, kind="answer")  # credited: opens_window is True
+        self._send(channel, kind="confirm")  # a real confirm lands before reply_done drains
+        self.assertTrue(self.bridge._confirm_pending)
+        self.player.idle.set()
+        self._settle_watcher()
+        self._no_follow_up()
+
+    def test_confirm_still_pending_exactly_at_challenge_ttl(self) -> None:
+        self.start()
+        channel = self.attach()
+        self._send(channel, kind="confirm")
+        self._settle_watcher()
+        self.clock.now += voice_guard.CHALLENGE_TTL_S  # the check is <=
+        with self.bridge._lock:
+            self.assertTrue(self.bridge._confirm_is_pending())
+        self.clock.now += 0.001
+        with self.bridge._lock:
+            self.assertFalse(self.bridge._confirm_is_pending())
+
+    def test_wedged_lock_fails_closed_without_raising(self) -> None:
+        self.start()
+        channel = self.attach()
+        self._wake_credit()
+        self.player.idle.clear()
+        self._send(channel, kind="answer")  # credited
+        real = voice_module._bounded
+        calls = []
+
+        @contextlib.contextmanager
+        def wedged(lock, *args, **kwargs):
+            calls.append(1)
+            raise TimeoutError("wedged")
+            yield  # pragma: no cover
+
+        self.player.idle.set()
+        self.assertTrue(_wait_for(lambda: not self.bridge._control.empty()))
+        # _is_current takes the same lock; stub it so only the confirm check sees the wedge.
+        with mock.patch.object(voice_module, "_bounded", wedged), mock.patch.object(
+            self.bridge, "_is_current", return_value=True
+        ):
+            for _ in range(3):
+                self.bridge.process_frame(FRAME)
+        self.assertTrue(calls)
+        self.assertEqual(self.cues, [])
+        self.assertEqual(self.state, "IDLE")
+        self.assertIs(voice_module._bounded, real)
 
 
 class FollowUpOriginTest(VoiceTestCase):
@@ -2442,6 +2526,39 @@ class TooSoonAndRedactionTest(VoiceTestCase):
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0]["via"], "wake_barge_in")
 
+    def test_follow_up_turn_held_while_confirm_pending(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)  # the window was open when it arrived
+        self.player.enqueued.clear()
+        self.player.own_flags.clear()
+        self.say("follow_up", "confirm walnut lantern")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.player.enqueued, [CONFIRM_NEEDS_WAKE_SPEECH])
+        self.assertEqual(self.player.own_flags, [True])
+        self.assertTrue(self.bridge._confirm_pending)
+        printed = self.out.getvalue()
+        self.assertIn("[confirmation pending, so not sent", printed)
+        self.assertNotIn("you [follow_up]", printed)
+
+    def test_talk_over_turn_held_while_confirm_pending(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.player.enqueued.clear()
+        self.say("talk_over", "confirm walnut lantern")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.player.enqueued, [CONFIRM_NEEDS_WAKE_SPEECH])
+        self.assertTrue(self.bridge._confirm_pending)
+
+    def test_plain_wake_turn_not_held_while_confirm_pending(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.say("wake", "confirm walnut lantern")
+        self.assertEqual([m["via"] for m in self.sent], ["wake"])
+        self.assertNotIn(CONFIRM_NEEDS_WAKE_SPEECH, self.player.enqueued)
+
+    def test_follow_up_turn_sent_once_challenge_expired(self) -> None:
+        self.reply(kind="confirm", check=self.CHECK)
+        self.clock.now += voice_guard.CHALLENGE_TTL_S + 1
+        self.say("follow_up", "what time is it")
+        self.assertEqual([m["via"] for m in self.sent], ["follow_up"])
+
     def test_early_wake_turn_sent_when_no_confirm_pending(self) -> None:
         self.say("wake_barge_in", "what time is it")
         self.assertEqual(len(self.sent), 1)
@@ -2555,8 +2672,9 @@ class EchoTextGuardTest(VoiceTestCase):
             json.dumps({"type": "reply", "text": "Say confirm walnut lantern.", "kind": "confirm"}).encode("utf-8"),
         )
         self.assertTrue(self.bridge._confirm_pending)
-        self.turn("talk_over", "go ahead and do it")  # not echo: sent, but as talk_over
-        self.assertEqual(self.sent[-1]["via"], "talk_over")
+        self.turn("talk_over", "go ahead and do it")  # not echo, but a confirm is pending: held
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.bridge._confirm_pending)  # the challenge is untouched
         self.player.busy = False
         self.clock.now += 30
         self.turn("wake", "say confirm walnut lantern", busy=False, stamp=False)  # matches recent speech
