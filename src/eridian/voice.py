@@ -192,7 +192,11 @@ window, no chaining, no grant); closing that needs turn ids in the protocol. `ac
 early "running the tests now") never does, and neither does `confirm` -- a
 spoken confirmation prompt must not be answerable by ambient audio (a video
 saying "yes") inside an open mic window, so it needs a fresh wake word. An
-unknown `kind` fails closed: it is spoken but opens no window.
+unknown `kind` fails closed: it is spoken but opens no window. While a
+confirm's challenge could still be alive, no follow-up window opens, and a
+follow-up or talk-over turn is not sent (eridian says CONFIRM_NEEDS_WAKE_SPEECH
+in its own voice instead); an answer that arrives then spends its wake credit
+and opens nothing.
 
 Talk-over (`talk_over=True`, only when echo cancellation is on): while a reply
 plays, sustained user speech stops it without the wake word and becomes the
@@ -307,6 +311,21 @@ _RESERVED_OPS = ("mute", "voice_off", "status")  # all a reserved-slot connectio
 WAKE_MISMATCH_REPEAT_S = 60.0  # speak the mismatch notice at most once per window, whatever phrase is claimed
 WAKE_MISMATCH_SPEECH = "This session uses a different wake word than the voice process. Restart the session."
 TOO_SOON_SPEECH = "That was too soon after I spoke. Wait a moment, then say the wake word again."
+CONFIRM_NEEDS_WAKE_SPEECH = "A confirmation is waiting. Say the wake word, then the phrase."
+_CONFIRM_HOLDS = {
+    "wake_barge_in": (
+        "[too soon after I spoke, so not sent: wait a moment, then say the wake word again]\n",
+        TOO_SOON_SPEECH,
+    ),
+    "follow_up": (
+        "[confirmation pending, so not sent: say the wake word, then the phrase]\n",
+        CONFIRM_NEEDS_WAKE_SPEECH,
+    ),
+    "talk_over": (
+        "[confirmation pending, so not sent: say the wake word, then the phrase]\n",
+        CONFIRM_NEEDS_WAKE_SPEECH,
+    ),
+}  # via -> (console line, spoken line) for a turn held while a confirm is pending
 
 ANNOUNCE_TEMPLATES = {
     "finished": "Claude finished.",
@@ -1135,9 +1154,17 @@ class VoiceBridge:
                 and self._listener.state == "IDLE"
                 and gen != self._followed_gen
                 and self._is_current(gen)
+                and not self._confirm_pending_failclosed()
             ):
                 self._followed_gen = gen
                 self._listener.listen_now(self._follow_up_s)
+
+    def _confirm_pending_failclosed(self) -> bool:
+        try:
+            with _bounded(self._lock):
+                return self._confirm_is_pending()
+        except TimeoutError:
+            return True  # a wedged lock fails closed: no window
 
     def _confirm_is_pending(self) -> bool:
         """Session lock held. Pending only while the guard's challenge could still be alive."""
@@ -1270,22 +1297,19 @@ class VoiceBridge:
             if kept != text:
                 removed_line = f'[removed my own words: "{self._redact(text)}" -> "{self._redact(kept)}"]\n'
                 text = kept
-        if via == "wake_barge_in":
-            with _bounded(self._lock):
-                held = self._confirm_is_pending()
-            if held:
-                # Could be our own voice, so it can never grant; sending it
-                # would only use up the challenge. Say why instead.
-                def _say_too_soon() -> None:
-                    self._note_spoken(TOO_SOON_SPEECH)
-                    self._player.enqueue(TOO_SOON_SPEECH, own=True)
+        # While a confirm is pending only a plain wake turn may answer it: anything else
+        # could be our own voice or ambient audio, can never grant, and would only use
+        # up the challenge. Say why instead of sending.
+        hold = _CONFIRM_HOLDS.get(via)
+        if hold is not None and self._confirm_pending_failclosed():
+            line, spoken = hold
 
-                self._unsent(
-                    "[too soon after I spoke, so not sent: wait a moment, "
-                    "then say the wake word again]\n",
-                    _say_too_soon,
-                )
-                return
+            def _say_held() -> None:
+                self._note_spoken(spoken)
+                self._player.enqueue(spoken, own=True)
+
+            self._unsent(line, _say_held)
+            return
         tag = f" [{via}]" if via not in ("", "wake") else ""
         you_line = f"you{tag}: {self._redact(text)}\n"
         payload = {"type": "utterance", "text": text, "via": via}
@@ -1814,6 +1838,7 @@ class VoiceBridge:
                     kind == "answer"
                     and self._reply_origin in WAKE_TURN_VIAS
                     and self._clock() - self._reply_origin_at <= REPLY_WINDOW_CREDIT_TTL_S
+                    and not self._confirm_is_pending()
                 )
                 if kind != "ack":
                     self._reply_origin = ""
