@@ -146,6 +146,16 @@ class DenyDirTests(MemoryTestCase):
         os.chdir(link)
         self.assertEqual(self.run_main("list")[0], 2)
 
+    def test_case_variant_deny_dir_refused(self) -> None:
+        sub = self.root / "WorkDir" / "x"
+        sub.mkdir(parents=True)
+        if not (self.root / "workdir").exists():
+            self.skipTest("case-sensitive filesystem")
+        os.chdir(sub)
+        code, out, err = self.run_main("list", deny=self.root / "workdir")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("personal-only", err)
+
 
 class SafetyTests(MemoryTestCase):
     def test_symlinked_dir_refused(self) -> None:

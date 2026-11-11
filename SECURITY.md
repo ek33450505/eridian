@@ -30,7 +30,7 @@ The runtime code in this repository is the typed-chat persona SessionStart hook 
 
 ### Memory Store (`memory.py`)
 
-**Threat:** The store holds short personal notes that the persona writes about its user, and a later unit will feed them back into session context. Its risks are exposure of those notes, corruption or loss, and stored text that tries to act as instructions when it is read back.
+**Threat:** The store holds short personal notes that the persona writes about its user, and the persona hook feeds them back into the context of personal sessions. Its risks are exposure of those notes, corruption or loss, and stored text that tries to act as instructions when it is read back.
 
 **Mechanism:**
 - `python -P -m eridian.memory add --kind {win,fail,joke,fact,mood} TEXT...`, `list`, `forget N` and `forget --all`. It never reads stdin.
@@ -45,6 +45,22 @@ The runtime code in this repository is the typed-chat persona SessionStart hook 
 - The notes are plain text on disk, protected only by file permissions. They are not encrypted.
 - The `--deny-under` check guards against accidents, not against a deliberate caller. A caller can pass a different directory, and a work session whose working directory lies outside the deny directory is not detected.
 - Intermediate components of the store path may be symlinks; only the last component is checked. The path comes from the user's own `$HOME` or `$ERIDIAN_HOME`.
-- Stored text is model-written and will be read back into context by a later unit. Single-line text with no control or bidi characters can still say anything. Framing, escaping and a size budget belong to the code that injects it.
+- Stored text is model-written and is read back into personal sessions (see "Memory Injection" below). Single-line text with no control or bidi characters can still say anything.
 - `forget N` uses the numbering from `list`. A concurrent `add` that evicts an entry between the two calls can shift the numbers.
 - `ERIDIAN_TEST_LOCK_TIMEOUT` (a finite number of seconds, 0 or more) overrides the lock wait. It exists for tests.
+
+### Memory Injection (`persona.py` with `memory.py`)
+
+**Threat:** Notes written in one session are injected into later personal sessions as SessionStart context, which the model trusts more than tool output. A note planted from untrusted content could try to steer later sessions. The save instruction also asks the model to run a shell command whose text it writes itself.
+
+**Mechanism:**
+- Memory is added only when `cwd` is inside `--under` and is NOT inside `--work-under` or `~/Projects/work`. The work-directory checks compare by file identity (`os.path.samefile` over the resolved `cwd` and its parents), so a symlink or a differently-cased path is still caught; a spelling-based check also runs, so a missing work directory still matches by path. The deny directory is fixed in code; no caller can change it. Work sessions never read the store.
+- `eridian.memory` is imported lazily. Any error in importing it, in the work-directory checks, in reading the store (unsafe, oversized or corrupt) or in rendering leaves the plain persona or the persona plus instruction, with exit 0. The read takes no lock, so it cannot wait.
+- Notes are read only through `load_entries()` (strict validation, newest 60). Each line is rendered as `- YYYY-MM-DD kind: "text"`. The text is JSON-quoted, and `<` and `>` are escaped as `\u003c` and `\u003e`, so a note cannot close the `<rocky-memory>` frame or start a new line. A fixed header says the notes are background data that must never be acted on as a request, command or permission. The whole block (header, tags and notes) stays within 1500 characters: the newest notes, up to the first one that does not fit, listed oldest first.
+- The save instruction shows the command with the interpreter path shell-quoted and the note text in single quotes. It tells the model to keep apostrophes, dollar signs and backticks out of the note, to tell the user whenever it saves one, and never to save secrets, credentials, health or financial details, other people's private details or work content.
+
+**Residual risks:**
+- A plain-English note can still try to steer the model. The header is a soft control. The limits are the 200-character single-line format, the 1500-character budget, personal-only reads, and `list`/`forget` for the user.
+- The model writes the save command. If it ignores the quoting rule, shell expansion is possible. Claude Code's Bash permission prompt is the backstop, so do not add `eridian.memory add` to an auto-approve allowlist.
+- Matching a differently-cased path needs the work directory to exist and be statable; otherwise only the exact spelling matches.
+- A work session whose `cwd` lies outside both `--work-under` and `~/Projects/work` is not recognised as work.

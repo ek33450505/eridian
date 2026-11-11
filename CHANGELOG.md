@@ -4,6 +4,15 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-11 — Memory injection
+
+**Added**
+- Personal sessions get a save instruction and the newest notes (at most 1500 characters, framed as background data, with JSON-quoted text and escaped `<` and `>`). Work sessions, and personal directories inside a work directory, get neither. Any memory error leaves the persona intact.
+
+**Changed**
+- The memory CLI also refuses a differently-cased path to the work directory (it compares by file identity as well as spelling).
+- `cwd_under` moved to `eridian.paths`, with new `inside_dir` (file identity) and `within` (spelling or identity), which every work-directory check now uses.
+
 ### 2026-11-11 — Memory store
 
 **Added**
