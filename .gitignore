@@ -3,13 +3,4 @@
 __pycache__/
 *.pyc
 
-# Wake-word training: datasets, generated clips, and intermediate features are large and reproducible
-training/work/
-training/data/
-*.npy
-
-# Local audio captures from spikes
-*.wav
-*.aiff
-
 .DS_Store

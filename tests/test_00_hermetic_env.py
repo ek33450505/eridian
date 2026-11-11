@@ -9,7 +9,7 @@ to apply the same scrub. Under discover the module can still load a second time 
 package), so the temp home is recorded in ERIDIAN_TEST_HERMETIC_HOME, which the
 scrub keeps, and a second load reuses it: one temp home, one atexit handler.
 Tests that need a specific variable set it themselves (mock.patch.dict).
-ERIDIAN_TEST_* opt-ins (e.g. ERIDIAN_TEST_REAL_KOKORO) are kept. Running a file
+ERIDIAN_TEST_* opt-ins are kept. Running a file
 directly (`python tests/test_x.py`) skips this scrub.
 
 After the scrub, ERIDIAN_HOME is pointed at a throwaway temp dir so a test that
