@@ -4,6 +4,15 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-11 — Work-repo persona and journal voice
+
+**Added**
+- `--work-under DIR`: sessions under that directory get the persona plus a fixed `WORK_CLAUSE`, which keeps the persona name and speech out of every work artifact (commits, PRs, tickets, messages, docs, handoffs, journal entries). `--under` wins when both match.
+- The persona may write Claude's journal in its own voice and add one line at the top or bottom of a handoff file. Everything else on disk stays plain, and both exceptions are off in work repositories.
+
+**Changed**
+- SECURITY.md no longer points to GitHub private vulnerability reporting, which is not enabled.
+
 ### 2026-11-11 — Voice archived; refocus on typed Rocky
 
 **Removed**
