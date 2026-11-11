@@ -4,6 +4,15 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-11 — Voice archived; refocus on typed Rocky
+
+**Removed**
+- The voice interface (wake word, speech in and out, `voice_guard`), wake-word training, the offline-check scripts and the speech persona. All of it is preserved at tag `voice-archive-v1`.
+
+**Changed**
+- The package now has no runtime dependencies.
+- There is no `eridian` console script; the SessionStart hook runs as `python -m eridian.persona`.
+
 ### 2026-11-10 — No open mic while a confirm is pending
 
 **Fixed**
