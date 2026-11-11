@@ -26,6 +26,8 @@ echo '{"cwd": "/path/to/projects/my-repo"}' | \
 
 Use absolute paths; the hook ignores relative ones. When `cwd` is inside the `--under` directory it prints a SessionStart JSON envelope with the persona as `additionalContext`. Otherwise it prints nothing. Once its arguments parse it always exits 0, so it never blocks a session.
 
+Add `--work-under /path/to/work` to also cover work repositories: a `cwd` inside that directory gets the persona plus a work clause that keeps the persona name and speech out of every work artifact (commits, PRs, tickets, messages, docs). When `cwd` matches both directories, `--under` wins and no work clause is added. The work directory must not sit inside the `--under` directory, otherwise `--under` wins and work sessions get no work clause.
+
 Register it in your Claude Code settings, with absolute paths:
 
 ```json

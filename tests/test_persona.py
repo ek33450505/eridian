@@ -180,5 +180,123 @@ class TypedHookTest(unittest.TestCase):
         self.assertEqual(got["hookSpecificOutput"]["hookEventName"], "SessionStart")
 
 
+class WorkHookTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="ut")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.work = self.root / "work"
+        self.work_sub = self.work / "repo"
+        self.work_evil = self.root / "work-evil"
+        self.personal = self.root / "personal"
+        self.outside = self.root / "elsewhere"
+        for d in (self.work_sub, self.work_evil, self.personal, self.outside):
+            d.mkdir(parents=True)
+
+    def _run(
+        self, cwd: object, under: object = None, work_under: object = "default"
+    ) -> tuple[int, str]:
+        out = io.StringIO()
+        argv = ["sessionstart", "--under", str(self.personal if under is None else under)]
+        if work_under == "default":
+            work_under = self.work
+        if work_under is not None:
+            argv += ["--work-under", str(work_under)]
+        rc = persona.main(argv, stdin=io.StringIO(json.dumps({"cwd": str(cwd)})), stdout=out)
+        return rc, out.getvalue()
+
+    def _envelope(self, context: str) -> dict:
+        return {
+            "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}
+        }
+
+    def _assert_work(self, rc_out: tuple[int, str]) -> None:
+        self.assertEqual(rc_out[0], 0)
+        self.assertEqual(
+            json.loads(rc_out[1]),
+            self._envelope(persona.TYPED_ROCKY_BLOCK + "\n\n" + persona.WORK_CLAUSE),
+        )
+
+    def _assert_personal(self, rc_out: tuple[int, str]) -> None:
+        self.assertEqual(rc_out[0], 0)
+        self.assertEqual(json.loads(rc_out[1]), self._envelope(persona.TYPED_ROCKY_BLOCK))
+
+    def test_work_dir_emits_work_variant(self) -> None:
+        self._assert_work(self._run(self.work))
+
+    def test_work_subdir_emits_work_variant(self) -> None:
+        self._assert_work(self._run(self.work_sub))
+
+    def test_personal_dir_still_plain_with_work_under(self) -> None:
+        self._assert_personal(self._run(self.personal))
+
+    def test_personal_nested_in_work_wins(self) -> None:
+        self._assert_personal(self._run(self.personal, work_under=self.root))
+
+    def test_work_sibling_prefix_is_silent(self) -> None:
+        self.assertEqual(self._run(self.work_evil), (0, ""))
+
+    def test_relative_work_under_is_silent(self) -> None:
+        self.assertEqual(self._run(self.work_sub, work_under="work"), (0, ""))
+
+    def test_symlink_out_of_work_is_silent(self) -> None:
+        link = self.work / "link"
+        link.symlink_to(self.outside)
+        self.assertEqual(self._run(link), (0, ""))
+
+    def test_dotdot_escape_out_of_work_is_silent(self) -> None:
+        self.assertEqual(self._run(f"{self.work_sub}/../../elsewhere"), (0, ""))
+
+    def test_work_under_absent_is_silent(self) -> None:
+        self.assertEqual(self._run(self.work_sub, work_under=None), (0, ""))
+
+    def test_work_under_nested_in_under_gets_no_clause(self) -> None:
+        # Documented limitation: --under wins, so a work dir inside it gets no work clause.
+        self._assert_personal(self._run(self.work_sub, under=self.root, work_under=self.work))
+
+    def test_readme_registration_uses_isolated_mode(self) -> None:
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+        match = re.search(r"```json\n(.*?)\n```", readme, re.DOTALL)
+        self.assertIsNotNone(match)
+        settings = json.loads(match.group(1))
+        commands = [
+            hook["command"]
+            for entry in settings["hooks"]["SessionStart"]
+            for hook in entry["hooks"]
+        ]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("/.venv/bin/python -P -m eridian.persona sessionstart --under ", command)
+
+    def test_work_clause_content(self) -> None:
+        clause = persona.WORK_CLAUSE
+        for needle in (
+            "Crosby",
+            "never appear",
+            "journal entries",
+            "Both parts of that on-disk exception are off here",
+            "for this chat only",
+        ):
+            self.assertIn(needle, clause)
+        self.assertIsNone(re.search(r"\bEd\b", clause))
+        self.assertNotIn("/Users/", clause)
+
+    def test_block_has_journal_and_handoff_exception(self) -> None:
+        block = persona.TYPED_ROCKY_BLOCK
+        for needle in (
+            "One narrow exception to the on-disk rule",
+            "Claude's journal",
+            "one Rocky line, at its very top or at its very bottom",
+            "every other part of a handoff file stays plain",
+            "goes at the top whenever a concerns, security or caveat passage",
+        ):
+            self.assertIn(needle, block)
+        exception = block.index("One narrow exception to the on-disk rule")
+        self.assertGreater(
+            exception, block.index("These plain-English rules override everything above.")
+        )
+        self.assertLess(exception, block.index("Style shapes wording"))
+
+
 if __name__ == "__main__":
     unittest.main()
