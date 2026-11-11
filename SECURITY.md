@@ -8,7 +8,7 @@ eridian is a personal, single-user tool. Report suspected vulnerabilities privat
 
 ## Threat Model and Controls
 
-The only runtime code in this repository is the typed-chat persona SessionStart hook (`src/eridian/persona.py`). The earlier voice interface, with its own threat model, is archived at tag `voice-archive-v1` and is not covered here.
+The runtime code in this repository is the typed-chat persona SessionStart hook (`src/eridian/persona.py`) and the persona's memory store CLI (`src/eridian/memory.py`). The earlier voice interface, with its own threat model, is archived at tag `voice-archive-v1` and is not covered here.
 
 ### Typed-Chat Persona Hook (`persona.py`)
 
@@ -27,3 +27,24 @@ The only runtime code in this repository is the typed-chat persona SessionStart 
 - It runs whatever `persona.py` is in the checkout the hook command points at. Point the hook only at a checkout you trust, and remember that editing that checkout changes what runs at every session start under `DIR`.
 - Registering `--work-under` means the hook's code also runs at session start for work sessions, with the work repository as its working directory. The `-P` flag in the registered command is mandatory: it keeps that directory off `sys.path`, so modules in the work repository cannot shadow eridian's or the standard library's. `-P` needs Python 3.11 or later (older interpreters reject the flag and the hook exits 2 without running). The venv's `site-packages` and `.pth` files are trusted.
 - The work directory must not sit inside `DIR`; if it does, `DIR` wins and work sessions get no `WORK_CLAUSE`.
+
+### Memory Store (`memory.py`)
+
+**Threat:** The store holds short personal notes that the persona writes about its user, and a later unit will feed them back into session context. Its risks are exposure of those notes, corruption or loss, and stored text that tries to act as instructions when it is read back.
+
+**Mechanism:**
+- `python -P -m eridian.memory add --kind {win,fail,joke,fact,mood} TEXT...`, `list`, `forget N` and `forget --all`. It never reads stdin.
+- The store is `$ERIDIAN_HOME/memory.jsonl`, or `~/.eridian/memory.jsonl` when `ERIDIAN_HOME` is unset. The directory is opened once per command with `O_DIRECTORY|O_NOFOLLOW`, and it must be owned by the current user. It is set to mode 0700 on every write. Every file operation is relative to that directory handle.
+- Files are opened with `O_NOFOLLOW|O_NONBLOCK`. A file must be a regular file with one link that is owned by the current user. Symlinks, hard links, FIFOs and other users' files are refused, and the command exits 1.
+- Writes go to a new temp file (`O_EXCL`, mode 0600), are flushed and fsynced, then `os.replace`d over the store, and the directory is fsynced. Every read-modify-write holds an exclusive `flock` on `memory.lock`. If the lock is not free within 5 seconds, the command exits 1 instead of waiting forever.
+- Text on `add` has whitespace collapsed to single spaces. Control, format, surrogate, private-use and unassigned characters are dropped. Text over 200 characters is rejected, not truncated. The store keeps at most 60 entries, dropping the oldest first.
+- Reads are strict. Each line must be valid UTF-8 JSON with exactly `ts` (a real `YYYY-MM-DD` date), `kind` (one of the five) and `text` (already normalised, 1 to 200 characters). Any other line is skipped. A store larger than 256 KiB is refused, never truncated and rewritten. `load_entries()` returns at most the newest 60 entries.
+- Every command refuses (exit 2) when the working directory resolves inside `--deny-under`, which defaults to `~/Projects/work`. This keeps work sessions from reading or writing personal memory.
+
+**Residual risks:**
+- The notes are plain text on disk, protected only by file permissions. They are not encrypted.
+- The `--deny-under` check guards against accidents, not against a deliberate caller. A caller can pass a different directory, and a work session whose working directory lies outside the deny directory is not detected.
+- Intermediate components of the store path may be symlinks; only the last component is checked. The path comes from the user's own `$HOME` or `$ERIDIAN_HOME`.
+- Stored text is model-written and will be read back into context by a later unit. Single-line text with no control or bidi characters can still say anything. Framing, escaping and a size budget belong to the code that injects it.
+- `forget N` uses the numbering from `list`. A concurrent `add` that evicts an entry between the two calls can shift the numbers.
+- `ERIDIAN_TEST_LOCK_TIMEOUT` (a finite number of seconds, 0 or more) overrides the lock wait. It exists for tests.

@@ -48,6 +48,19 @@ Register it in your Claude Code settings, with absolute paths:
 }
 ```
 
+## Memory
+
+`eridian.memory` is a small, personal-only store of short notes the persona keeps across sessions: wins, failures, running jokes, facts and moods. It stores no transcripts.
+
+```sh
+.venv/bin/python -P -m eridian.memory add --kind win "shipped the work clause"
+.venv/bin/python -P -m eridian.memory list
+.venv/bin/python -P -m eridian.memory forget 3
+.venv/bin/python -P -m eridian.memory forget --all
+```
+
+Kinds are `win`, `fail`, `joke`, `fact` and `mood`. Each note is one line of at most 200 characters, and the store keeps the newest 60. Notes live in `~/.eridian/memory.jsonl` (or `$ERIDIAN_HOME/memory.jsonl`), in a directory only you can read. Every command refuses to run inside the `--deny-under` directory (default `~/Projects/work`), so work sessions never read or write personal memory. Nothing injects these notes into a session yet.
+
 ## Tests
 
 ```sh

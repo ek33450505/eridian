@@ -4,6 +4,11 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-11 — Memory store
+
+**Added**
+- `python -P -m eridian.memory add|list|forget`: a personal-only store of short persona notes in `~/.eridian/memory.jsonl` (60 entries, 200 characters each, kinds `win`, `fail`, `joke`, `fact`, `mood`). It writes atomically under a lock, refuses symlinks, hard links and non-regular files, validates every line on read, and refuses to run inside the work directory. Nothing injects the notes into sessions yet.
+
 ### 2026-11-11 — Work-repo persona and journal voice
 
 **Added**
