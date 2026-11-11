@@ -59,7 +59,9 @@ Register it in your Claude Code settings, with absolute paths:
 .venv/bin/python -P -m eridian.memory forget --all
 ```
 
-Kinds are `win`, `fail`, `joke`, `fact` and `mood`. Each note is one line of at most 200 characters, and the store keeps the newest 60. Notes live in `~/.eridian/memory.jsonl` (or `$ERIDIAN_HOME/memory.jsonl`), in a directory only you can read. Every command refuses to run inside the `--deny-under` directory (default `~/Projects/work`), so work sessions never read or write personal memory. Nothing injects these notes into a session yet.
+Kinds are `win`, `fail`, `joke`, `fact` and `mood`. Each note is one line of at most 200 characters, and the store keeps the newest 60. Notes live in `~/.eridian/memory.jsonl` (or `$ERIDIAN_HOME/memory.jsonl`), in a directory only you can read. Every command refuses to run inside the `--deny-under` directory (default `~/Projects/work`), so work sessions never read or write personal memory. Refusals compare paths by spelling and by file identity, so a differently-cased path is refused too.
+
+In a personal session (`cwd` under `--under`, and not inside `--work-under` or `~/Projects/work`), the SessionStart hook adds two things after the persona. The first is an instruction that tells the persona when to save a note and how. It saves rarely, in plain English, inside single quotes, and tells you when it does. The second is the newest notes that fit in 1500 characters, framed as background data rather than instructions. Each note's text is JSON-quoted with `<` and `>` escaped. Work sessions get neither. If the store or the memory module has any problem, the persona still loads, without the notes.
 
 ## Tests
 

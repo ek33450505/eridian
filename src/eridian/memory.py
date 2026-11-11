@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
 
-from eridian.persona import _cwd_under
+from eridian.paths import within
 
 KINDS = ("win", "fail", "joke", "fact", "mood")
 MAX_TEXT = 200
@@ -279,7 +279,7 @@ def main(
     args = _build_parser().parse_args(argv)
     try:
         deny = os.path.abspath(os.path.expanduser(args.deny_under))
-        if _cwd_under(os.getcwd(), deny):
+        if within(os.getcwd(), deny):
             err.write("memory is personal-only; refusing to run in the work directory\n")
             return 2
         return _run(args, out, err)
