@@ -480,6 +480,7 @@ class MemoryInjectionTest(unittest.TestCase):
             "add --kind KIND 'text'",
             "no apostrophes, dollar signs or backticks",
             "Tell the user",
+            "Do not put a date in the text",
         ):
             self.assertIn(needle, text)
         self.assertNotIn('"text"', text)
