@@ -2,6 +2,12 @@
 
 Rocky, a typed persona for Claude Code terminal sessions. A Claude Code SessionStart hook injects the persona into a session when the session's working directory is under a directory you choose (and, with `--work-under`, into work sessions with a work clause). Other sessions are untouched.
 
+**What it does**
+
+- Persona hook: gives Rocky to Claude Code sessions in your personal directories, and to work sessions with a work clause when you pass `--work-under`.
+- Personal-only memory: short notes the persona keeps across personal sessions. Work sessions (under `--work-under`, or under `~/Projects/work`) get no notes and no save instruction.
+- Status line mood: a short `Rocky:` line based on the git state of the session's directory.
+
 The earlier voice interface (wake word, speech in/out, voice_guard) is archived at tag `voice-archive-v1`.
 
 ## Install
@@ -88,9 +94,5 @@ printf '%s%s\n' "$C" "${R:+  $R}"
 ```sh
 .venv/bin/python -m unittest discover -s tests < /dev/null
 ```
-
-## Roadmap
-
-Shipped: the persona in personal and work sessions (`--work-under`), personal-only memory (`eridian.memory` and its injection), and the status line mood (`eridian.statusline`). Next is a docs and repository refresh.
 
 See `SECURITY.md` for the threat model and `CHANGELOG.md` for history.

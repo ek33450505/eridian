@@ -1,7 +1,7 @@
 [project]
 name = "eridian"
-version = "0.1.0"
-description = "Rocky, a typed persona for Claude Code terminal sessions."
+version = "0.2.0"
+description = "Rocky, a typed persona for Claude Code: a SessionStart persona hook, personal-only memory and a status line mood."
 requires-python = ">=3.12"
 license = "Apache-2.0"
 readme = "README.md"
