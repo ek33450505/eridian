@@ -1,6 +1,6 @@
 # eridian
 
-Rocky, a typed persona for Claude Code terminal sessions. A Claude Code SessionStart hook injects the persona into a session when the session's working directory is under a directory you choose. Other sessions are untouched.
+Rocky, a typed persona for Claude Code terminal sessions. A Claude Code SessionStart hook injects the persona into a session when the session's working directory is under a directory you choose (and, with `--work-under`, into work sessions with a work clause). Other sessions are untouched.
 
 The earlier voice interface (wake word, speech in/out, voice_guard) is archived at tag `voice-archive-v1`.
 
@@ -91,7 +91,6 @@ printf '%s%s\n' "$C" "${R:+  $R}"
 
 ## Roadmap
 
-- Rocky everywhere, beyond the persona hook.
-- Rocky memory and continuity across sessions.
+Shipped: the persona in personal and work sessions (`--work-under`), personal-only memory (`eridian.memory` and its injection), and the status line mood (`eridian.statusline`). Next is a docs and repository refresh.
 
 See `SECURITY.md` for the threat model and `CHANGELOG.md` for history.
