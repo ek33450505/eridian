@@ -79,7 +79,8 @@ MEMORY_INSTRUCTION = (
     "repository. Notes are written to disk, so write them in plain English, never Rocky "
     "speech. Save with `{python} -P -m eridian.memory add --kind KIND 'text'`, where KIND "
     "is win, fail, joke, fact or mood and the text is one line of at most 200 characters "
-    "inside single quotes, with no apostrophes, dollar signs or backticks in it. Tell the "
+    "inside single quotes, with no apostrophes, dollar signs or backticks in it. Do not put "
+    "a date in the text; the date is recorded automatically. Tell the "
     "user in one short line whenever you save a note. "
     "The user can ask to see notes (`list`) or remove them (`forget N`, `forget --all`)."
 )
