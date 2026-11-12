@@ -4,6 +4,11 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### 2026-11-11 — Status line mood
+
+**Added**
+- `python -P -m eridian.statusline`: a status line segment that prints a short persona mood from the session directory's git state (worry, work, push, pull, good). It prints nothing outside a repo, on any error or timeout, or when any git clean or process filter driver is configured, so the status line never makes git run a filter program.
+
 ### 2026-11-11 — Memory injection
 
 **Added**
