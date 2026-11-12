@@ -8,7 +8,7 @@ eridian is a personal, single-user tool. Report suspected vulnerabilities privat
 
 ## Threat Model and Controls
 
-The runtime code in this repository is the typed-chat persona SessionStart hook (`src/eridian/persona.py`) and the persona's memory store CLI (`src/eridian/memory.py`). The earlier voice interface, with its own threat model, is archived at tag `voice-archive-v1` and is not covered here.
+The runtime code in this repository is the typed-chat persona SessionStart hook (`src/eridian/persona.py`), the persona's memory store CLI (`src/eridian/memory.py`) and the status line segment (`src/eridian/statusline.py`). The earlier voice interface, with its own threat model, is archived at tag `voice-archive-v1` and is not covered here.
 
 ### Typed-Chat Persona Hook (`persona.py`)
 
@@ -64,3 +64,19 @@ The runtime code in this repository is the typed-chat persona SessionStart hook 
 - The model writes the save command. If it ignores the quoting rule, shell expansion is possible. Claude Code's Bash permission prompt is the backstop, so do not add `eridian.memory add` to an auto-approve allowlist.
 - Matching a differently-cased path needs the work directory to exist and be statable; otherwise only the exact spelling matches.
 - A work session whose `cwd` lies outside both `--work-under` and `~/Projects/work` is not recognised as work.
+
+### Status Line Segment (`statusline.py`)
+
+**Threat:** A status line command runs unsandboxed after every assistant message, in every session and directory. Running `git status` there means a repository's config is read constantly. Git config can make `git status` execute programs: an fsmonitor hook, or a clean or process filter driver applied to a stat-dirty tracked file.
+
+**Mechanism:**
+- It reads the status line JSON from stdin (at most 64 KiB), takes `workspace.current_dir` (else `cwd`), and needs an absolute path to an existing directory.
+- Every git call gets an environment with all inherited `GIT_*` variables removed (then `GIT_OPTIONAL_LOCKS=0` and `GIT_TERMINAL_PROMPT=0` set), stdin from `/dev/null`, its own process group, and a 0.25 s timeout. On timeout the whole process group is killed.
+- First, `git config --get-regexp '^filter\..*\.(clean|process)$'` reads every config scope, including included files. Only "no match" (exit 1) continues. Any configured clean or process filter driver, an error or a timeout means no segment.
+- Then `git -c core.fsmonitor=false --no-optional-locks status --porcelain=v2 --branch -uno --ignore-submodules=all` runs. `--no-optional-locks` means it never writes the index.
+- The output is one of five fixed strings. No repository text, such as a branch name, is ever printed. The command always exits 0 and prints nothing on any problem, including a closed stdout.
+
+**Residual risks:**
+- Both calls read the repository's config, as any git command does. The filter check and the fsmonitor override close the execution paths known for `git status`. A future git release could add another.
+- A repository with a legitimate filter driver, such as Git LFS configured globally, shows no segment at all.
+- In the worst case (a git call times out) it takes about 0.5 s: 0.25 s for the call plus up to 0.25 s to reap the killed process. A timed-out filter check stops before the status call. Typical cost here is about 30 ms.

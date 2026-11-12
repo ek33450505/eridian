@@ -63,6 +63,26 @@ Kinds are `win`, `fail`, `joke`, `fact` and `mood`. Each note is one line of at 
 
 In a personal session (`cwd` under `--under`, and not inside `--work-under` or `~/Projects/work`), the SessionStart hook adds two things after the persona. The first is an instruction that tells the persona when to save a note and how. It saves rarely, in plain English, inside single quotes, and tells you when it does. The second is the newest notes that fit in 1500 characters, framed as background data rather than instructions. Each note's text is JSON-quoted with `<` and `>` escaped. Work sessions get neither. If the store or the memory module has any problem, the persona still loads, without the notes.
 
+## Status line
+
+`eridian.statusline` prints a short mood for the Claude Code status line, based on the git state of the session's directory:
+
+| Repo state | Output |
+|---|---|
+| conflicts, detached HEAD, or both ahead of and behind upstream | `Rocky: worry worry worry` |
+| changed tracked files | `Rocky: work work` |
+| commits not pushed | `Rocky: push question` |
+| behind upstream | `Rocky: pull question` |
+| clean | `Rocky: good good good` |
+
+Untracked files are ignored. It prints nothing outside a git repo, on any error, when git takes longer than 0.25 s, or when any git filter driver (`filter.*.clean` or `filter.*.process`) is configured for the repo. It always exits 0. To add it after an existing status line command, pipe the same input to both and join the outputs:
+
+```sh
+I=$(cat); C=$(printf '%s' "$I" | your-statusline-command); \
+R=$(printf '%s' "$I" | /path/to/eridian/.venv/bin/python -P -m eridian.statusline 2>/dev/null); \
+printf '%s%s\n' "$C" "${R:+  $R}"
+```
+
 ## Tests
 
 ```sh
