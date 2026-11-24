@@ -1,6 +1,6 @@
 {
   "name": "rocky-buddy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Rocky, an animated helper in a side pane (personal sessions only)",
   "author": { "name": "ek33450505" },
   "license": "Apache-2.0",

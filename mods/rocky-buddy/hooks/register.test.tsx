@@ -2900,6 +2900,7 @@ test('the tool is registered once in a personal session, with its schema', async
   expect(spec.isDeferred).toBe(false)
   expect(spec.description).toMatch(/real moment/)
   expect(spec.description).toMatch(/At most once per turn/)
+  expect(spec.description).toMatch(/never on routine steps/)
   expect(spec.description).toMatch(/Never put secrets, paths or command text/)
 })
 
@@ -3237,60 +3238,10 @@ const BASE_SECTIONS = [
   { id: 'env', text: 'cwd: here', scope: 'session' },
 ]
 
-test('a personal session adds one section, last, marked as the mod\'s', async ($, on) => {
+test('the mod adds nothing to the system prompt: its guidance rides the tool description', async ($, on) => {
   moodWorld(on)
   on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
   await $.session.start(SESSION)
-
-  const r = await compose($, [TOOL])
-
-  expect(r.sections).toHaveLength(BASE_SECTIONS.length + 1)
-  expect(r.sections.slice(0, BASE_SECTIONS.length)).toEqual(BASE_SECTIONS)
-  const added = r.sections[r.sections.length - 1]
-  expect(added?.id).toBe('rocky-buddy:mood')
-  expect(added?.scope).toBe('session')
-  expect(added?.text).toMatch(/^\[rocky-buddy mod\]/)
-  expect(added?.text).toMatch(/rocky_mood/)
-  expect(added?.text).toMatch(/real moment/)
-  expect(added?.text).toMatch(/At most once per turn/)
-  expect(added?.text).toMatch(/never contain secrets, file paths or command text/)
-  expect((added?.text ?? '').split('\n').length).toBeLessThanOrEqual(5)
-})
-
-for (const [what, cwd] of [['a work session', `${W}/crosscheck`], ['a session elsewhere', `${HOME}/Documents`]] as [string, string][]) {
-  test(`${what} gets exactly the prompt \`next\` composed`, async ($, on) => {
-    moodWorld(on)
-    on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
-    cwdNow = cwd
-    await $.session.start({ ...SESSION, cwd })
-
-    const r = await compose($, [TOOL])
-
-    expect(r).toEqual({ sections: BASE_SECTIONS })
-  })
-}
-
-test('no section where the tool is not offered', async ($, on) => {
-  moodWorld(on)
-  on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
-  await $.session.start(SESSION)
-  expect(await compose($, ['Bash', 'Read'])).toEqual({ sections: BASE_SECTIONS })
-})
-
-test('the section is not added twice', async ($, on) => {
-  moodWorld(on)
-  on('prompt.compose', () => ({ sections: [...BASE_SECTIONS, { id: 'rocky-buddy:mood', text: 'mine', scope: 'session' }] }) as never)
-  await $.session.start(SESSION)
-  const r = await compose($, [TOOL])
-  expect(r.sections.filter(s => s.id === 'rocky-buddy:mood')).toHaveLength(1)
-})
-
-test('the section follows the guard live: a work directory takes it away', async ($, on) => {
-  moodWorld(on)
-  on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
-  await $.session.start(SESSION)
-  expect((await compose($, [TOOL])).sections).toHaveLength(BASE_SECTIONS.length + 1)
-  cwdNow = `${W}/crosscheck`
   expect(await compose($, [TOOL])).toEqual({ sections: BASE_SECTIONS })
 })
 
