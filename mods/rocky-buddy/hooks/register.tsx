@@ -9,8 +9,8 @@ import type {
   UiBlitResult,
 } from 'claude-code'
 
-import type { Fallback, Frame, Mood, RockyMood } from '../types'
-import { ASK, isPersonAsk, outcomeFor } from './outcome'
+import type { Fallback, Frame, Friends, Mood, RockyMood } from '../types'
+import { agentOutcome, agentStatus, ASK, isPersonAsk, outcomeFor } from './outcome'
 import type { Kind } from './outcome'
 
 const PANE = 'rocky'
@@ -79,9 +79,14 @@ const ALT_DENIES = 2 // in a row, before the pane gives up on pictures
 // stored, which outlives a reload.
 const moodAtom = atom(
   { plugin: 'rocky-buddy', key: 'mood' } as const,
-  { mood: 'idle', detail: '', seq: 0, gen: 0, until: 0 } satisfies RockyMood,
-  { shape: 'mood-4' }, // 4: `detail` is the whole bubble line now, not a tool name
+  { mood: 'idle', detail: '', seq: 0, gen: 0, until: 0, friendStarts: [] } satisfies RockyMood,
+  { shape: 'mood-6' }, // 4: `detail` is the whole bubble line; 6: the running friends' start times
 )
+// The subagents running (by agent id), so a completion can find its start and a
+// missing one can time out. See Friends in the types.
+const friendsAtom = atom({ plugin: 'rocky-buddy', key: 'friends' } as const, {} satisfies Friends, {
+  shape: 'friends-1',
+})
 // `now` is the clock as of the last tick: the draw has no clock of its own, and
 // a mood whose `until` it has passed reads as idle.
 // Whether the pane may draw the picture: 'ascii' once the terminal has said it
@@ -203,6 +208,35 @@ const lineFor = (m: RockyMood) => {
   return said !== '' ? said : LINES[m.mood]
 }
 
+// The most friends the bubble counts (a runaway number is not worth the room).
+const MAX_FRIENDS_SHOWN = 99
+// A subagent seen to start is counted for this long: an end that never came must
+// not leave it counted for ever. (A live one running longer drops out too.)
+const FRIEND_TTL_MS = 30 * 60 * 1000
+
+// How many of the stored start times are still within their time at `now`: each
+// entry on its own clock, so a younger one keeps counting when an older expires.
+const friendsAt = (stored: RockyMood, now: number) =>
+  Array.isArray(stored.friendStarts)
+    ? stored.friendStarts.filter(t => typeof t === 'number' && t + FRIEND_TTL_MS > now).length
+    : 0
+
+// What the pane shows for a stored mood at clock `now`: an expired or unknown
+// mood is idle (nothing was written to make it so); and while subagents run the
+// bubble counts them over an idle Rocky, or over a working or thinking one that
+// has no live detail of its own. A line (a tool's narration, a test result, a
+// commit, a question, a failure, a finished agent) shows over the count.
+const shownMood = (stored: RockyMood, now: number): RockyMood => {
+  const base: RockyMood =
+    isMood(stored.mood) && stored.until > now ? stored : { ...stored, mood: 'idle', detail: '' }
+  const n = friendsAt(stored, now)
+  const counting =
+    n > 0 && (base.mood === 'idle' || ((base.mood === 'working' || base.mood === 'thinking') && base.detail === ''))
+  return counting
+    ? { ...base, mood: 'working', detail: `friends friends: ${Math.min(n, MAX_FRIENDS_SHOWN)} working` }
+    : base
+}
+
 const bubble = (text: string, columns: number, center: number): string[] => {
   const inner = Math.max(0, Math.min(text.length, columns - 4))
   const said = clip(text, inner).padEnd(inner)
@@ -275,7 +309,12 @@ const apply = async (
     const next = change(m, now)
     if (!next) return m
     const { ttl, ...mood } = next
-    return { ...mood, seq: m.seq + 1, until: now + (ttl ?? TTL_MS[next.mood]) }
+    return {
+      ...mood,
+      seq: m.seq + 1,
+      until: now + (ttl ?? TTL_MS[next.mood]),
+      friendStarts: m.friendStarts,
+    }
   })
 }
 
@@ -344,7 +383,7 @@ const tick = async ($: Ticking, st: Ticker) => {
     // The mood is read each tick (a state read at 12 Hz): a write to it must
     // show within a frame. Expiry is judged on the estimated clock.
     const m = await read($, moodAtom)
-    const mood: unknown = m.until > now ? m.mood : 'idle'
+    const mood: unknown = shownMood(m, now).mood
     const file = framePath($.plugin.root, mood, pictureFrame(st.n, st.k))
     const blit = await $.ui.blit({ requestId: PANE, key: IMAGE_KEY, source: { file, format: 'png' } })
     if (st.dead) return
@@ -780,6 +819,133 @@ const standDown = async ($: Ticking, from?: Ticker) => {
   await $.ui.close({ id: PANE }).catch(quiet)
 }
 
+// ---- friends: the subagents -------------------------------------------------
+// A subagent's spawn is a +1 and its own `turn.complete` (carrying its agent id,
+// for foreground and background agents alike) a -1, with its report to read a
+// status token from. Teammates (idle between turns) are not counted. The running
+// set lives in state, so it survives a reload; each entry counts for FRIEND_TTL_MS
+// from its start, so a completion that never came cannot leave a count for ever.
+const MAX_FRIENDS_KEPT = 200
+const TOMBSTONE_MS = 60 * 1000
+
+// The name an agent is shown by: the part before `__` (a CAST name like
+// `code-reviewer__rocky-narrate`), only if it is plain (letters, digits, `_`,
+// `:`, `-`), not sensitive-looking, and cut to 24 characters; else `friend`.
+const friendType = (raw: unknown): string => {
+  if (typeof raw !== 'string') return 'friend'
+  const part = raw.split('__')[0] ?? ''
+  if (!/^[A-Za-z0-9_:-]+$/.test(part) || sensitive(part)) return 'friend'
+  const shown = clean(part.slice(0, MAX_SHOWN))
+  return shown === '' ? 'friend' : shown
+}
+
+const pruneFriends = (reg: unknown, now: number): Friends => {
+  if (typeof reg !== 'object' || reg === null) return {}
+  const live = Object.entries(reg as Record<string, unknown>)
+    .filter((entry): entry is [string, { at: number; type: string; gone?: true }] => {
+      const f = entry[1] as { at?: unknown; type?: unknown; gone?: unknown } | null
+      if (typeof f !== 'object' || f === null || typeof f.at !== 'number' || typeof f.type !== 'string') return false
+      return f.at + (f.gone === true ? TOMBSTONE_MS : FRIEND_TTL_MS) > now
+    })
+  // Over the cap, a note of an early end (a tombstone) is the first to go: a live
+  // start is never evicted in favour of one.
+  const newest = (a: [string, { at: number }], b: [string, { at: number }]) => b[1].at - a[1].at
+  const starts = live.filter(([, f]) => f.gone !== true).sort(newest).slice(0, MAX_FRIENDS_KEPT)
+  const notes = live.filter(([, f]) => f.gone === true).sort(newest).slice(0, MAX_FRIENDS_KEPT - starts.length)
+  return Object.fromEntries([...starts, ...notes])
+}
+
+// Changes the running set, and the start times the bubble counts (kept in the
+// mood record). Writes only where Rocky is allowed. Returns the set as it was
+// before `mutate`.
+const syncFriends = async ($: Clocked, mutate: (reg: Friends, now: number) => Friends) => {
+  const now = await $.clock.now()
+  if (!(await allowed($))) return undefined
+  let before: Friends = {}
+  const reg = await update($, friendsAtom, (stored): Friends => {
+    before = pruneFriends(stored, now)
+    return pruneFriends(mutate(before, now), now)
+  })
+  const starts = Object.values(reg).filter(f => f.gone !== true).map(f => f.at)
+  // Asked again right before this write: a `cd` can land between the two.
+  if (!(await allowed($))) return before
+  await update($, moodAtom, (m): RockyMood => ({ ...m, friendStarts: starts }))
+  return before
+}
+
+// One at a time: the count written is always from the latest set.
+let friendsChain: Promise<unknown> = Promise.resolve()
+const inFriendsChain = (work: () => Promise<unknown>) => {
+  friendsChain = friendsChain.then(work).catch(quiet)
+  return friendsChain
+}
+
+// Agents seen to start as teammates: their (idle-between-turns) ends are not ends
+// of a friend, and leave no note. (Remembered for this load only.)
+const teammates = new Set<string>()
+const MAX_TEAMMATES_KEPT = 200
+
+// Where an agent that was given its own directory runs, by the guard's own
+// judgement: 'work' and 'unknown' are not tracked at all. `elsewhere` stays
+// tracked on purpose: worktrees often sit outside ~/Projects/personal (in /tmp,
+// say) and they are not work.
+const placeOf = async ($: Judging, cwd: string) => {
+  try {
+    return judge(cwd, await $.env.get('HOME'), config).why
+  } catch {
+    return 'unknown'
+  }
+}
+
+const friendStarted = async ($: Clocked, agentId: string, type: string, cwd: string | undefined) => {
+  if (cwd !== undefined) {
+    const why = await placeOf($, cwd)
+    if (why === 'work' || why === 'unknown') return
+  }
+  await syncFriends($, (reg, now) => {
+    if (reg[agentId]?.gone === true) {
+      // its end came first: this start is dropped
+      const { [agentId]: late, ...rest } = reg
+      return rest
+    }
+    return { ...reg, [agentId]: { at: now, type } }
+  })
+}
+
+// A mood that is still showing and must not be replaced by a finished agent's: a
+// question, a failure, or an outcome. (Idle, working and expired ones may be.)
+const holdsTheBubble = (m: RockyMood, now: number) =>
+  m.until > now && (m.mood === 'worry' || m.mood === 'happy' || (m.mood === 'thinking' && m.detail !== ''))
+
+// An agent ended: one fewer, and a mood for how its report says it went.
+const friendFinished = async ($: Clocked, agentId: string, reason: unknown, answer: unknown) => {
+  let type: string | undefined
+  const before = await syncFriends($, (reg, now) => {
+    const known = reg[agentId]
+    if (known !== undefined && known.gone !== true) {
+      type = known.type
+      const { [agentId]: gone, ...rest } = reg
+      return rest
+    }
+    // never seen to start (yet): a short-lived note, so a late start is dropped
+    return { ...reg, [agentId]: { at: now, type: 'friend', gone: true } }
+  })
+  if (before === undefined || type === undefined || reason !== 'answer') return
+  const status = agentStatus(answer)
+  if (status === undefined) return
+  const out = agentOutcome(type, status)
+  await apply($, (m, now) =>
+    holdsTheBubble(m, now) ? undefined : { mood: out.mood, detail: out.detail, gen: m.gen, ttl: out.ttl },
+  )
+}
+
+// A new session starts with no friends.
+const resetFriends = async ($: Clocked) => {
+  if (!(await allowed($))) return
+  await update($, friendsAtom, (): Friends => ({}))
+  if (await allowed($)) await update($, moodAtom, (m): RockyMood => ({ ...m, friendStarts: [] }))
+}
+
 export const register: Register = (on, options) => {
   config = options
 
@@ -821,6 +987,7 @@ export const register: Register = (on, options) => {
     // A reload re-runs this: clear whatever mood the last session left.
     try {
       await apply($, m => ({ mood: 'idle', detail: '', gen: m.gen }))
+      await inFriendsChain(() => resetFriends($))
       if (await allowed($)) await update($, fallbackAtom, (): Fallback => 'image')
     } catch {
       // state trouble must not stop the pane opening
@@ -873,14 +1040,24 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    // A subagent's turn is its whole run: it ended. Observed only.
+    if (e.agentId) {
+      const done = await next(e)
+      try {
+        const id = e.agentId
+        if (!teammates.has(id)) inFriendsChain(() => friendFinished($, id, e.reason, e.answer))
+      } catch {
+        // Rocky's count is not worth the turn
+      }
+      return done
+    }
     if (!(await allowed($))) {
       await standDown($).catch(quiet) // idempotent: closes a pane left open
       return next(e)
     }
     // The boundary first, so a call settling during the completion is late.
-    if (!e.agentId) await bumpGen($)
+    await bumpGen($)
     const done = await next(e)
-    if (e.agentId) return done
 
     await apply($, m => ({ mood: 'happy', detail: '', gen: m.gen + 1 }))
 
@@ -943,6 +1120,30 @@ export const register: Register = (on, options) => {
     return ran
   }).catch(($, e, next) => next(e))
 
+  // A subagent started: one more friend. Observed only: what `next` settled to
+  // goes back as it came, and nothing about the spawn is rewritten. (If a hook
+  // beneath throws, this hook fails after `next` was called and its `.catch` is
+  // asked: `next(e)` there replays the settled result and nothing beneath runs
+  // again, as the docs' "Caught" section says, so the spawn happens once.)
+  on('agent.spawn', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      const id = r?.agentId
+      if (typeof id === 'string' && id !== '' && id.length <= 200 && e.isTeammate === true) {
+        if (teammates.size >= MAX_TEAMMATES_KEPT) teammates.clear()
+        teammates.add(id)
+      }
+      if (typeof id === 'string' && id !== '' && id.length <= 200 && e.isTeammate !== true) {
+        const type = friendType(e.subagentType)
+        const cwd = typeof e.cwd === 'string' ? e.cwd : undefined
+        inFriendsChain(() => friendStarted($, id, type, cwd))
+      }
+    } catch {
+      // Rocky's count is not worth the spawn
+    }
+    return r
+  }).catch(($, e, next) => next(e))
+
   // Observes the permission verdict and changes nothing: what `next` settled to
   // goes back as it came (an ask handed up as heard stays the engine's own).
   // A person is being asked: Rocky wonders, for a minute or until the call goes on.
@@ -974,10 +1175,7 @@ export const register: Register = (on, options) => {
     const stored = await read($, moodAtom)
     const frame = await read($, frameAtom)
     const fallback = await read($, fallbackAtom)
-    // An expired mood reads as idle; nothing was written to make it so.
-    // An unknown mood (a corrupt stored value) reads as idle too.
-    const m: RockyMood =
-      isMood(stored.mood) && stored.until > frame.now ? stored : { ...stored, mood: 'idle', detail: '' }
+    const m = shownMood(stored, frame.now)
 
     // Blank rows above center the bubble and the figure in a pane that is taller.
     const spacer = (rows: number) =>

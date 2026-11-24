@@ -78,3 +78,40 @@ export const outcomeFor = (
 // A permission ask that a person answers.
 export const ASK: Outcome = { mood: 'thinking', detail: 'question? you decide.', ttl: 60000 }
 export const isPersonAsk = (decision: unknown, approver: unknown) => decision === 'ask' && approver === 'person'
+
+// ---- a subagent's report ----
+
+export type AgentStatus = 'DONE' | 'DONE_WITH_CONCERNS' | 'BLOCKED' | 'NEEDS_CONTEXT'
+
+// Only the end of a report is looked at, and only for a status token: the line
+// `Status: DONE` (with the markdown forms `**Status:** DONE`) or the JSON member
+// `"status": "DONE"`. Patterns are anchored and bounded; the last match wins.
+const REPORT_TAIL = 4000
+const STATUS_LINE = /(?:^|\n)[ \t]{0,8}\*{0,3}Status\*{0,3}:?\*{0,3}[ \t]{0,8}(DONE_WITH_CONCERNS|DONE|BLOCKED|NEEDS_CONTEXT)\b/g
+const STATUS_JSON = /"status"[ \t]{0,4}:[ \t]{0,4}"(DONE_WITH_CONCERNS|DONE|BLOCKED|NEEDS_CONTEXT)"/g
+
+export const agentStatus = (report: unknown): AgentStatus | undefined => {
+  if (typeof report !== 'string') return undefined
+  const tail = report.slice(-REPORT_TAIL)
+  let best: { at: number; status: AgentStatus } | undefined
+  for (const re of [STATUS_LINE, STATUS_JSON]) {
+    re.lastIndex = 0
+    for (let m = re.exec(tail); m !== null; m = re.exec(tail)) {
+      if (m[1] !== undefined && (best === undefined || m.index >= best.at)) best = { at: m.index, status: m[1] as AgentStatus }
+    }
+  }
+  return best?.status
+}
+
+// The moods a finished agent earns: the line is fixed words and the agent's
+// (already clean) type.
+export const agentOutcome = (type: string, status: AgentStatus): Outcome => {
+  switch (status) {
+    case 'DONE':
+      return { mood: 'happy', detail: `good good: ${type} done`, ttl: 4000 }
+    case 'DONE_WITH_CONCERNS':
+      return { mood: 'worry', detail: `hmm hmm: ${type} concerns`, ttl: 10000 }
+    default:
+      return { mood: 'worry', detail: `worry worry: ${type} blocked` }
+  }
+}
