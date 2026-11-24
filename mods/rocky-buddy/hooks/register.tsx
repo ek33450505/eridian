@@ -78,7 +78,7 @@ const ALT_DENIES = 2 // in a row, before the pane gives up on pictures
 const moodAtom = atom(
   { plugin: 'rocky-buddy', key: 'mood' } as const,
   { mood: 'idle', detail: '', seq: 0, gen: 0, until: 0 } satisfies RockyMood,
-  { shape: 'mood-3' },
+  { shape: 'mood-4' }, // 4: `detail` is the whole bubble line now, not a tool name
 )
 // `now` is the clock as of the last tick: the draw has no clock of its own, and
 // a mood whose `until` it has passed reads as idle.
@@ -193,8 +193,12 @@ const LINES: Record<Mood, string> = {
 const clip = (text: string, width: number) =>
   text.length <= width ? text : width > 2 ? `${text.slice(0, width - 2)}..` : text.slice(0, Math.max(0, width))
 
-const lineFor = (m: RockyMood) =>
-  m.mood === 'working' && m.detail ? `${LINES.working}: ${m.detail}` : LINES[m.mood]
+// While working, the line is what the tool call narrated (cleaned again here:
+// a stored value is not trusted).
+const lineFor = (m: RockyMood) => {
+  const said = m.mood === 'working' && typeof m.detail === 'string' ? clean(m.detail, MAX_LINE) : ''
+  return said !== '' ? said : LINES[m.mood]
+}
 
 const bubble = (text: string, columns: number, center: number): string[] => {
   const inner = Math.max(0, Math.min(text.length, columns - 4))
@@ -409,6 +413,206 @@ const ensureTicker = async ($: Ticking, restart = false, period = FAST_MS) => {
   }
 }
 
+// ---- what the bubble says about the work ------------------------------------
+// The bubble names what Rocky sees, in his doubled-verb way, from the tool and
+// its input. Only these may ever be shown: the kind of tool, a file's BASENAME
+// (never a directory, and not at all if the name looks sensitive or the file is
+// in the work folder), the first word of a simple Bash command (never its
+// arguments), a git subcommand, a subagent type, an MCP server's name. Nothing
+// is worked out by parsing shell syntax: a Bash line is built from allow-listed
+// shapes only, so anything unusual says `run run` and can leak nothing.
+//
+// Every shown token is cleaned with an ALLOW-list (below) and capped.
+const MAX_SHOWN = 24 // one shown token
+const MAX_LINE = 60 // a whole bubble line (a verb pair and a token)
+
+// Letters, numbers, punctuation, symbols and the plain space are all that is
+// ever drawn: control, format (zero-width, bidi, soft hyphen, word joiners,
+// interlinear annotation, tag characters), variation selectors and the other
+// invisible characters are dropped. Escape sequences go first, whole.
+const ALLOWED = /^[\p{L}\p{N}\p{P}\p{S} ]$/u
+
+const clean = (text: string, max = MAX_SHOWN): string => {
+  const kept = Array.from(
+    text
+      .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, '') // OSC sequences
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '') // CSI sequences
+      .replace(/[\u0080-\u009f]/g, '') // C1 controls, including their introducers
+      .normalize('NFC')
+      .replace(/[\t\n\r\u000b\u000c]|\p{Z}/gu, ' '),
+  )
+    .filter(ch => ALLOWED.test(ch))
+    .join('')
+    .replace(/ +/g, ' ')
+    .trim()
+  const chars = Array.from(kept)
+  return chars.length > max ? `${chars.slice(0, max - 1).join('')}\u2026` : kept
+}
+
+// File names that may carry or point at a secret are never named.
+const SENSITIVE_NAME: RegExp[] = [
+  /^\.env/,
+  /\.env(\.|$)/, // prod.env
+  /\.(pem|key|p12|pfx|kdbx|keystore|jks|asc|gpg|tfvars|tfstate|p8|ppk|age)(\.|~|$)/, // also server.key.bak, id.pem~
+  /^id_/,
+  /credential|secret|token|passw/,
+  /service[-_]?account|serviceaccountkey/,
+  /api[-_]?key/,
+  /^\.(npmrc|netrc|pgpass|pypirc)$/,
+  /vault[-_]?pass/,
+  /kubeconfig/,
+  /^auth\.json/,
+  /\.envrc/,
+  /^authorized_keys$/,
+  /^known_hosts$/,
+  /[a-z0-9_-]{24,}/, // a token-shaped run
+  /(^|[^a-z0-9])(ghp_|gho_|ghu_|ghs_|github_pat_|sk-|xox|akia)/, // known token prefixes
+]
+const sensitive = (name: string) => {
+  const lower = name.toLowerCase()
+  return SENSITIVE_NAME.some(re => re.test(lower))
+}
+
+// The file's whole name, cleaned but not shortened: it is judged before it is
+// cut for the bubble. A path ending in a slash names a directory: no name.
+const baseName = (path: string): string | undefined => {
+  if (/[\\/]$/.test(path)) return undefined
+  const last = path.split(/[\\/]/).filter(part => part !== '').pop()
+  const name = last === undefined ? '' : clean(last, Number.POSITIVE_INFINITY)
+  return name === '' ? undefined : name
+}
+
+// Where a path lands, for the work check only: lenient (no hygiene rejection,
+// so an odd name is still compared), NFC and case-folded like the guard.
+const looseSegments = (path: string): string[] => {
+  const out: string[] = []
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') out.pop()
+    else out.push(part.normalize('NFC').toLowerCase())
+  }
+  return out
+}
+
+// True when the file is inside the work folder, or when that cannot be told.
+const inWork = (path: string, v: Verdict): boolean => {
+  if (!v.workSegs) return true
+  // A path that starts with ~ or holds a $ cannot be placed (the file system
+  // would expand it): treated as work.
+  if (path.startsWith('~') || path.includes('$')) return true
+  const full = path.startsWith('/') ? path : v.cwd === undefined ? undefined : `${v.cwd}/${path}`
+  return full === undefined || within(looseSegments(full), v.workSegs)
+}
+
+// Bash, by allow-list. The command word is the command's first word only if it
+// is plain (letters, digits, `.`, `_`, `/`, `-`) and ends at a space or the end
+// of the command: so `X=$(...) foo`, `TOKEN=abc\ def cmd`, quotes, `$`, and
+// every other shell construct give no word at all. A wrapper (`sudo`, `env`...)
+// is not looked through. The words after it are used only to recognise a few
+// shapes, and only while each is plain; nothing from them is ever shown except
+// a git subcommand.
+const COMMAND_WORD = /^[A-Za-z0-9._/-]+(?=\s|$)/
+const PLAIN_WORD = /^[A-Za-z0-9._:-]+$/
+const WRAPPERS = ['sudo', 'env', 'command', 'exec', 'time', 'nice', 'nohup', 'xargs', 'doas']
+const TEST_SCRIPT = /^test(:[A-Za-z0-9._-]+)?$/
+
+// The only git subcommands ever shown: anything else (a word typed in that slot
+// could be anything, a token included) is `git git`.
+const GIT_SUBCOMMANDS = [
+  'add', 'am', 'bisect', 'blame', 'branch', 'checkout', 'cherry-pick', 'clean', 'clone', 'commit', 'config',
+  'diff', 'fetch', 'grep', 'init', 'log', 'merge', 'mv', 'pull', 'push', 'rebase', 'reflog', 'remote',
+  'reset', 'restore', 'revert', 'rm', 'show', 'stash', 'status', 'switch', 'tag', 'worktree',
+]
+
+const bashLine = (command: string, v: Verdict): string => {
+  const text = command.replace(/^\s+/, '')
+  const found = COMMAND_WORD.exec(text)
+  if (!found) return 'run run'
+  // A script given by path is a file like any other: one in the work folder (or
+  // one that cannot be placed) is not named.
+  if (found[0].includes('/') && inWork(found[0], v)) return 'run run'
+  // Judged on the whole word, before it is shortened for the bubble.
+  const raw = found[0].split('/').filter(part => part !== '').pop() ?? ''
+  const name = clean(raw)
+  const lower = name.toLowerCase()
+  if (name === '' || WRAPPERS.includes(lower) || sensitive(raw)) return 'run run'
+
+  // The plain words after the command word, up to the first one that is not.
+  const after: string[] = []
+  let unclear = false // a word that is not plain stopped the list
+  for (const word of text.slice(found[0].length).split(/\s+/).filter(w => w !== '').slice(0, 8)) {
+    if (!PLAIN_WORD.test(word)) {
+      unclear = true
+      break
+    }
+    after.push(word.toLowerCase())
+  }
+  const isTest =
+    ['pytest', 'bats'].includes(lower) ||
+    (['npm', 'pnpm', 'yarn'].includes(lower) &&
+      (TEST_SCRIPT.test(after[0] ?? '') || (after[0] === 'run' && TEST_SCRIPT.test(after[1] ?? '')))) ||
+    ((lower === 'go' || lower === 'cargo') && after[0] === 'test') ||
+    (lower === 'claude' && after[0] === 'plugin' && after[1] === 'test') ||
+    (lower === 'uv' && after[0] === 'run' && after.includes('pytest'))
+  if (isTest) return `test test: ${name}`
+  if (lower === 'git') {
+    const sub = after[0]
+    if (sub === undefined) return unclear ? `run run: ${name}` : 'git git'
+    if (sub.startsWith('-')) return 'git git'
+    return GIT_SUBCOMMANDS.includes(sub) ? `git git: ${sub}` : 'git git'
+  }
+  return `run run: ${name}`
+}
+
+const fallbackLine = (tool: string) => {
+  const name = clean(tool)
+  return name === '' ? 'work work' : `work work: ${name}`
+}
+
+// The bubble line for a tool call. Never throws: an input that is not what the
+// tool's type says falls back to the tool's name.
+const narrate = (tool: string, input: Readonly<Record<string, unknown>>, v: Verdict): string => {
+  try {
+    const pathLine = (verb: string, path: unknown) => {
+      if (typeof path !== 'string' || inWork(path, v)) return `${verb} ${verb}`
+      const name = baseName(path)
+      return name === undefined || sensitive(name) ? `${verb} ${verb}` : `${verb} ${verb}: ${clean(name)}`
+    }
+    switch (tool) {
+      case 'Edit':
+      case 'Write':
+        return pathLine('edit', input.file_path)
+      case 'NotebookEdit':
+        return pathLine('edit', input.notebook_path)
+      case 'Read':
+        return pathLine('read', input.file_path)
+      case 'Grep':
+      case 'Glob':
+        return 'search search' // never the pattern: it can be anything the model is looking for
+      case 'Bash':
+        return typeof input.command === 'string' ? bashLine(input.command, v) : fallbackLine(tool)
+      case 'WebFetch':
+      case 'WebSearch':
+        return 'look look: web'
+      case 'Agent':
+      case 'Task': {
+        const kind = typeof input.subagent_type === 'string' ? clean(input.subagent_type) : ''
+        return kind === '' ? 'friend friend' : `friend friend: ${kind}`
+      }
+      default: {
+        if (tool.startsWith('mcp__')) {
+          const parts = tool.split('__')
+          const server = parts.length >= 3 ? clean(parts[1] ?? '') : ''
+          if (server !== '') return `tool tool: ${server}`
+        }
+        return fallbackLine(tool)
+      }
+    }
+  } catch {
+    return fallbackLine(tool)
+  }
+}
+
 // ---- the work guard -------------------------------------------------------
 // Rocky is for personal sessions. `allowed($)` is the one question, asked fresh
 // (the session's directory and $HOME are read each time, nothing is cached)
@@ -431,7 +635,12 @@ const ensureTicker = async ($: Ticking, restart = false, period = FAST_MS) => {
 const DEFAULT_PERSONAL = '~/Projects/personal'
 const DEFAULT_WORK = '~/Projects/work'
 
-type Verdict = { ok: boolean; why: 'ok' | 'work' | 'elsewhere' | 'unknown' }
+type Verdict = {
+  ok: boolean
+  why: 'ok' | 'work' | 'elsewhere' | 'unknown'
+  workSegs?: string[] // the work folder, for hiding work paths in the bubble
+  cwd?: string
+}
 
 let config: PluginOptions = {} // the plugin's options, as register received them
 // The answer of `$.fs.exists` for an explicitly named work folder, taken once per
@@ -496,9 +705,10 @@ const judge = (cwd: string, home: string | undefined, options: PluginOptions): J
   const work = optionRoot(options.workUnder, DEFAULT_WORK, home)
   if (!personal || !work) return { ok: false, why: 'unknown' }
   const checkWork = work.explicit ? work.path : undefined
-  if (within(dir, work.segs)) return { ok: false, why: 'work', checkWork } // work wins
-  if (!within(dir, personal.segs)) return { ok: false, why: 'elsewhere', checkWork }
-  return { ok: true, why: 'ok', checkWork }
+  const extra = { checkWork, workSegs: work.segs, cwd }
+  if (within(dir, work.segs)) return { ok: false, why: 'work', ...extra } // work wins
+  if (!within(dir, personal.segs)) return { ok: false, why: 'elsewhere', ...extra }
+  return { ok: true, why: 'ok', ...extra }
 }
 
 const verdict = async ($: Judging): Promise<Verdict> => {
@@ -657,13 +867,16 @@ export const register: Register = (on, options) => {
   // the call, and the result goes back exactly as `next` produced it.
   on('tool.call', async ($, e, next) => {
     let gen: number | undefined
+    let line = fallbackLine(e.tool) // what the bubble says; narrated from the input in the chain below
     const pre = (async () => {
-      if (!(await allowed($))) {
+      const v = await verdict($)
+      if (!v.ok) {
         // Sent away: stop any ticker and close the pane (harmless if nothing
         // is open), so a pane left open in a work directory does not stay.
         await standDown($)
         return
       }
+      line = narrate(e.tool, e, v)
       // Back from being sent away: the pane we closed opens again.
       if (parked) {
         parked = false
@@ -676,7 +889,7 @@ export const register: Register = (on, options) => {
         // a worry that has run out no longer holds
         return m.mood === 'worry' && m.until > now
           ? undefined
-          : { mood: 'working', detail: e.tool, gen: m.gen }
+          : { mood: 'working', detail: line, gen: m.gen }
       })
     })().catch(quiet)
 
@@ -688,8 +901,8 @@ export const register: Register = (on, options) => {
         if (started === undefined) return
         await apply($, m => {
           if (m.gen !== started) return undefined // a turn boundary passed: late
-          if (failed) return { mood: 'worry', detail: e.tool, gen: m.gen }
-          return m.mood === 'worry' ? { mood: 'working', detail: e.tool, gen: m.gen } : undefined
+          if (failed) return { mood: 'worry', detail: line, gen: m.gen }
+          return m.mood === 'worry' ? { mood: 'working', detail: line, gen: m.gen } : undefined
         })
       })
       .catch(quiet)

@@ -130,7 +130,7 @@ test('a working call names its tool', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: 'ls' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /work work: Bash/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /run run: ls/ })).toBeTruthy()
   await ui.unmount()
 })
 
@@ -207,7 +207,7 @@ test('a subagent tool call still sets working', async ($, on) => {
   await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /work work: Bash/ })).toBeTruthy()
+  expect(await ui.find({ type: 'Text', text: /run run: ls/ })).toBeTruthy()
   await ui.unmount()
 })
 
@@ -226,7 +226,7 @@ test('a session.start mid-mood resets to idle at once', async ($, on) => {
   await $.session.start(SESSION)
   await $.turn.start({ text: 'go', turnId: 't1' })
   await $.tool.call({ tool: 'Bash', command: 'ls' })
-  expect(await moodMounted($, /work work: Bash/)).toBe(true)
+  expect(await moodMounted($, /run run: ls/)).toBe(true)
 
   await $.session.start(SESSION)
 
@@ -293,7 +293,7 @@ test('a subagent turn.complete moves nothing, and its tool calls still do', asyn
   expect(await moodMounted($, /worry worry worry/)).toBe(true)
 })
 
-test('a subagent turn.complete followed by a tool call shows work work: Bash', async ($, on) => {
+test('a subagent turn.complete followed by a tool call shows run run: ls', async ($, on) => {
   engine(on)
   await $.session.start(SESSION)
   await $.turn.start({ text: 'go', turnId: 't1' })
@@ -302,7 +302,7 @@ test('a subagent turn.complete followed by a tool call shows work work: Bash', a
   expect(await moodMounted($, /question\?/)).toBe(true)
   await $.tool.call({ tool: 'Bash', command: 'ls' })
 
-  expect(await moodMounted($, /work work: Bash/)).toBe(true)
+  expect(await moodMounted($, /run run: ls/)).toBe(true)
 })
 
 test('thinking and working decay to idle, and each write pushes the decay out', async ($, on) => {
@@ -317,11 +317,11 @@ test('thinking and working decay to idle, and each write pushes the decay out', 
 
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   await clock.advance(15000)
-  expect(await moodMounted($, /work work: Bash/)).toBe(true)
+  expect(await moodMounted($, /run run: ls/)).toBe(true)
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   // 25s after the first write: its decay (20s) has passed, the second's has not
   await clock.advance(10000)
-  expect(await moodMounted($, /work work: Bash/)).toBe(true)
+  expect(await moodMounted($, /run run: ls/)).toBe(true)
   await clock.advance(11000)
   expect(await moodMounted($, /\|\s+\.\.\.\s+\|/)).toBe(true)
 })
@@ -480,7 +480,7 @@ test('every mood and frame draws the same height, exactly 20 columns wide', asyn
   await $.turn.start({ text: 'go', turnId: 't1' })
   await sample('thinking', /question\?/)
   await $.tool.call({ tool: 'Bash', command: 'ls' })
-  await sample('working', /work work: Bash/)
+  await sample('working', /run run: ls/)
   await $.tool.call({ tool: 'Bash', command: 'bad' })
   // 20 columns clip the bubble's text: the line is read by its start
   await sample('worry', /worry worry/)
@@ -596,7 +596,7 @@ test('a worry that has run out does not block working', async ($, on) => {
   on('tool.call', async () => {
     calls++
     if (calls === 1) return { result: {}, isError: true } as never
-    midCall = await moodMounted($, /work work: Bash/)
+    midCall = await moodMounted($, /run run: ls/)
     return { result: {} } as never
   })
   await $.session.start(SESSION)
@@ -673,7 +673,7 @@ test('a clock that fails on the tool path leaves the tool result unchanged', asy
   expect(failNext).toBe(false) // the failing read was reached
   expect(ran).toEqual(answer)
   // the tool path's own mood writes went through
-  expect(await moodMounted($, /work work: Bash/)).toBe(true)
+  expect(await moodMounted($, /run run: ls/)).toBe(true)
 })
 
 // ---- the picture (terminal surface) ----
@@ -702,9 +702,9 @@ test("the terminal draws the picture from a file, keyed rocky, with the mood's f
   const working = await mountTerminal($)
   const next = await working.find({ type: 'Image', key: 'rocky' })
   expect((next?.props.source as { file: string }).file.endsWith('assets/frames/working-00.png')).toBe(true)
-  expect(next?.props.alt).toBe('work work: Bash')
+  expect(next?.props.alt).toBe('run run: ls')
   // the bubble is still text above it
-  expect(await working.find({ type: 'Text', text: /work work: Bash/ })).toBeTruthy()
+  expect(await working.find({ type: 'Text', text: /run run: ls/ })).toBeTruthy()
   await working.unmount()
 })
 
@@ -1676,4 +1676,204 @@ test('a tool call and a turn start racing to reopen a parked pane open it exactl
   await turn
   await settle()
   expect(opened).toBe(2) // one reopen, not two
+})
+
+// ---- what the bubble says about the work ----
+
+const bubbleSays = async ($: Engine) => {
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 60 }, surface: 'desktop' })
+  const rows = (await ui.findAll({ type: 'Text' })).map(r => r.text as string)
+  await ui.unmount()
+  return (rows[1] ?? '').replace(/^\s*\|\s*/, '').replace(/\s*\|\s*$/, '')
+}
+
+const narrated = async ($: Engine, on: On, tool: string, input: Record<string, unknown>) => {
+  engine(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool, ...input } as never)
+  await settle()
+  return bubbleSays($)
+}
+
+const SRC = `${P}/eridian/src`
+const SPACED = 'ab.cd.'.repeat(10) // 60 characters, no long run, so it is shown (capped)
+
+// Characters that draw as nothing or reorder text: each must vanish from a name.
+const INVISIBLE: [string, number][] = [
+  ['an Arabic letter mark', 0x061c], ['a soft hyphen', 0x00ad], ['a word joiner', 0x2060],
+  ['a function application mark', 0x2061], ['an invisible times', 0x2062], ['an invisible separator', 0x2063],
+  ['an invisible plus', 0x2064], ['a Mongolian vowel separator', 0x180e], ['a combining grapheme joiner', 0x034f],
+  ['variation selector 16', 0xfe0f], ['variation selector 1', 0xfe00], ['an interlinear annotation anchor', 0xfff9],
+  ['an interlinear annotation separator', 0xfffa], ['an interlinear annotation terminator', 0xfffb],
+  ['a tag character', 0xe0041], ['the cancel tag', 0xe007f], ['a zero-width space', 0x200b],
+  ['a zero-width joiner', 0x200d], ['a left-to-right mark', 0x200e], ['a right-to-left override', 0x202e],
+  ['a bidi isolate', 0x2066], ['a byte order mark', 0xfeff],
+]
+
+const CASES: [string, string, Record<string, unknown>, string][] = [
+  ['Edit', 'Edit', { file_path: `${SRC}/app.ts`, old_string: 'a', new_string: 'b' }, 'edit edit: app.ts'],
+  ['Write', 'Write', { file_path: `${SRC}/notes.md`, content: 'x' }, 'edit edit: notes.md'],
+  ['NotebookEdit', 'NotebookEdit', { notebook_path: `${SRC}/n.ipynb`, new_source: 'x' }, 'edit edit: n.ipynb'],
+  ['Read', 'Read', { file_path: `${SRC}/README.md` }, 'read read: README.md'],
+  ['a name with sk- inside a word is fine', 'Read', { file_path: `${SRC}/task-list.txt` }, 'read read: task-list.txt'],
+  ['Grep never shows its pattern', 'Grep', { pattern: 'TODO' }, 'search search'],
+  ['Glob never shows its pattern', 'Glob', { pattern: '**/*.ts' }, 'search search'],
+  ['Glob of the work folder', 'Glob', { pattern: '~/Projects/work/*' }, 'search search'],
+  ['Grep with an escape in its pattern', 'Grep', { pattern: 'a\u001b[31mb' }, 'search search'],
+  ['Bash pytest', 'Bash', { command: 'pytest -q tests/' }, 'test test: pytest'],
+  ['Bash bats', 'Bash', { command: 'bats tests/' }, 'test test: bats'],
+  ['Bash npm test', 'Bash', { command: 'npm test' }, 'test test: npm'],
+  ['Bash pnpm run test', 'Bash', { command: 'pnpm run test' }, 'test test: pnpm'],
+  ['Bash npm run test:unit', 'Bash', { command: 'npm run test:unit' }, 'test test: npm'],
+  ['Bash yarn test', 'Bash', { command: 'yarn test --watch' }, 'test test: yarn'],
+  ['Bash go test', 'Bash', { command: 'go test ./...' }, 'test test: go'],
+  ['Bash cargo test', 'Bash', { command: 'cargo test' }, 'test test: cargo'],
+  ['Bash claude plugin test', 'Bash', { command: 'claude plugin test mods/x' }, 'test test: claude'],
+  ['Bash uv run pytest', 'Bash', { command: 'uv run pytest -q' }, 'test test: uv'],
+  ['Bash uv run --with pytest', 'Bash', { command: 'uv run --with pytest pytest -q' }, 'test test: uv'],
+  ['Bash pytest by path', 'Bash', { command: '/usr/local/bin/pytest -x' }, 'test test: pytest'],
+  ['Bash git status', 'Bash', { command: 'git status' }, 'git git: status'],
+  ['Bash git alone', 'Bash', { command: 'git' }, 'git git'],
+  ['Bash git -C x status', 'Bash', { command: 'git -C x status' }, 'git git'],
+  ['Bash git with a flag value', 'Bash', { command: 'git -c http.extraheader=SECRETVALUE fetch origin' }, 'git git'],
+  ['Bash git with a quoted word', 'Bash', { command: 'git "status"' }, 'run run: git'],
+  ['Bash git with a secret-shaped word', 'Bash', { command: 'git ghp_abcdefghijklmnopqrstuvwxyz0123' }, 'git git'],
+  ['Bash ls', 'Bash', { command: 'ls -la /etc' }, 'run run: ls'],
+  ['Bash a command word that is a secret shape', 'Bash', { command: 'sk-abcdefghijklmnopqrstuvwxyz foo' }, 'run run'],
+  ['Bash an assignment before the command', 'Bash', { command: 'TOKEN=abc curl https://example.com/x' }, 'run run'],
+  ['Bash a command substitution in an assignment', 'Bash', { command: 'X=$(printf sk-abc) foo' }, 'run run'],
+  ['Bash a cat in an assignment', 'Bash', { command: 'API_KEY=$(cat ~/.key) curl x' }, 'run run'],
+  ['Bash an escaped space in an assignment', 'Bash', { command: 'TOKEN=abc\\ def cmd' }, 'run run'],
+  ['Bash a dollar-quote assignment', 'Bash', { command: "TOKEN=$'x y' pytest" }, 'run run'],
+  ['Bash a quote run into a word', 'Bash', { command: 'TOKEN="a"b cmd' }, 'run run'],
+  ['Bash a quoted assignment', 'Bash', { command: `TOKEN='a b c' curl x` }, 'run run'],
+  ['Bash an unterminated quote in an assignment', 'Bash', { command: 'TOKEN="abc def curl x' }, 'run run'],
+  ['Bash env wrapper', 'Bash', { command: 'env TOKEN=abc curl x' }, 'run run'],
+  ['Bash env by path', 'Bash', { command: '/usr/bin/env git status' }, 'run run'],
+  ['Bash sudo with a flag value', 'Bash', { command: 'sudo -u bob make all' }, 'run run'],
+  ['Bash sudo -r with a role', 'Bash', { command: 'sudo -r secretrole pytest' }, 'run run'],
+  ['Bash sudo -t with a number', 'Bash', { command: 'sudo -t 30 git status' }, 'run run'],
+  ['Bash time', 'Bash', { command: 'time pytest' }, 'run run'],
+  ['Bash nohup', 'Bash', { command: 'nohup pytest &' }, 'run run'],
+  ['Bash xargs', 'Bash', { command: 'xargs rm' }, 'run run'],
+  ['Bash a subshell', 'Bash', { command: '$(echo hi) there' }, 'run run'],
+  ['Bash an escape first', 'Bash', { command: '\u001b[31mcurl x' }, 'run run'],
+  ['Bash a quoted command word', 'Bash', { command: '"curl" x' }, 'run run'],
+  ['Bash empty', 'Bash', { command: '' }, 'run run'],
+  ['Bash leading whitespace', 'Bash', { command: '   ls' }, 'run run: ls'],
+  ['WebFetch', 'WebFetch', { url: 'https://example.com/secret?token=1', prompt: 'p' }, 'look look: web'],
+  ['WebSearch', 'WebSearch', { query: 'q', mode: 'standard' }, 'look look: web'],
+  ['Agent', 'Agent', { description: 'd', prompt: 'p', subagent_type: 'code-reviewer' }, 'friend friend: code-reviewer'],
+  ['Task', 'Task', { subagent_type: 'planner' }, 'friend friend: planner'],
+  ['Agent without a type', 'Agent', { description: 'd', prompt: 'p' }, 'friend friend'],
+  ['an MCP tool', 'mcp__neon__run_sql', { sql: 'select 1' }, 'tool tool: neon'],
+  ['an MCP server with a hyphen', 'mcp__my-server__x', {}, 'tool tool: my-server'],
+  ['a malformed MCP name', 'mcp__x', {}, 'work work: mcp__x'],
+  ['any other tool', 'Skill', { skill: 's' }, 'work work: Skill'],
+  ['Edit with a number for a path', 'Edit', { file_path: 42 }, 'edit edit'],
+  ['Edit with no input', 'Edit', {}, 'edit edit'],
+  ['Read with an object for a path', 'Read', { file_path: { a: 1 } }, 'read read'],
+  ['Bash with a number for a command', 'Bash', { command: 7 }, 'work work: Bash'],
+  ['Bash with no command', 'Bash', {}, 'work work: Bash'],
+  ['a path under workUnder', 'Edit', { file_path: `${W}/crosscheck/secret.ts` }, 'edit edit'],
+  ['a plain file under workUnder', 'Edit', { file_path: `${W}/crosscheck/app.ts` }, 'edit edit'],
+  ['a path that reaches workUnder through ..', 'Read', { file_path: `${P}/../work/x/secret.ts` }, 'read read'],
+  ['a relative path into workUnder', 'Read', { file_path: '../../work/x/plain.ts' }, 'read read'],
+  ['a relative path in the project', 'Read', { file_path: 'src/app.ts' }, 'read read: app.ts'],
+  ['a path in a work folder with other case', 'Edit', { file_path: `${HOME}/PROJECTS/WORK/x/plain.ts` }, 'edit edit'],
+  ['a path ending in a slash names a directory', 'Read', { file_path: '/home/u/x/projectdir/' }, 'read read'],
+  ['a relative path ending in a slash', 'Read', { file_path: 'src/projectdir/' }, 'read read'],
+  ['a 300-character name ending in secret.json is judged whole', 'Read', { file_path: `${SRC}/${'a.'.repeat(145)}secret.json` }, 'read read'],
+  ['a tilde path', 'Read', { file_path: '~/Projects/work/d.ts' }, 'read read'],
+  ['a tilde path anywhere', 'Read', { file_path: '~/notes/d.ts' }, 'read read'],
+  ['a path with a variable', 'Read', { file_path: '$HOME/x/e.ts' }, 'read read'],
+  ['a path with a variable in the middle', 'Read', { file_path: `${SRC}/$X/e.ts` }, 'read read'],
+  ['a dotenv file', 'Read', { file_path: `${SRC}/.env.production` }, 'read read'],
+  ['an ssh key', 'Read', { file_path: `${SRC}/id_rsa` }, 'read read'],
+  ['a pem file', 'Edit', { file_path: `${SRC}/server.pem` }, 'edit edit'],
+  ['a credentials file', 'Read', { file_path: `${SRC}/credentials.json` }, 'read read'],
+  ['a token-prefixed file', 'Read', { file_path: `${SRC}/ghp_abc123.txt` }, 'read read'],
+  ['a file with secret in its name', 'Read', { file_path: `${SRC}/my-secret-notes.md` }, 'read read'],
+  ['a file with password in its name', 'Read', { file_path: `${SRC}/Passwords.csv` }, 'read read'],
+  ['an npmrc', 'Read', { file_path: `${SRC}/.npmrc` }, 'read read'],
+  ['authorized_keys', 'Read', { file_path: `${SRC}/authorized_keys` }, 'read read'],
+  ['known_hosts', 'Read', { file_path: `${SRC}/known_hosts` }, 'read read'],
+  ['a token-shaped name', 'Read', { file_path: `${SRC}/abcdefghijklmnopqrstuvwxyz.txt` }, 'read read'],
+  ['an sk- token name', 'Read', { file_path: `${SRC}/sk-proj-notes.txt` }, 'read read'],
+  ['an AWS key id name', 'Read', { file_path: `${SRC}/AKIAIOSFODNN7.txt` }, 'read read'],
+  ['a path with an escape sequence in its name', 'Edit', { file_path: `${SRC}/a\u001b[31mb.ts` }, 'edit edit: ab.ts'],
+  ['a path with an OSC sequence in its name', 'Read', { file_path: `${SRC}/a\u001b]0;pwned\u0007b.ts` }, 'read read: ab.ts'],
+  ['a path with a control character in its name', 'Read', { file_path: `${SRC}/a\u0001\u0002b.ts` }, 'read read: ab.ts'],
+  ['a path with a C1 control in its name', 'Read', { file_path: `${SRC}/a\u009bb.ts` }, 'read read: ab.ts'],
+  ['a long basename is capped', 'Read', { file_path: `${SRC}/${SPACED}.ts` }, `read read: ${'ab.cd.'.repeat(10).slice(0, 23)}…`],
+  ['a subagent type with an escape', 'Agent', { description: 'd', prompt: 'p', subagent_type: 'x\u001b[1my' }, 'friend friend: xy'],
+  ['whitespace in a name collapses', 'Read', { file_path: `${SRC}/a  \t b.ts` }, 'read read: a b.ts'],
+  ['a non-breaking space becomes a space', 'Read', { file_path: `${SRC}/a  b.ts` }, 'read read: a b.ts'],
+  ['letters of other scripts are kept', 'Read', { file_path: `${SRC}/über-日本.ts` }, 'read read: über-日本.ts'],
+  ['Bash a 40-character command word is a token shape, judged before it is cut', 'Bash', { command: 'abcdefghijklmnopqrstuvwxyz0123456789ABCD foo' }, 'run run'],
+  ['Bash a 25-character mixed-case command word', 'Bash', { command: 'AbCdEfGhIjKlMnOpQrStUvWxY foo' }, 'run run'],
+  ['Bash git with a token in the subcommand slot', 'Bash', { command: 'git 0123456789abcdefghijklmnopqrstuvwxyz' }, 'git git'],
+  ['Bash git with an unknown word', 'Bash', { command: 'git frobnicate' }, 'git git'],
+  ['Bash git rebase', 'Bash', { command: 'git rebase -i main' }, 'git git: rebase'],
+  ['Bash git cherry-pick', 'Bash', { command: 'git cherry-pick abc' }, 'git git: cherry-pick'],
+  ['Bash git worktree', 'Bash', { command: 'git worktree list' }, 'git git: worktree'],
+  ['Bash git switch', 'Bash', { command: 'git switch main' }, 'git git: switch'],
+  ['Bash a script in the work folder', 'Bash', { command: `${W}/acme/run-release.sh --prod` }, 'run run'],
+  ['Bash a relative script into the work folder', 'Bash', { command: '../../work/acme/run.sh' }, 'run run'],
+  ['Bash a script in the work folder with other case', 'Bash', { command: `${HOME}/PROJECTS/WORK/acme/go.sh` }, 'run run'],
+  ['Bash a script in the project', 'Bash', { command: './run.sh --fast' }, 'run run: run.sh'],
+  ['Bash a script elsewhere in the personal tree', 'Bash', { command: `${P}/other/build.sh` }, 'run run: build.sh'],
+  ['Bash a sensitive script name', 'Bash', { command: './deploy-secret.sh' }, 'run run'],
+  ['Bash a tilde script', 'Bash', { command: '~/Projects/work/x.sh' }, 'run run'],
+  ...[
+    'server.key.bak', 'id.pem~', 'prod.env', 'service-account.json', 'serviceAccountKey.json', 'app.tfvars',
+    'terraform.tfstate', 'kubeconfig', 'kubeconfig.yaml', 'kubeconfig-prod', 'kubeconfig.md', 'auth.json', 'auth.json.bak', 'vault_pass.txt', 'ansible-vault-pass', 'foo.envrc', '.envrc', 'key.p8', 'my_api_key.txt', 'prod.vault_pass', 'deploy.ppk',
+    'backup.age', 'cert.keystore.old', 'API-KEY.md', '.env', 'x.env.local', 'my.jks', 'a.gpg',
+  ].map((name): [string, string, Record<string, unknown>, string] => [
+    `the file ${name} is masked`, 'Read', { file_path: `${SRC}/${name}` }, 'read read',
+  ]),
+  ...['keyboard.ts', 'monkey.ts', 'authors.json', 'environment.ts', 'ages.md', 'p8notes.md', 'envelope.ts', 'authentication.ts'].map(
+    (name): [string, string, Record<string, unknown>, string] => [
+      `the ordinary file ${name} is shown`, 'Read', { file_path: `${SRC}/${name}` }, `read read: ${name}`,
+    ],
+  ),
+  ...INVISIBLE.map(([what, code]): [string, string, Record<string, unknown>, string] => [
+    `${what} (U+${code.toString(16).toUpperCase()}) is dropped from a name`,
+    'Read',
+    { file_path: `${SRC}/q${String.fromCodePoint(code)}r.ts` },
+    'read read: qr.ts',
+  ]),
+]
+
+for (const [name, tool, input, expected] of CASES) {
+  test(`the bubble narrates ${name}`, async ($, on) => {
+    const said = await narrated($, on, tool, input)
+    expect(said).toBe(expected)
+    // never a directory, an argument, a secret or a control character
+    expect(said).not.toMatch(/secret|abc|SECRET|token|pwned|example\.com|\/etc|Projects/i)
+    expect(said).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/)
+    expect(Array.from(said.replace(/^[a-z]+ [a-z]+: ?/, '')).length).toBeLessThanOrEqual(24)
+  })
+}
+
+test('a custom work folder hides its files too', { options: { personalUnder: '~/Projects', workUnder: '~/Projects/client' } }, async ($, on) => {
+  const said = await narrated($, on, 'Edit', { file_path: `${HOME}/Projects/client/app/x.ts` })
+  expect(said).toBe('edit edit')
+})
+
+test('the bubble line is cleaned again when drawn, whatever was stored', async ($, on) => {
+  // a stored detail with an escape (a corrupt value) is not drawn raw
+  on('state.get', (_, e) => {
+    const key = (e as { key?: unknown }).key
+    if (key === 'mood') {
+      return { value: { version: 1, value: { shape: 'mood-4', value: { mood: 'working', detail: 'run run: a\u001b[31mb', seq: 1, gen: 0, until: 1e12 } } } } as never
+    }
+    if (key === 'frame') return { value: { version: 1, value: { shape: 'frame-2', value: { n: 0, now: 0 } } } } as never
+    return { value: { version: 1, value: { shape: 'fallback-1', value: 'image' } } } as never
+  })
+  engine(on)
+  await $.session.start(SESSION)
+
+  expect(await bubbleSays($)).toBe('run run: ab')
 })
