@@ -964,6 +964,18 @@ const ROCKY_TOOL = 'mcp__rocky-buddy__rocky_mood' // as the model names it
 const SAID_COOLDOWN_MS = 5000
 let lastSaidAt = Number.NEGATIVE_INFINITY
 
+// The context fill (a whole percent) the last measure showed, so only an upward
+// crossing of 80 or 90 speaks. Undefined until a measure has been seen.
+const CONTEXT_LINE = 'brain full full: '
+const CONTEXT_WORRY_MS = 20000
+const COMPACT_HAPPY_MS = 6000
+let lastPercent: number | undefined
+
+// A mood that must not be replaced by a context or compaction line: a face the
+// assistant set, a question, an outcome. Rocky's own context worry may be.
+const holdsAgainstSession = (m: RockyMood, now: number) =>
+  holdsTheBubble(m, now) && !(m.says !== true && m.mood === 'worry' && m.detail.startsWith(CONTEXT_LINE))
+
 const SAID_TTL_MS: Record<Mood, number> = { happy: 6000, worry: 30000, thinking: 60000, working: 20000, idle: 0 }
 
 const MOOD_TOOL_SPEC = {
@@ -1042,6 +1054,7 @@ export const register: Register = (on, options) => {
     altDenies = 0
     otherDenies = 0
     lastSaidAt = Number.NEGATIVE_INFINITY // a new session may set a face at once
+    lastPercent = undefined
 
     // The command exists everywhere, so /rocky can say why he is not here.
     try {
@@ -1263,6 +1276,50 @@ export const register: Register = (on, options) => {
     }
     return r
   }).catch(($, e, next) => next(e))
+
+  // Observes the context fill: an upward crossing of 80 or 90 worries him.
+  on('session.measure', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      const p: unknown = e.context?.percent
+      if (typeof p === 'number' && Number.isInteger(p) && p >= 0 && p <= 100) {
+        const before = lastPercent
+        lastPercent = p
+        const crossed = (before === undefined || before < 80) && p >= 80 || (before === undefined || before < 90) && p >= 90
+        if (crossed) {
+          void (async () => {
+            await apply($, (m, now) =>
+              holdsAgainstSession(m, now)
+                ? undefined
+                : { mood: 'worry', detail: `${CONTEXT_LINE}${p}%`, gen: m.gen, ttl: CONTEXT_WORRY_MS },
+            )
+          })().catch(quiet)
+        }
+      }
+    } catch {
+      // Rocky's worry is not worth the measure
+    }
+    return r
+  })
+
+  // Observes a compaction of the main loop: when it stands, Rocky is happy.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      if (!e.agentId && e.trigger !== 'precompute' && r && !('skip' in r && r.skip !== undefined) && Array.isArray(r.messages)) {
+        void (async () => {
+          await apply($, (m, now) =>
+            holdsAgainstSession(m, now)
+              ? undefined
+              : { mood: 'happy', detail: 'brain small now', gen: m.gen, ttl: COMPACT_HAPPY_MS },
+          )
+        })().catch(quiet)
+      }
+    } catch {
+      // Rocky's cheer is not worth the compaction
+    }
+    return r
+  })
 
   // Observes the permission verdict and changes nothing: what `next` settled to
   // goes back as it came (an ask handed up as heard stays the engine's own).
