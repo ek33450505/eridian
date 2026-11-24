@@ -79,8 +79,8 @@ const ALT_DENIES = 2 // in a row, before the pane gives up on pictures
 // stored, which outlives a reload.
 const moodAtom = atom(
   { plugin: 'rocky-buddy', key: 'mood' } as const,
-  { mood: 'idle', detail: '', seq: 0, gen: 0, until: 0, friendStarts: [] } satisfies RockyMood,
-  { shape: 'mood-6' }, // 4: `detail` is the whole bubble line; 6: the running friends' start times
+  { mood: 'idle', detail: '', seq: 0, gen: 0, until: 0, friendStarts: [], says: false } satisfies RockyMood,
+  { shape: 'mood-7' }, // 4: `detail` is the whole bubble line; 6: the running friends' start times; 7: `says`
 )
 // The subagents running (by agent id), so a completion can find its start and a
 // missing one can time out. See Friends in the types.
@@ -230,8 +230,10 @@ const shownMood = (stored: RockyMood, now: number): RockyMood => {
   const base: RockyMood =
     isMood(stored.mood) && stored.until > now ? stored : { ...stored, mood: 'idle', detail: '' }
   const n = friendsAt(stored, now)
+  // a face the assistant set shows as it is, even with no line of its own
+  const said = stored.says === true && stored.until > now
   const counting =
-    n > 0 && (base.mood === 'idle' || ((base.mood === 'working' || base.mood === 'thinking') && base.detail === ''))
+    n > 0 && !said && (base.mood === 'idle' || ((base.mood === 'working' || base.mood === 'thinking') && base.detail === ''))
   return counting
     ? { ...base, mood: 'working', detail: `friends friends: ${Math.min(n, MAX_FRIENDS_SHOWN)} working` }
     : base
@@ -301,21 +303,25 @@ type Ticking = Clocked & {
 // allowed, checked right before the write.
 const apply = async (
   $: Clocked,
-  change: (m: RockyMood, now: number) => (Pick<RockyMood, 'mood' | 'detail' | 'gen'> & { ttl?: number }) | undefined,
+  change: (m: RockyMood, now: number) => (Pick<RockyMood, 'mood' | 'detail' | 'gen'> & { ttl?: number; says?: boolean }) | undefined,
 ) => {
   const now = await $.clock.now()
-  if (!(await allowed($))) return
+  if (!(await allowed($))) return false
+  let wrote = false
   await update($, moodAtom, (m): RockyMood => {
     const next = change(m, now)
+    wrote = next !== undefined // each attempt decides afresh (a retry may write nothing)
     if (!next) return m
-    const { ttl, ...mood } = next
+    const { ttl, says, ...mood } = next
     return {
       ...mood,
+      says: says === true,
       seq: m.seq + 1,
       until: now + (ttl ?? TTL_MS[next.mood]),
       friendStarts: m.friendStarts,
     }
   })
+  return wrote
 }
 
 // A turn boundary: `gen` moves, the mood and its expiry do not.
@@ -915,7 +921,7 @@ const friendStarted = async ($: Clocked, agentId: string, type: string, cwd: str
 // A mood that is still showing and must not be replaced by a finished agent's: a
 // question, a failure, or an outcome. (Idle, working and expired ones may be.)
 const holdsTheBubble = (m: RockyMood, now: number) =>
-  m.until > now && (m.mood === 'worry' || m.mood === 'happy' || (m.mood === 'thinking' && m.detail !== ''))
+  m.until > now && (m.says === true || m.mood === 'worry' || m.mood === 'happy' || (m.mood === 'thinking' && m.detail !== ''))
 
 // An agent ended: one fewer, and a mood for how its report says it went.
 const friendFinished = async ($: Clocked, agentId: string, reason: unknown, answer: unknown) => {
@@ -946,6 +952,86 @@ const resetFriends = async ($: Clocked) => {
   if (await allowed($)) await update($, moodAtom, (m): RockyMood => ({ ...m, friendStarts: [] }))
 }
 
+// ---- Rocky's own words: the rocky_mood tool ---------------------------------
+// The assistant can set Rocky's face. The tool exists only where Rocky is
+// allowed when the session starts; it cannot be withdrawn later, so its handler
+// asks again and answers "not here" (writing nothing) where he is not.
+const ROCKY_TOOL_NAME = 'rocky_mood'
+const ROCKY_TOOL = 'mcp__rocky-buddy__rocky_mood' // as the model names it
+
+// How long each mood the assistant sets lasts (idle: at once).
+// A rocky_mood call within this long of the last one that took is ignored.
+const SAID_COOLDOWN_MS = 5000
+let lastSaidAt = Number.NEGATIVE_INFINITY
+
+const SAID_TTL_MS: Record<Mood, number> = { happy: 6000, worry: 30000, thinking: 60000, working: 20000, idle: 0 }
+
+const MOOD_TOOL_SPEC = {
+  name: ROCKY_TOOL_NAME,
+  description:
+    "Set Rocky's face in his side pane when the work hits a real moment: blocked, fixed, shipped, waiting on the user. " +
+    "Line: up to five plain words, letters only, in Rocky's doubled style (e.g. 'fix good good', 'worry: review blocks'). " +
+    'At most once per turn. Never put secrets, paths or command text in the line. ' +
+    "The line is required but may be empty: Rocky then shows the mood's own words.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      mood: { type: 'string', enum: ['happy', 'worry', 'thinking', 'working', 'idle'] },
+      line: { type: 'string', maxLength: 60 },
+    },
+    required: ['mood', 'line'],
+    additionalProperties: false,
+  },
+  isDeferred: false, // in the tool list, not behind ToolSearch
+} as const
+
+// The system prompt section that tells the model about the tool.
+const MOOD_SECTION = {
+  id: 'rocky-buddy:mood',
+  scope: 'session',
+  text: [
+    "[rocky-buddy mod] Rocky is a small mascot in the user's side pane; the rocky_mood tool sets his face.",
+    'Call it only at a real moment: blocked, fixed, shipped, or waiting on the user. At most once per turn, and never on routine steps.',
+    'Give a short line of up to five plain words (letters only) in his doubled style, for example "fix good good" or "worry: review blocks".',
+    'The line must never contain secrets, file paths or command text.',
+  ].join('\n'),
+} as const
+
+// (SAID_LINE below is the stated contract in one pattern; the per-word shape is
+// stricter, so it never decides alone.)
+// A line the assistant gave, made safe to draw, and held to WORDS ONLY: after
+// the usual cleaning it must be at most five words of ASCII letters (an apostrophe
+// or hyphen inside a word, and `! ? : , .` at its end), each at most 12 letters and
+// 24 characters. No digits, symbols, `_`, `@`, `/`, `\\`, `$` or backticks, and
+// no dots inside a word: that is what keeps a key, a token, a path or a command
+// out of the bubble (a name filter is not enough for that). Anything else drops
+// the whole line, and the mood shows its own words.
+const MAX_SAID_WORDS = 5
+const MAX_SAID_LETTERS = 12
+const SAID_WORD = /^[A-Za-z]+(?:['-][A-Za-z]+)?[!?:,.]*$/
+const SAID_LINE = /^[A-Za-z][A-Za-z '!?:,.-]*$/
+
+const saidLine = (line: unknown): string => {
+  if (typeof line !== 'string') return ''
+  // Cut first (a huge line is not worth cleaning), then cleaned to a length longer
+  // than any good line, so a cut ('…') is never kept.
+  const shown = clean(line.slice(0, 200), 80)
+  if (!SAID_LINE.test(shown) || sensitive(shown)) return ''
+  const words = shown.split(' ')
+  if (words.length > MAX_SAID_WORDS) return ''
+  for (const word of words) {
+    const letters = Array.from(word).filter(ch => /[A-Za-z]/.test(ch)).length
+    if (!SAID_WORD.test(word) || letters > MAX_SAID_LETTERS || word.length > 2 * MAX_SAID_LETTERS) return ''
+  }
+  return shown
+}
+
+// (Called only after session.start has found Rocky allowed: the inactive path
+// returns before it, so the tool is never registered anywhere else.)
+const registerMoodTool = async ($: Pick<EngineInterface, 'tool'>) => {
+  await $.tool.register(MOOD_TOOL_SPEC as never)
+}
+
 export const register: Register = (on, options) => {
   config = options
 
@@ -955,6 +1041,7 @@ export const register: Register = (on, options) => {
     useImages = true
     altDenies = 0
     otherDenies = 0
+    lastSaidAt = Number.NEGATIVE_INFINITY // a new session may set a face at once
 
     // The command exists everywhere, so /rocky can say why he is not here.
     try {
@@ -982,6 +1069,13 @@ export const register: Register = (on, options) => {
     if (await allowed($)) {
       parked = false // opened here: the turn.start reopen has nothing to do
       $.ui.open({ id: PANE, title: TITLE }).catch(quiet)
+    }
+
+    // The tool exists only in a session where Rocky is allowed.
+    try {
+      await registerMoodTool($)
+    } catch {
+      // no tool, no face from the assistant: the rest still works
     }
 
     // A reload re-runs this: clear whatever mood the last session left.
@@ -1059,10 +1153,32 @@ export const register: Register = (on, options) => {
     await bumpGen($)
     const done = await next(e)
 
-    await apply($, m => ({ mood: 'happy', detail: '', gen: m.gen + 1 }))
+    // A face the assistant set holds through the turn's end (the gen bump above
+    // has already happened, and the late-settle guard rests on that).
+    await apply($, (m, now) =>
+      m.says === true && m.until > now ? undefined : { mood: 'happy', detail: '', gen: m.gen + 1 },
+    )
 
     return done
   })
+
+  // The assistant sets Rocky's face. This hook answers the call itself.
+  on('tool.call', { tool: ROCKY_TOOL }, async ($, e) => {
+    if (!(await allowed($))) return { result: 'Rocky is not here.' } // no state written
+    const { mood, line } = e
+    if (!isMood(mood)) return { deny: `${ROCKY_TOOL_NAME}: mood must be one of happy, worry, thinking, working, idle` }
+    if (typeof line !== 'string') return { deny: `${ROCKY_TOOL_NAME}: line is required, a string` }
+    // Once in a few seconds: a call right after the last is ignored (an ok, no write).
+    const at = await $.clock.now()
+    if (at - lastSaidAt < SAID_COOLDOWN_MS) return { result: 'ok' }
+    const said = saidLine(line)
+    // The cooldown starts only once the write has landed: a guard that bailed, or
+    // a write that threw, spends none.
+    if (await apply($, m => ({ mood, detail: said, gen: m.gen, ttl: SAID_TTL_MS[mood], says: true }))) {
+      lastSaidAt = at
+    }
+    return { result: 'ok' } // never an echo of the line
+  }).catch(() => ({ deny: `${ROCKY_TOOL_NAME} failed` }))
 
   // The hook awaits nothing of Rocky's: his pre-write and post-write run beside
   // the call, and the result goes back exactly as `next` produced it.
@@ -1087,6 +1203,8 @@ export const register: Register = (on, options) => {
       void ensureTicker($).catch(quiet)
       await apply($, (m, now) => {
         gen = m.gen
+        // a face the assistant set holds while it lasts, and so does a worry
+        if (m.says === true && m.until > now) return undefined
         // a worry that has run out no longer holds
         return m.mood === 'worry' && m.until > now
           ? undefined
@@ -1104,11 +1222,13 @@ export const register: Register = (on, options) => {
       .then(async () => {
         const started = gen
         if (started === undefined) return
-        await apply($, m => {
+        await apply($, (m, now) => {
           if (m.gen !== started) return undefined // a turn boundary passed: late
           const outcome = outcomeFor(shape.kind, shape.runner, failed, text)
           if (outcome) return { ...outcome, gen: m.gen }
           if (failed) return { mood: 'worry', detail: '', gen: m.gen }
+          // the assistant's own face is not undone by a call that ends
+          if (m.says === true && m.until > now) return undefined
           // a question put to the person, or a worry, is over once the call ran
           return m.mood === 'worry' || m.mood === 'thinking'
             ? { mood: 'working', detail: shape.line, gen: m.gen }
@@ -1152,7 +1272,8 @@ export const register: Register = (on, options) => {
     const r = await next(e)
     // Nothing here may throw before `return r`: the verdict goes back untouched.
     try {
-      if (isPersonAsk(r?.decision, e.approver)) {
+      // (not for Rocky's own tool: he does not wonder about his own face)
+      if (e.tool !== ROCKY_TOOL && isPersonAsk(r?.decision, e.approver)) {
         // after the call's own start-of-call write, so the question is the last word
         void lastPre
           .then(() => apply($, m => ({ mood: ASK.mood, detail: ASK.detail, gen: m.gen, ttl: ASK.ttl })))
@@ -1160,6 +1281,24 @@ export const register: Register = (on, options) => {
       }
     } catch {
       // Rocky's wondering is not worth the verdict
+    }
+    return r
+  }).catch(($, e, next) => next(e))
+
+  // Tells the model about the tool, only where Rocky is allowed and the tool is
+  // offered. Where he is not, the prompt is exactly what `next` composed.
+  on('prompt.compose', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      if (
+        e.tools.includes(ROCKY_TOOL) &&
+        !r.sections.some(section => section.id === MOOD_SECTION.id) &&
+        (await allowed($))
+      ) {
+        return { sections: [...r.sections, MOOD_SECTION] }
+      }
+    } catch {
+      // the prompt as it came
     }
     return r
   }).catch(($, e, next) => next(e))

@@ -99,6 +99,26 @@ A finished agent never replaces a mood that is still showing and belongs to some
 
 **Changes to subagent turns.** A subagent's turn no longer goes through the main loop's guard check: it does not stand Rocky down (the main loop's turns, tool calls and stamps do). Every subagent and teammate `turn.complete` now reads its agent id and, if allowed, writes state (the running set, or a one-minute note for an agent Rocky never saw start), which is why teammates' turns write a little state too.
 
+### Rocky's own words
+
+The assistant can set Rocky's face itself, through a tool, `rocky_mood` (the model sees it as `mcp__rocky-buddy__rocky_mood`), when the work hits a real moment: blocked, fixed, shipped, waiting on you. It takes a `mood` (`happy`, `worry`, `thinking`, `working` or `idle`) and a `line` of a few words in Rocky's doubled style (`fix good good`). A system prompt section, added only where Rocky is allowed, tells the model when to use it: at most once per turn, never on routine steps, never with secrets, file paths or command text in the line.
+
+| Mood set | Lasts |
+| --- | --- |
+| `happy` | 6 s |
+| `worry` | 30 s |
+| `thinking` | 60 s |
+| `working` | 20 s |
+| `idle` | at once |
+
+**What is checked.** The mood must be one of the five, and `line` is required (a missing or non-string one is refused with an error and nothing is written), but it may be an empty string: the mood then shows its own words. **The line is words only, by design:** after the usual cleaning it must be at most five words of ASCII letters A-Z and a-z (other scripts, accented letters and look-alike letters drop the line; an apostrophe or hyphen inside a word; `! ? : , .` at its end), each at most 12 letters. No digits, symbols, `_`, `@`, `/`, `\`, `$`, backticks or dots inside a word; a line that is longer, or looks sensitive, is dropped whole, and the mood shows its own words. That is what keeps a key, a token, a path or a command out of the bubble, since a filter built for file names cannot. A short random-looking word of letters can still pass. The tool never echoes the line back: it answers `ok`. A call within 5 s of the last one that took is ignored (it still answers `ok`, and writes nothing).
+
+**What holds the bubble.** A face the assistant set counts as a live mood: later tool-call narration, and the end of a call, do not replace it while it lasts, a finished subagent and the friends count do not either, and a later `rocky_mood` call does. A real event (a failing test run, a commit, a question to you) still shows over it.
+
+**Only where he is.** The tool is registered only where Rocky is allowed when the session starts, and the prompt section is added only then (in other sessions the prompt is exactly what the engine composed). A registered tool cannot be withdrawn mid-session, so if a session moves into a work folder the tool answers `Rocky is not here.` and writes nothing.
+
+**Permission is yours.** Rocky's `tool.check` hook only observes: it hands every verdict back exactly as it came, `rocky_mood` included, so Claude Code asks you the first time the assistant calls it (and Rocky does not wonder about his own face). To stop the question, allow the tool yourself: run `/permissions` and allow `mcp__rocky-buddy__rocky_mood`, or add it to `permissions.allow` in your settings (`"permissions": { "allow": ["mcp__rocky-buddy__rocky_mood"] }`). Without the rule Claude Code asks once per call, or once per session if you choose "don't ask again". Allowing the tool also means you stop seeing each call's line before it is drawn, which is why the line is held to words only. The assistant's face is not drawn into the transcript (the tool call row shows as any tool's does).
+
 ### Permission questions
 
 Rocky watches the permission check and changes nothing about it: his `tool.check` hook only observes, and hands the verdict back exactly as it came. When the engine asks a *person* (not a host program) whether a call may run, he wonders: thinking, `question? you decide.`, for up to 60 s or until the call goes on. The hook returns the verdict exactly as `next` gave it, whatever Rocky does with it, and a failure in Rocky's part can never reach the verdict. The tests raise the check with `approver: 'person'` through the kit; a real permission dialog was not exercised.

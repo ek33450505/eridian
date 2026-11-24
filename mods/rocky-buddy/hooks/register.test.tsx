@@ -902,7 +902,7 @@ test('a corrupt mood or a negative frame counter still names a real frame file',
   on('state.get', (_, e) => {
     const key = (e as { key?: unknown }).key
     if (key === 'mood') {
-      return { value: { version: 1, value: { shape: 'mood-6', value: { mood: 'zombie', detail: '', seq: 1, gen: 0, until: 1e12, friendStarts: [] } } } } as never
+      return { value: { version: 1, value: { shape: 'mood-7', value: { mood: 'zombie', detail: '', seq: 1, gen: 0, until: 1e12, friendStarts: [], says: false } } } } as never
     }
     if (key === 'frame') {
       return { value: { version: 1, value: { shape: 'frame-2', value: { n: -7, now: 0 } } } } as never
@@ -1887,7 +1887,7 @@ test('the bubble line is cleaned again when drawn, whatever was stored', async (
   on('state.get', (_, e) => {
     const key = (e as { key?: unknown }).key
     if (key === 'mood') {
-      return { value: { version: 1, value: { shape: 'mood-6', value: { mood: 'working', detail: 'run run: a\u001b[31mb', seq: 1, gen: 0, until: 1e12, friendStarts: [] } } } } as never
+      return { value: { version: 1, value: { shape: 'mood-7', value: { mood: 'working', detail: 'run run: a\u001b[31mb', seq: 1, gen: 0, until: 1e12, friendStarts: [], says: false } } } } as never
     }
     if (key === 'frame') return { value: { version: 1, value: { shape: 'frame-2', value: { n: 0, now: 0 } } } } as never
     return { value: { version: 1, value: { shape: 'fallback-1', value: 'image' } } } as never
@@ -2488,8 +2488,8 @@ const seeded = (on: On, seed: Record<string, unknown>) => {
 }
 
 const MOOD6 = (extra: Record<string, unknown>) => ({
-  shape: 'mood-6',
-  value: { mood: 'idle', detail: '', seq: 1, gen: 0, until: 0, friendStarts: [], ...extra },
+  shape: 'mood-7',
+  value: { mood: 'idle', detail: '', seq: 1, gen: 0, until: 0, friendStarts: [], says: false, ...extra },
 })
 
 test('a count whose time has passed is not shown', async ($, on) => {
@@ -2862,4 +2862,612 @@ test('an end for an agent of no kind Rocky saw start leaves a note', async ($, o
 
   const kept = (store.get('friends')?.value as { value: Record<string, { gone?: true }> }).value
   expect(kept.stranger?.gone).toBe(true)
+})
+
+// ---- Rocky's own words: the rocky_mood tool ----
+
+const TOOL = 'mcp__rocky-buddy__rocky_mood'
+
+let registered: Record<string, unknown>[] = []
+const moodWorld = (on: On, toolResult?: Record<string, unknown> | (() => Promise<unknown>)) => {
+  registered = []
+  on('tool.register', (_, e) => {
+    registered.push(e as Record<string, unknown>)
+    return { value: { tool: TOOL } } as never
+  })
+  return friendsWorld(on, toolResult)
+}
+
+const setFace = ($: Engine, mood: unknown, line?: unknown) =>
+  $.tool.call({ tool: TOOL, mood, ...(line === undefined ? {} : { line }) } as never)
+
+test('the tool is registered once in a personal session, with its schema', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+
+  expect(registered).toHaveLength(1)
+  const spec = registered[0] as {
+    name: string
+    description: string
+    inputSchema: { type: string; properties: { mood: { enum: string[] }; line: { maxLength: number } }; required: string[] }
+    isDeferred: boolean
+  }
+  expect(spec.name).toBe('rocky_mood')
+  expect(spec.inputSchema.properties.mood.enum).toEqual(['happy', 'worry', 'thinking', 'working', 'idle'])
+  expect(spec.inputSchema.properties.line.maxLength).toBe(60)
+  expect(spec.inputSchema.required).toEqual(['mood', 'line'])
+  expect((spec.inputSchema as { additionalProperties?: unknown }).additionalProperties).toBe(false)
+  expect(spec.isDeferred).toBe(false)
+  expect(spec.description).toMatch(/real moment/)
+  expect(spec.description).toMatch(/At most once per turn/)
+  expect(spec.description).toMatch(/Never put secrets, paths or command text/)
+})
+
+for (const [what, cwd, home] of [
+  ['a work session', `${W}/crosscheck`, HOME],
+  ['a session elsewhere', `${HOME}/Documents`, HOME],
+  ['a session whose HOME is unknown', `${P}/eridian`, ''],
+] as [string, string, string][]) {
+  test(`the tool is not registered in ${what}`, async ($, on) => {
+    registered = []
+    on('tool.register', (_, e) => {
+      registered.push(e as Record<string, unknown>)
+      return { value: { tool: TOOL } } as never
+    })
+    engine(on, { result: {} }, {}, home)
+    cwdNow = cwd
+    await $.session.start({ ...SESSION, cwd })
+    expect(registered).toHaveLength(0)
+  })
+}
+
+test('the tool is not registered when the directory cannot be read', async ($, on) => {
+  moodWorld(on)
+  cwdBroken = true
+  await $.session.start(SESSION)
+  expect(registered).toHaveLength(0)
+})
+
+test('a failing registration does not stop the session from starting', async ($, on) => {
+  engine(on)
+  on('tool.register', () => {
+    throw new Error('no tools today')
+  })
+  await $.session.start(SESSION)
+  expect(opened).toBe(1)
+})
+
+test('the assistant sets a face, and the result never echoes the line', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+
+  const r = await setFace($, 'happy', 'fix good good')
+  await settle()
+
+  expect(r).toEqual({ result: 'ok' })
+  expect(await bubbleSays($)).toBe('fix good good')
+})
+
+for (const [mood, line, fallback] of [
+  ['happy', 'ship good', 'good good good'],
+  ['worry', 'worry: review blocks', 'worry worry worry'],
+  ['thinking', 'wait wait', 'question?'],
+  ['working', 'build build', 'work work'],
+] as [string, string, string][]) {
+  test(`the ${mood} face shows the line, or its own words when the line is dropped`, async ($, on) => {
+    const clock = moodWorld(on)
+    await $.session.start(SESSION)
+    await setFace($, mood, line)
+    await settle()
+    expect(await bubbleSays($)).toBe(line)
+    await clock.advance(6000)
+    await setFace($, mood, '/secret/path')
+    await settle()
+    expect(await bubbleSays($)).toBe(fallback)
+  })
+}
+
+for (const [mood, ttl] of [['happy', 6000], ['worry', 30000], ['thinking', 60000], ['working', 20000]] as [string, number][]) {
+  test(`the ${mood} face lasts ${ttl / 1000} s`, async ($, on) => {
+    const clock = moodWorld(on)
+    await $.session.start(SESSION)
+    await setFace($, mood, 'a face')
+    await settle()
+    await clock.advance(ttl - 1500)
+    expect(await bubbleSays($)).toBe('a face')
+    await clock.advance(3000)
+    expect(await bubbleSays($)).toBe('...')
+  })
+}
+
+test('the idle face is at once', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'happy', 'up up')
+  await settle()
+  expect(await bubbleSays($)).toBe('up up')
+  await clock.advance(6000)
+  await setFace($, 'idle', 'down down')
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+const BAD_INPUT: [string, unknown, unknown][] = [
+  ['an unknown mood', 'angry', 'x'],
+  ['a missing mood', undefined, 'x'],
+  ['a number for a mood', 5, 'x'],
+  ['an object for a mood', { a: 1 }, 'x'],
+  ['a mood in the wrong case', 'Happy', 'x'],
+  ['a missing line', 'happy', undefined],
+  ['a number for a line', 'happy', 42],
+  ['an object for a line', 'happy', { a: 1 }],
+]
+
+for (const [what, mood, line] of BAD_INPUT) {
+  test(`${what} is refused with an error and writes nothing`, async ($, on) => {
+    moodWorld(on)
+    await $.session.start(SESSION)
+    await setFace($, 'worry', 'before')
+    await settle()
+
+    const r = await setFace($, mood, line)
+    await settle()
+
+    expect(r).toHaveProperty('deny')
+    expect(JSON.stringify(r)).not.toContain('x"') // not an echo of what was sent
+    expect(await bubbleSays($)).toBe('before')
+  })
+}
+
+const LINES: [string, string, string][] = [
+  ['a 200-character line is dropped, not cut', 'word '.repeat(40), 'good good good'],
+  ['an escape sequence is stripped', 'fix \u001b[31mgood\u001b[0m good', 'fix good good'],
+  ['an OSC sequence is stripped', 'ab\u001b]0;pwned\u0007cd', 'abcd'],
+  ['bidi characters are stripped', 'fix‮ good​ good⁦', 'fix good good'],
+  ['control characters are stripped', 'fix\u0001 good', 'fix good'],
+  ['invisible characters are stripped', 'fix⁠­ good‍', 'fix good'],
+  ['whitespace collapses', 'fix   \t good', 'fix good'],
+  ['letters of other scripts are dropped', 'über 日本', 'good good good'],
+  ['a sensitive-looking line is dropped', 'my token is here', 'good good good'],
+  ['a secret-shaped line is dropped', 'ghp_abcdefghijklmnopqrstuvwx', 'good good good'],
+  ['a long random run is dropped', 'abcdefghijklmnopqrstuvwxyz0123456789', 'good good good'],
+  ['a path is dropped', '/Users/x/app.ts', 'good good good'],
+  ['a relative path is dropped', 'src/app.ts', 'good good good'],
+  ['a home path is dropped', '~/notes', 'good good good'],
+  ['a backslash is dropped', 'a\\b', 'good good good'],
+  ['a variable is dropped', 'use $HOME', 'good good good'],
+  ['a backtick command is dropped', '`ls`', 'good good good'],
+  ['an empty line says its mood\'s own words', '', 'good good good'],
+  ['a short password is dropped', 'hunter2', 'good good good'],
+  ['a password in words is dropped', 'the password hunter', 'good good good'],
+  ['a spaced token is dropped', 'ghp_ abcd efgh', 'good good good'],
+  ['a JWT-like string is dropped', 'eyJ.abc.def', 'good good good'],
+  ['dotted words are dropped', 'fix.good.good', 'good good good'],
+  ['hex groups with digits are dropped', 'a1b2 c3d4 e5f6', 'good good good'],
+  ['a line with digits is dropped', 'fix 42', 'good good good'],
+  ['a line with an equals sign is dropped', 'key=value', 'good good good'],
+  ['a line with a plus is dropped', 'a+b', 'good good good'],
+  ['a line with an at sign is dropped', 'mail@x', 'good good good'],
+  ['an underscore is dropped', 'snake_case', 'good good good'],
+  ['a 13-letter word is dropped', 'abcdefghijklm', 'good good good'],
+  ['a 12-letter word stays', 'abcdefghijkl', 'abcdefghijkl'],
+  ['six words are dropped', 'one two three four five six', 'good good good'],
+  ['five words stay', 'one two three four five', 'one two three four five'],
+  ['a line starting with punctuation is dropped', '!fix good', 'good good good'],
+  ['fix good good stays', 'fix good good', 'fix good good'],
+  ['worry: review blocks stays', 'worry: review blocks', 'worry: review blocks'],
+  ['amaze amaze! stays', 'amaze amaze!', 'amaze amaze!'],
+  ['an apostrophe inside a word stays', "don't stop", "don't stop"],
+  ['a hyphen inside a word stays', 'well-done fix', 'well-done fix'],
+  ['a trailing run of punctuation is bounded', 'a' + '.'.repeat(30), 'good good good'],
+]
+
+for (const [what, line, shown] of LINES) {
+  test(`a line: ${what}`, async ($, on) => {
+    moodWorld(on)
+    await $.session.start(SESSION)
+    await setFace($, 'happy', line)
+    await settle()
+    const said = await bubbleSays($)
+    expect(said).toBe(shown)
+    expect(said).not.toMatch(/[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁤⁦-⁩﻿]/)
+  })
+}
+
+test('where Rocky is not, the tool answers so and writes nothing', async ($, on) => {
+  const w = watch(on)
+  on('tool.register', () => ({ value: { tool: TOOL } }) as never)
+  await $.session.start(SESSION)
+  cwdNow = `${W}/crosscheck` // the session moved into work: the tool cannot be withdrawn
+  const writes = w.seen.writes
+
+  const r = await setFace($, 'happy', 'fix good good')
+  await settle()
+
+  expect(r).toEqual({ result: 'Rocky is not here.' })
+  expect(w.seen.writes).toBe(writes)
+})
+
+// ---- what holds the bubble ----
+
+test('a face the assistant set is not replaced by later tool narration while it lasts', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await setFace($, 'happy', 'ship good')
+  await settle()
+
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('ship good')
+
+  await clock.advance(7000)
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('run run: ls') // it has run out: narration is back
+})
+
+test('a face the assistant set is not undone by a call that ends', async ($, on) => {
+  let release: () => void = () => {}
+  const hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  moodWorld(on, async () => {
+    await hold
+    return { result: {} }
+  })
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const call = $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  await setFace($, 'thinking', 'hmm hmm')
+  await settle()
+  release()
+  await call
+  await settle()
+  expect(await bubbleSays($)).toBe('hmm hmm')
+})
+
+test('an idle face does not hold the bubble: narration is back at once', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await setFace($, 'idle', 'rest rest')
+  await settle()
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('run run: ls')
+})
+
+test('a later rocky_mood call does replace it', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'worry', 'first first')
+  await clock.advance(6000)
+  await setFace($, 'happy', 'second second')
+  await settle()
+  expect(await bubbleSays($)).toBe('second second')
+})
+
+test('a finished subagent does not replace it', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await setFace($, 'working', 'build build')
+  await settle()
+  await finish($, 'a1', 'Status: BLOCKED')
+  await settle()
+  expect(await bubbleSays($)).toBe('build build')
+})
+
+test('the friends count does not show over it', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await setFace($, 'working', 'build build')
+  await settle()
+  expect(await bubbleSays($)).toBe('build build')
+})
+
+test('a test failure still shows over it (a real event)', async ($, on) => {
+  moodWorld(on, { result: {}, isError: true, text: '2 failed' })
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await setFace($, 'happy', 'all good')
+  await settle()
+  await $.tool.call({ tool: 'Bash', command: 'pytest' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('worry worry: 2 tests fail')
+})
+
+test('the rocky_mood call is not narrated as work', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await setFace($, 'happy', 'ship good')
+  await settle()
+  expect(await bubbleSays($)).not.toMatch(/tool tool|rocky-buddy/)
+})
+
+// ---- permission is the user's: the check only observes ----
+
+for (const answer of [
+  { decision: 'ask' as const, reason: 'the engine' },
+  { decision: 'allow' as const, reason: 'the engine' },
+  { decision: 'deny' as const, reason: 'the engine' },
+]) {
+  for (const approver of ['person', 'host', undefined]) {
+    test(`the engine's ${answer.decision} for rocky_mood goes back as it came (approver ${approver ?? 'none'})`, async ($, on) => {
+      moodWorld(on)
+      on('tool.check', () => answer as never)
+      await $.session.start(SESSION)
+      const r = await $.tool.check({ tool: TOOL, input: { mood: 'happy', line: 'x' }, ...(approver ? { approver } : {}) } as never)
+      expect(r).toEqual(answer)
+    })
+  }
+}
+
+test('an ask about rocky_mood does not make Rocky wonder, though a person is asked', async ($, on) => {
+  moodWorld(on)
+  on('tool.check', () => ({ decision: 'ask' }) as never)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.check({ tool: TOOL, input: { mood: 'happy', line: 'x' }, approver: 'person' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('question?') // thinking from the turn, not the question
+})
+
+test('an ask about another tool still does', async ($, on) => {
+  moodWorld(on)
+  on('tool.check', () => ({ decision: 'ask' }) as never)
+  await $.session.start(SESSION)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, approver: 'person' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('question? you decide.')
+})
+
+// ---- the system prompt ----
+
+const compose = ($: Engine, tools: string[]) =>
+  $.prompt.compose({ model: 'm', promptModel: 'm', tools, surfaces: ['terminal'], outputStyle: null, traits: [] } as never)
+
+const BASE_SECTIONS = [
+  { id: 'intro', text: 'You are an assistant.', scope: 'shared' },
+  { id: 'tools', text: 'Tools: a b c', scope: 'shared' },
+  { id: 'env', text: 'cwd: here', scope: 'session' },
+]
+
+test('a personal session adds one section, last, marked as the mod\'s', async ($, on) => {
+  moodWorld(on)
+  on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
+  await $.session.start(SESSION)
+
+  const r = await compose($, [TOOL])
+
+  expect(r.sections).toHaveLength(BASE_SECTIONS.length + 1)
+  expect(r.sections.slice(0, BASE_SECTIONS.length)).toEqual(BASE_SECTIONS)
+  const added = r.sections[r.sections.length - 1]
+  expect(added?.id).toBe('rocky-buddy:mood')
+  expect(added?.scope).toBe('session')
+  expect(added?.text).toMatch(/^\[rocky-buddy mod\]/)
+  expect(added?.text).toMatch(/rocky_mood/)
+  expect(added?.text).toMatch(/real moment/)
+  expect(added?.text).toMatch(/At most once per turn/)
+  expect(added?.text).toMatch(/never contain secrets, file paths or command text/)
+  expect((added?.text ?? '').split('\n').length).toBeLessThanOrEqual(5)
+})
+
+for (const [what, cwd] of [['a work session', `${W}/crosscheck`], ['a session elsewhere', `${HOME}/Documents`]] as [string, string][]) {
+  test(`${what} gets exactly the prompt \`next\` composed`, async ($, on) => {
+    moodWorld(on)
+    on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
+    cwdNow = cwd
+    await $.session.start({ ...SESSION, cwd })
+
+    const r = await compose($, [TOOL])
+
+    expect(r).toEqual({ sections: BASE_SECTIONS })
+  })
+}
+
+test('no section where the tool is not offered', async ($, on) => {
+  moodWorld(on)
+  on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
+  await $.session.start(SESSION)
+  expect(await compose($, ['Bash', 'Read'])).toEqual({ sections: BASE_SECTIONS })
+})
+
+test('the section is not added twice', async ($, on) => {
+  moodWorld(on)
+  on('prompt.compose', () => ({ sections: [...BASE_SECTIONS, { id: 'rocky-buddy:mood', text: 'mine', scope: 'session' }] }) as never)
+  await $.session.start(SESSION)
+  const r = await compose($, [TOOL])
+  expect(r.sections.filter(s => s.id === 'rocky-buddy:mood')).toHaveLength(1)
+})
+
+test('the section follows the guard live: a work directory takes it away', async ($, on) => {
+  moodWorld(on)
+  on('prompt.compose', () => ({ sections: BASE_SECTIONS }) as never)
+  await $.session.start(SESSION)
+  expect((await compose($, [TOOL])).sections).toHaveLength(BASE_SECTIONS.length + 1)
+  cwdNow = `${W}/crosscheck`
+  expect(await compose($, [TOOL])).toEqual({ sections: BASE_SECTIONS })
+})
+
+// ---- round 2: a cooldown, and a face with no line of its own ----
+
+test('a second rocky_mood call within five seconds is ignored, and answered ok', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  expect(await setFace($, 'happy', 'first first')).toEqual({ result: 'ok' })
+  await settle()
+  await clock.advance(1000)
+
+  expect(await setFace($, 'worry', 'second second')).toEqual({ result: 'ok' })
+  await settle()
+
+  expect(await bubbleSays($)).toBe('first first')
+})
+
+test('a rocky_mood call after the cooldown applies', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'happy', 'first first')
+  await clock.advance(1000)
+  await setFace($, 'worry', 'ignored ignored')
+  await clock.advance(5000) // 6 s since the first
+  await setFace($, 'happy', 'third third')
+  await settle()
+  expect(await bubbleSays($)).toBe('third third')
+})
+
+test('an ignored call does not start a new cooldown', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'happy', 'first first')
+  await clock.advance(3000)
+  await setFace($, 'worry', 'ignored ignored') // ignored: no new cooldown
+  await clock.advance(3000) // 6 s since the first, 3 s since the ignored one
+  await setFace($, 'happy', 'fourth fourth')
+  await settle()
+  expect(await bubbleSays($)).toBe('fourth fourth')
+})
+
+test('a refused call does not start a cooldown', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'angry', 'x') // refused
+  await setFace($, 'happy', 'right away')
+  await settle()
+  expect(await bubbleSays($)).toBe('right away')
+})
+
+for (const [mood, own] of [['working', 'work work'], ['thinking', 'question?'], ['worry', 'worry worry worry'], ['happy', 'good good good']] as [string, string][]) {
+  test(`a ${mood} face with no line of its own is not covered by the friends count`, async ($, on) => {
+    moodWorld(on)
+    await $.session.start(SESSION)
+    await spawn($)
+    await setFace($, mood, '') // an empty line
+    await settle()
+    expect(await bubbleSays($)).toBe(own)
+  })
+}
+
+test('the friends count comes back when the assistant\'s face has run out', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await setFace($, 'working', '')
+  await settle()
+  expect(await bubbleSays($)).toBe('work work')
+  await clock.advance(21000)
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+})
+
+test('a missing line is an error and nothing is written', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'worry', 'before before')
+  await settle()
+  const r = await setFace($, 'happy')
+  await settle()
+  expect(r).toHaveProperty('deny')
+  expect(await bubbleSays($)).toBe('before before')
+})
+
+// ---- round 3: a held face, the cooldown's start, and ASCII-only words ----
+
+test('a turn.complete leaves a live assistant face alone, and it ends at its own TTL', async ($, on) => {
+  const clock = moodWorld(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await setFace($, 'worry', 'review blocks')
+  await settle()
+  await $.turn.complete({ turnId: 't1', ...(COMPLETE as object) } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('review blocks')
+
+  await clock.advance(31_000)
+  await settle()
+  expect(await bubbleSays($)).not.toBe('review blocks')
+  expect(await bubbleSays($)).not.toBe('good good good')
+})
+
+test('a turn.complete with no live face still shows good good good', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.complete({ turnId: 't1', ...(COMPLETE as object) } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('good good good')
+})
+
+test('a new session.start lets a rocky_mood call apply at once', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  await setFace($, 'happy', 'first first')
+  await $.session.start(SESSION)
+  await setFace($, 'worry', 'second second')
+  await settle()
+  expect(await bubbleSays($)).toBe('second second')
+})
+
+test('a rocky_mood call the guard refuses at the write does not start the cooldown', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  holdCwdNth = 2 // the handler's check passes; the write's own check waits
+  const first = setFace($, 'happy', 'first first')
+  await settle()
+  cwdNow = `${W}/crosscheck` // the cd lands before the write
+  releaseCwd()
+  expect(await first).toEqual({ result: 'ok' })
+  await settle()
+  cwdNow = `${P}/eridian`
+  await setFace($, 'worry', 'second second') // no time has passed: only a cooldown would stop it
+  await settle()
+  expect(await bubbleSays($)).toBe('second second')
+})
+
+const NON_ASCII: [string, string][] = [
+  ['a Cyrillic homoglyph word', 'fіx good'],
+  ['CJK', '修正 良い'],
+  ['Hebrew letters', 'שלום good'],
+  ['Arabic letters', 'مرحبا good'],
+  ['an accented Latin word', 'café good'],
+]
+for (const [what, line] of NON_ASCII) {
+  test(`a non-ASCII line is dropped: ${what}`, async ($, on) => {
+    moodWorld(on)
+    await $.session.start(SESSION)
+    await setFace($, 'happy', line)
+    await settle()
+    expect(await bubbleSays($)).toBe('good good good')
+  })
+}
+
+test('a 10,000-character line is dropped', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  expect(await setFace($, 'happy', 'a '.repeat(5000))).toEqual({ result: 'ok' })
+  await settle()
+  expect(await bubbleSays($)).toBe('good good good')
+})
+
+test('a huge line is cut before it is cleaned, so it is dropped quickly', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  const t0 = Date.now()
+  await setFace($, 'happy', 'a '.repeat(20_000_000))
+  await settle()
+  expect(await bubbleSays($)).toBe('good good good')
+  expect(Date.now() - t0).toBeLessThan(1000)
+})
+
+test('the tool description says the line is required but may be empty', async ($, on) => {
+  moodWorld(on)
+  await $.session.start(SESSION)
+  const spec = registered[0] as { description: string }
+  expect(spec.description).toMatch(/line is required/i)
+  expect(spec.description).toMatch(/empty/i)
+  expect(await setFace($, 'happy', '')).toEqual({ result: 'ok' })
 })
