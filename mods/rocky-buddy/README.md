@@ -63,6 +63,26 @@ Rocky narrates the tool call in his doubled-verb way:
 | An MCP tool | `tool tool: neon` (the server) |
 | Anything else, or an input he cannot read | `work work: <tool name>` |
 
+### How a call ended
+
+When a call finishes Rocky reacts to the outcome with a fixed line, never with the tool's output:
+
+| What happened | Mood and line | Shown for |
+| --- | --- | --- |
+| A test run (the runners above) fails | worry, `worry worry: tests fail`, or `worry worry: 3 tests fail` (`1 test fails` for one) when the output has a count he knows | 20 s |
+| A test run succeeds | happy, `good good good: tests pass` | 4 s |
+| `git commit` succeeds | happy, `good good: commit` | 4 s |
+| `git push` succeeds | happy, `good good good: push` | 4 s |
+| `gh pr merge` succeeds | happy, `amaze amaze: merged` | 8 s |
+| Any other failure | worry, `worry worry worry` | 20 s |
+| Any other success | the working line, as above | |
+
+The only thing ever read from a result is a failure count, and only as a whole number from 1 to 9999 (`9999+` above that), looked for in the last 20,000 characters (where summaries are) with anchored, bounded patterns so a huge or hostile output cannot slow the hook: `pytest` and `npm`/`pnpm`/`yarn` (`N failed`), `uv run pytest`, `bats` (lines starting `not ok`), `claude plugin test` (` N fail`), `go test` (`--- FAIL` lines), `cargo test` (`N failed` in the `test result: FAILED` line). Any other output text is never shown. A failed commit or push is an ordinary failure.
+
+### Permission questions
+
+Rocky watches the permission check and changes nothing about it: his `tool.check` hook only observes, and hands the verdict back exactly as it came. When the engine asks a *person* (not a host program) whether a call may run, he wonders: thinking, `question? you decide.`, for up to 60 s or until the call goes on. The hook returns the verdict exactly as `next` gave it, whatever Rocky does with it, and a failure in Rocky's part can never reach the verdict. The tests raise the check with `approver: 'person'` through the kit; a real permission dialog was not exercised.
+
 **How the Bash line is chosen.** No shell syntax is parsed. The command word is the command's first word only if it is plain (letters, digits, `.`, `_`, `/`, `-`) and ends at a space or the end of the command; otherwise the line is `run run`, so a secret in an assignment, a substitution or a quoted argument can never be picked up as a word. A wrapper is not looked through. A script given by path (`./run.sh`, `/path/to/run.sh`) is treated like a file: one inside your `workUnder` folder, or one that cannot be placed, gives `run run`. The words after the command word are used only to recognise a test runner or a git subcommand, and only while each is plain.
 
 **What is never shown:** a directory or a full path (only a file's basename), any argument of a Bash command, a search pattern, a web address or query, a prompt, file contents. A file inside your `workUnder` folder is not named, and neither is a path starting with `~` or containing `$`. A file whose name looks sensitive is not named either: `.env*`, key and certificate files (`.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.keystore`, `.jks`, `.asc`, `.gpg`), `id_*`, anything with `credential`, `secret`, `token` or `passw` in it, `.npmrc`, `.netrc`, `.pgpass`, `.pypirc`, `authorized_keys`, `known_hosts`, `kubeconfig`, `auth.json`, `*.env`, `*.tfvars`, `*.tfstate`, `*.p8`, `*.ppk`, `*.age`, service-account and API-key names, `.vault_pass` (an extension counts mid-name too: `server.key.bak`, `id.pem~`), a run of 24 or more letters, digits, `_` or `-`, or a well-known token prefix (`ghp_`, `gho_`, `github_pat_`, `sk-`, `xox`, `AKIA`). Those, and the cases above, show only the verb (`read read`). A path ending in a slash names a directory and shows only the verb too.

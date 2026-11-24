@@ -4,6 +4,9 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### Added
+- `mods/rocky-buddy`: Rocky reacts to how a call ended. A failing test run worries him (`worry worry: tests fail`, or `3 tests fail`, `1 test fails` when the output has a count he knows, from pytest, bats, `claude plugin test`, go and cargo; only the number is ever read, from the last 20,000 characters with bounded patterns), a passing one pleases him (`good good good: tests pass`), and a successful `git commit`, `git push` or `gh pr merge` makes him happy (`good good: commit`, `good good good: push`, `amaze amaze: merged` for 8 s). When the engine asks a person to approve a call he wonders (`question? you decide.`, 60 s) through a `tool.check` hook that only observes and returns the verdict unchanged. No output text is ever shown.
+
 ### Changed
 - `mods/rocky-buddy`: while he works, Rocky's bubble now says what the tool call is doing in his doubled-verb way (`edit edit: app.ts`, `test test: pytest`, `git git: status`, `run run: ls`, `search search`, `look look: web`, `friend friend: <agent>`, `tool tool: <server>`) instead of `work work: <tool>`. It shows only the tool kind, a file's basename, a plain Bash command's first word, a git subcommand, an agent type or an MCP server. Bash is read by allow-list, not parsed: wrappers (`sudo`, `env`...), assignments, quotes and `$` give `run run`; search patterns are never shown; sensitive file names (`.env*`, keys, credentials, token-shaped names) and anything under `workUnder` or starting with `~` or holding `$` show only the verb. Shown words keep only letters, numbers, punctuation, symbols and plain spaces (no invisible or direction-changing characters) and are capped at 24 characters.
 

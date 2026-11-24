@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, UiBlitArgs } from 'claude-code'
 
+import { failCount, isPersonAsk } from './outcome'
+
 const PANE = {
   plugin: 'rocky-buddy',
   component: 'Pane',
@@ -32,7 +34,7 @@ const picture = (b: UiBlitArgs) => {
 // test can change it), or a hook of its own.
 const engine = (
   on: On,
-  toolResult: Record<string, unknown> = { result: {} },
+  toolResult: Record<string, unknown> | (() => Promise<unknown>) = { result: {} },
   blit: Record<string, unknown> | ((e: UiBlitArgs) => Promise<unknown>) = {},
   home = HOME,
 ) => {
@@ -49,7 +51,7 @@ const engine = (
   })
   on('command.register', () => ({ value: { command: 'rocky' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('tool.call', () => toolResult as never)
+  on('tool.call', (typeof toolResult === 'function' ? toolResult : () => toolResult) as never)
   on('turn.start', () => ({ turnId: 't1' }))
   on('turn.complete', () => ({ text: '' }))
   return mock.clock(on)
@@ -284,12 +286,14 @@ test('a subagent turn.complete moves nothing, and its tool calls still do', asyn
   await $.session.start(SESSION)
   await $.turn.start({ text: 'go', turnId: 't1' })
   await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await settle()
 
   // the subagent's turn.complete neither made Rocky happy nor made the call late
   expect(await moodMounted($, /worry worry worry/)).toBe(true)
   expect(await moodMounted($, /good good good/)).toBe(false)
 
   await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' })
+  await settle()
   expect(await moodMounted($, /worry worry worry/)).toBe(true)
 })
 
@@ -1687,13 +1691,26 @@ const bubbleSays = async ($: Engine) => {
   return (rows[1] ?? '').replace(/^\s*\|\s*/, '').replace(/\s*\|\s*$/, '')
 }
 
+// The bubble while the call is still running (a finished test run or commit
+// changes it to an outcome line).
 const narrated = async ($: Engine, on: On, tool: string, input: Record<string, unknown>) => {
-  engine(on)
+  let release: () => void = () => {}
+  const hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  engine(on, async () => {
+    await hold
+    return { result: {} }
+  })
   await $.session.start(SESSION)
   await $.turn.start({ text: 'go', turnId: 't1' })
-  await $.tool.call({ tool, ...input } as never)
+  const call = $.tool.call({ tool, ...input } as never)
   await settle()
-  return bubbleSays($)
+  const said = await bubbleSays($)
+  release()
+  await call
+  await settle()
+  return said
 }
 
 const SRC = `${P}/eridian/src`
@@ -1876,4 +1893,306 @@ test('the bubble line is cleaned again when drawn, whatever was stored', async (
   await $.session.start(SESSION)
 
   expect(await bubbleSays($)).toBe('run run: ab')
+})
+
+// ---- outcomes: how a call ended, and permission asks ----
+
+const GIT = (...words: string[]) => ['git', ...words].join(' ')
+
+const ended = async (
+  $: Engine,
+  on: On,
+  command: string,
+  result: Record<string, unknown>,
+) => {
+  const clock = engine(on, result)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command } as never)
+  await settle()
+  return { said: await bubbleSays($), clock }
+}
+
+const FAILED = { result: {}, isError: true }
+
+const FAILURES: [string, string, string, string][] = [
+  ['pytest counts "N failed"', 'pytest -q', 'FAILED t.py::a\n3 failed, 2 passed in 1.2s', 'worry worry: 3 tests fail'],
+  ['uv run pytest counts the same way', 'uv run pytest', '1 failed in 0.1s', 'worry worry: 1 test fails'],
+  ['bats counts "not ok" lines', 'bats tests/', 'ok 1 a\nnot ok 2 b\nnot ok 3 c\nok 4 d', 'worry worry: 2 tests fail'],
+  ['claude plugin test counts " N fail"', 'claude plugin test mods/x', ' 54 pass\n 2 fail\nRan 56 tests', 'worry worry: 2 tests fail'],
+  ['go test counts "--- FAIL" lines', 'go test ./...', '--- FAIL: TestA (0.00s)\n--- FAIL: TestB (0.00s)\nFAIL', 'worry worry: 2 tests fail'],
+  ['cargo test counts the failed in its result line', 'cargo test', 'test result: FAILED. 3 passed; 2 failed; 0 ignored', 'worry worry: 2 tests fail'],
+  ['npm test counts "N failed"', 'npm test', 'Tests: 4 failed, 10 passed', 'worry worry: 4 tests fail'],
+  ['pytest does not take "N failures" for its count', 'pytest', 'there were 2 failures noted', 'worry worry: tests fail'],
+  ['bats counts only lines that start with "not ok"', 'bats t', 'ok 1 a # not ok here\nnot ok 2 b', 'worry worry: 1 test fails'],
+  ['a count at the cap is shown as it is', 'pytest', '9999 failed', 'worry worry: 9999 tests fail'],
+  ['a count just above the cap shows a plus', 'pytest', '10000 failed', 'worry worry: 9999+ tests fail'],
+  ['a count far above the cap shows a plus', 'pytest', '123456 failed', 'worry worry: 9999+ tests fail'],
+  ['no count in the output', 'pytest', 'boom', 'worry worry: tests fail'],
+  ['a zero count is no count', 'pytest', '0 failed', 'worry worry: tests fail'],
+  ['no text at all', 'pytest', '', 'worry worry: tests fail'],
+]
+
+for (const [name, command, text, line] of FAILURES) {
+  test(`a failing test run: ${name}`, async ($, on) => {
+    const { said } = await ended($, on, command, { ...FAILED, text })
+    expect(said).toBe(line)
+  })
+}
+
+test('only a number is ever taken from a failing run, never its other text', async ($, on) => {
+  const { said } = await ended($, on, 'pytest', {
+    ...FAILED,
+    text: 'FAILED secret_test.py::test_sk-abcdef1234 AssertionError: token=ghp_zzz\n3 failed in 2s',
+  })
+  expect(said).toBe('worry worry: 3 tests fail')
+  expect(said).not.toMatch(/secret|sk-|token|ghp_|Assertion|abcdef/i)
+})
+
+test('a denied test run is a failing one', async ($, on) => {
+  const { said } = await ended($, on, 'pytest', { deny: 'no' })
+  expect(said).toBe('worry worry: tests fail')
+})
+
+test('a test run that succeeds is good', async ($, on) => {
+  const { said } = await ended($, on, 'pytest -q', { result: {}, text: '5 passed' })
+  expect(said).toBe('good good good: tests pass')
+})
+
+test('a successful test run is shown for the happy time (4 s), then idle', async ($, on) => {
+  const { clock } = await ended($, on, 'pytest -q', { result: {}, text: '5 passed' })
+  await clock.advance(3000)
+  expect(await bubbleSays($)).toBe('good good good: tests pass')
+  await clock.advance(2000)
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a successful commit is good', async ($, on) => {
+  const { said } = await ended($, on, GIT('commit', '-m', 'x'), { result: {}, text: '[main abc] x' })
+  expect(said).toBe('good good: commit')
+})
+
+test('a failed commit is an ordinary failure', async ($, on) => {
+  const { said } = await ended($, on, GIT('commit', '-m', 'x'), { ...FAILED, text: 'nothing to commit' })
+  expect(said).toBe('worry worry worry')
+})
+
+test('a successful push is good', async ($, on) => {
+  const { said } = await ended($, on, GIT('push', 'origin', 'main'), { result: {}, text: 'done' })
+  expect(said).toBe('good good good: push')
+})
+
+test('a failed push is an ordinary failure', async ($, on) => {
+  const { said } = await ended($, on, GIT('push'), { ...FAILED, text: 'rejected' })
+  expect(said).toBe('worry worry worry')
+})
+
+test('a merged pull request is amazing, and shown for 8 s', async ($, on) => {
+  const { said, clock } = await ended($, on, 'gh pr merge 12 --squash', { result: {}, text: 'merged' })
+  expect(said).toBe('amaze amaze: merged')
+  await clock.advance(6000)
+  expect(await bubbleSays($)).toBe('amaze amaze: merged') // past the ordinary 4 s
+  await clock.advance(3000)
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('only the literal words gh pr merge count', async ($, on) => {
+  const { said } = await ended($, on, 'gh pr view 12', { result: {}, text: 'x' })
+  expect(said).toBe('run run: gh')
+})
+
+test('any other success keeps the usual working line', async ($, on) => {
+  const { said } = await ended($, on, 'ls -la', { result: {}, text: 'a b c' })
+  expect(said).toBe('run run: ls')
+})
+
+test('git status success is not a celebration', async ($, on) => {
+  const { said } = await ended($, on, GIT('status'), { result: {}, text: 'clean' })
+  expect(said).toBe('git git: status')
+})
+
+// ---- the guard ----
+
+test('in a work session no outcome is written', async ($, on) => {
+  const w = watch(on, { ...FAILED, text: '3 failed' })
+  cwdNow = `${W}/crosscheck`
+  await $.session.start({ ...SESSION, cwd: cwdNow })
+  const writes = w.seen.writes
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'pytest' } as never)
+  await settle()
+  await w.clock.advance(83 * 10)
+
+  expect(w.seen.writes).toBe(writes)
+  expect(opened).toBe(0)
+})
+
+// ---- permission asks ----
+
+test('the predicate: only a person\'s ask counts', () => {
+  expect(isPersonAsk('ask', 'person')).toBe(true)
+  expect(isPersonAsk('ask', 'host')).toBe(false)
+  expect(isPersonAsk('ask', undefined)).toBe(false)
+  expect(isPersonAsk('allow', 'person')).toBe(false)
+  expect(isPersonAsk('deny', 'person')).toBe(false)
+})
+
+for (const answer of [
+  { decision: 'allow' as const, reason: 'fine' },
+  { decision: 'ask' as const, reason: 'sure?' },
+  { decision: 'deny' as const, reason: 'no' },
+]) {
+  test(`the permission verdict ${answer.decision} goes back exactly as it came`, async ($, on) => {
+    engine(on)
+    on('tool.check', () => answer as never)
+    await $.session.start(SESSION)
+
+    expect(await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).toEqual(answer)
+  })
+}
+
+test('an ask nobody here answers as a person does not change the mood', async ($, on) => {
+  engine(on)
+  on('tool.check', () => ({ decision: 'ask', reason: 'sure?' }) as never)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })
+  await settle()
+
+  expect(await moodMounted($, /question\? you decide/)).toBe(false)
+})
+
+// ---- a long output cannot slow a hook down ----
+
+const BIG = 200000
+const ADVERSARIAL: [string, string, string][] = [
+  ['pytest', 'a long digit run', '1'.repeat(BIG)],
+  ['pytest', 'digits then a near miss', '1'.repeat(BIG) + ' fail'],
+  ['uv', 'a long digit run', '9'.repeat(BIG)],
+  ['npm', 'a long digit run', '5'.repeat(BIG)],
+  ['claude', 'a long newline run', '\n'.repeat(BIG) + '5 fai'],
+  ['claude', 'spaces and newlines', ' \n'.repeat(BIG / 2) + 'x'],
+  ['cargo', 'a marker then digits', 'test result: FAILED.' + '1'.repeat(BIG)],
+  ['cargo', 'a marker then a long line', 'test result: FAILED.' + 'x'.repeat(BIG)],
+  ['cargo', 'markers all along', 'test result: FAILED. 1 '.repeat(BIG / 24)],
+  ['bats', 'a million-ish lines', 'not ok\n'.repeat(BIG / 7)],
+  ['go', 'many failing lines', '--- FAIL\n'.repeat(BIG / 9)],
+]
+
+for (const [runner, what, text] of ADVERSARIAL) {
+  test(`a ${BIG}-character ${runner} output (${what}) is read in under 100 ms`, () => {
+    const t = Date.now()
+    failCount(runner, text)
+    expect(Date.now() - t).toBeLessThan(100)
+  })
+}
+
+test('a summary at the end of a long output is still found', () => {
+  expect(failCount('pytest', 'x\n'.repeat(60000) + '3 failed in 1s')).toBe(3)
+  expect(failCount('bats', 'ok 1\n'.repeat(30000) + 'not ok 2')).toBe(1)
+})
+
+test('only the last 20,000 characters are read', () => {
+  expect(failCount('pytest', '8 failed\n' + 'x'.repeat(30000))).toBeUndefined()
+})
+
+// ---- a person's question ----
+
+const personAsks = (on: On) => {
+  on('tool.check', () => ({ decision: 'ask', reason: 'sure?' }) as never)
+}
+const check = ($: Engine, approver: string, tool = 'Bash') =>
+  $.tool.check({ tool, input: { command: 'ls' }, approver } as never)
+
+test('a person being asked makes Rocky wonder, for a minute', async ($, on) => {
+  const clock = engine(on)
+  personAsks(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await check($, 'person')
+  await settle()
+  expect(await bubbleSays($)).toBe('question? you decide.')
+
+  await clock.advance(50000)
+  expect(await bubbleSays($)).toBe('question? you decide.')
+  await clock.advance(12000)
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a question during a call is over when the call goes on', async ($, on) => {
+  let release: () => void = () => {}
+  const hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  engine(on, async () => {
+    await hold
+    return { result: {}, text: 'ok' }
+  })
+  // the dialog is the query below; the call itself is allowed once answered
+  on('tool.check', (_, e) => ({ decision: (e as { tool_use_id?: string }).tool_use_id ? 'allow' : 'ask' }) as never)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const call = $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('run run: ls') // working
+
+  await check($, 'person') // the permission dialog opens
+  await settle()
+  expect(await bubbleSays($)).toBe('question? you decide.')
+
+  release() // answered: the call runs and ends
+  await call
+  await settle()
+  expect(await bubbleSays($)).toBe('run run: ls')
+})
+
+for (const approver of ['host', 'nobody']) {
+  test(`an ask answered by ${approver} does not change the mood`, async ($, on) => {
+    engine(on)
+    personAsks(on)
+    await $.session.start(SESSION)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await check($, approver)
+    await settle()
+    expect(await bubbleSays($)).toBe('question?') // thinking from the turn, not the question
+  })
+}
+
+for (const decision of ['allow', 'deny']) {
+  test(`a person's ${decision} is not a question`, async ($, on) => {
+    engine(on)
+    on('tool.check', () => ({ decision, reason: 'x' }) as never)
+    await $.session.start(SESSION)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    await check($, 'person')
+    await settle()
+    expect(await bubbleSays($)).toBe('question?')
+  })
+}
+
+for (const answer of [
+  { decision: 'allow' as const, reason: 'fine' },
+  { decision: 'ask' as const, reason: 'sure?' },
+  { decision: 'deny' as const, reason: 'no' },
+]) {
+  test(`the verdict ${answer.decision} also goes back as it came when a person is asked`, async ($, on) => {
+    engine(on)
+    on('tool.check', () => answer as never)
+    await $.session.start(SESSION)
+
+    expect(await check($, 'person')).toEqual(answer)
+  })
+}
+
+test('in a work session a person\'s question is not written', async ($, on) => {
+  const w = watch(on)
+  personAsks(on)
+  cwdNow = `${W}/crosscheck`
+  await $.session.start({ ...SESSION, cwd: cwdNow })
+  const writes = w.seen.writes
+
+  await check($, 'person')
+  await settle()
+
+  expect(w.seen.writes).toBe(writes)
 })
