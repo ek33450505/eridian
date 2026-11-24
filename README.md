@@ -10,6 +10,10 @@ Rocky, a typed persona for Claude Code terminal sessions. A Claude Code SessionS
 
 The earlier voice interface (wake word, speech in/out, voice_guard) is archived at tag `voice-archive-v1`.
 
+## Rocky pane (mod)
+
+A Claude Code mod that draws an animated Rocky in a side pane for personal sessions (never work sessions). See [mods/rocky-buddy](mods/rocky-buddy/README.md). Install it with `/plugin install rocky-buddy --marketplace ek33450505/eridian`.
+
 ## Install
 
 Requires Python 3.12 or newer. The package has no runtime dependencies.

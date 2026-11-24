@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 
 .DS_Store
+
+# Claude Code mods: the engine writes these next to a mod when it loads it
+mods/*/.claude-plugin/types/
+mods/*/tsconfig.json
