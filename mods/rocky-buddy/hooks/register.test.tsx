@@ -3471,3 +3471,176 @@ test('the tool description says the line is required but may be empty', async ($
   expect(spec.description).toMatch(/empty/i)
   expect(await setFace($, 'happy', '')).toEqual({ result: 'ok' })
 })
+
+// ---- session state: context fill and compaction ----
+
+const measure = async ($: Engine, percent: unknown) => {
+  const r = await $.session.measure({ context: { window: 200000, percent }, rateLimits: [], changed: ['context'] } as never)
+  await settle()
+  return r
+}
+
+const MSG = { role: 'user', text: 'hi', toolUses: [] }
+const compacted = async ($: Engine, extra: Record<string, unknown> = {}) => {
+  const r = await $.session.compact({ trigger: 'manual', messages: [MSG], ...extra } as never)
+  await settle()
+  return r
+}
+
+const sessionWorld = (on: On, result: unknown = { messages: [MSG] }) => {
+  const clock = engine(on)
+  on('session.measure', (_, e) => ({ changed: (e as { changed: string[] }).changed }) as never)
+  on('session.compact', () => result as never)
+  return clock
+}
+
+test('context fill: a crossing of 80 fires, a steady 85 does not nag, 90 fires, a drop and a rise fire again', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  await measure($, 50)
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+  await measure($, 80)
+  expect(await bubbleSays($)).toBe('brain full full: 80%')
+  await measure($, 85) // steady above 80: nothing new
+  expect(await bubbleSays($)).toBe('brain full full: 80%')
+  await measure($, 90)
+  expect(await bubbleSays($)).toBe('brain full full: 90%')
+  await measure($, 50)
+  await measure($, 82)
+  expect(await bubbleSays($)).toBe('brain full full: 82%')
+})
+
+test('context fill: a steady reading writes nothing after the first', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  await measure($, 85)
+  const clock = await bubbleSays($)
+  expect(clock).toBe('brain full full: 85%')
+  await measure($, 86)
+  await measure($, 89)
+  expect(await bubbleSays($)).toBe('brain full full: 85%')
+})
+
+test('context fill: the line lasts 20 s', async ($, on) => {
+  const clock = sessionWorld(on)
+  await $.session.start(SESSION)
+  await measure($, 85)
+  expect(await bubbleSays($)).toBe('brain full full: 85%')
+  await clock.advance(21000)
+  await settle()
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+})
+
+test('context fill: only a whole number from 0 to 100 is shown', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  for (const bad of ['85', undefined, null, Number.NaN, Infinity, 85.5, -1, 101, {}, [85]]) {
+    await measure($, bad)
+    expect(await bubbleSays($)).not.toMatch(/brain/)
+  }
+  await measure($, 100)
+  expect(await bubbleSays($)).toBe('brain full full: 100%')
+})
+
+test('context fill: the measure result is what next gave', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  expect(await measure($, 95)).toEqual({ changed: ['context'] })
+})
+
+test('context fill: a new session forgets the last percent', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  await measure($, 85)
+  await $.session.start(SESSION)
+  await measure($, 85)
+  expect(await bubbleSays($)).toBe('brain full full: 85%')
+})
+
+test('context fill: a face the assistant set is not overwritten', async ($, on) => {
+  moodWorld(on)
+  on('session.measure', (_, e) => ({ changed: (e as { changed: string[] }).changed }) as never)
+  await $.session.start(SESSION)
+  await setFace($, 'happy', 'fix good good')
+  await settle()
+  await measure($, 85)
+  expect(await bubbleSays($)).toBe('fix good good')
+})
+
+test('context fill: a live question and a live outcome are not overwritten', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'git commit -m x' } as never)
+  await settle()
+  const outcome = await bubbleSays($)
+  expect(outcome).toMatch(/good/)
+  await measure($, 85)
+  expect(await bubbleSays($)).toBe(outcome)
+})
+
+test('context fill: a work cwd writes nothing', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  cwdNow = `${W}/app`
+  await measure($, 85)
+  await compacted($)
+  cwdNow = PERSONAL
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+})
+
+test('compaction: a main compact shows brain small now and returns what next gave', async ($, on) => {
+  const result = { messages: [MSG], tokensBefore: 9, tokensAfter: 3 }
+  sessionWorld(on, result)
+  await $.session.start(SESSION)
+  expect(await compacted($)).toEqual(result)
+  expect(await bubbleSays($)).toBe('brain small now')
+})
+
+test('compaction: a subagent compact is ignored', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  await compacted($, { agentId: 'a1' })
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+})
+
+test('compaction: a skipped compaction is not cheered, and the skip is returned as it came', async ($, on) => {
+  sessionWorld(on, { skip: 'nothing to do' })
+  await $.session.start(SESSION)
+  expect(await compacted($)).toEqual({ skip: 'nothing to do' })
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+})
+
+test('compaction: the happy line lasts 6 s', async ($, on) => {
+  const clock = sessionWorld(on)
+  await $.session.start(SESSION)
+  await compacted($)
+  expect(await bubbleSays($)).toBe('brain small now')
+  await clock.advance(7000)
+  await settle()
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+})
+
+test('compaction: replaces the context worry, but not a face the assistant set', async ($, on) => {
+  moodWorld(on)
+  on('session.measure', (_, e) => ({ changed: (e as { changed: string[] }).changed }) as never)
+  on('session.compact', () => ({ messages: [MSG] }) as never)
+  await $.session.start(SESSION)
+  await measure($, 85)
+  expect(await bubbleSays($)).toBe('brain full full: 85%')
+  await compacted($)
+  expect(await bubbleSays($)).toBe('brain small now')
+  await settle()
+  await $.session.start(SESSION)
+  await setFace($, 'worry', 'stuck stuck')
+  await settle()
+  await compacted($)
+  expect(await bubbleSays($)).toBe('stuck stuck')
+})
+
+test('compaction: a precompute installs nothing, so it is not cheered', async ($, on) => {
+  sessionWorld(on)
+  await $.session.start(SESSION)
+  await compacted($, { trigger: 'precompute' })
+  expect(await bubbleSays($)).not.toMatch(/brain/)
+})

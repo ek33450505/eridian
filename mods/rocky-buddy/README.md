@@ -99,6 +99,19 @@ A finished agent never replaces a mood that is still showing and belongs to some
 
 **Changes to subagent turns.** A subagent's turn no longer goes through the main loop's guard check: it does not stand Rocky down (the main loop's turns, tool calls and stamps do). Every subagent and teammate `turn.complete` now reads its agent id and, if allowed, writes state (the running set, or a one-minute note for an agent Rocky never saw start), which is why teammates' turns write a little state too.
 
+### Context and compaction
+
+Rocky watches how full the context is and when it is compacted. Both hooks only observe: `session.measure` and `session.compact` return exactly what the engine gave, and `instructions` and the messages are never touched.
+
+| What happened | Rocky shows | Lasts |
+| --- | --- | --- |
+| The fill crosses 80% upward, and again at 90% | worry, `brain full full: 85%` (the whole percent read) | 20 s |
+| The main conversation is compacted | happy, `brain small now` | 6 s |
+
+Only an upward crossing speaks: a steady 85% does not nag, and a drop below 80% re-arms it. The last reading is forgotten when a session starts. Only a whole number from 0 to 100 is read or shown; anything else is ignored. A subagent's compaction (it carries an `agentId`) is ignored, and so is a skipped one. Neither line replaces a face the assistant set, a question or an outcome that is still showing (Rocky's own context worry does give way to a later 90% line or a compaction). A `precompute` compaction installs nothing, so it is ignored too. Nothing is written in a work folder.
+
+A crossing that is blocked is spent: if a question or an assistant-set face is showing when 80% is crossed, the 80% line does not appear later, though a 90% crossing still can. A session that starts or resumes at 80% or more worries once, on its first reading.
+
 ### Rocky's own words
 
 The assistant can set Rocky's face itself, through a tool, `rocky_mood` (the model sees it as `mcp__rocky-buddy__rocky_mood`), when the work hits a real moment: blocked, fixed, shipped, waiting on you. It takes a `mood` (`happy`, `worry`, `thinking`, `working` or `idle`) and a `line` of a few words in Rocky's doubled style (`fix good good`). A system prompt section, added only where Rocky is allowed, tells the model when to use it: at most once per turn, never on routine steps, never with secrets, file paths or command text in the line.
