@@ -36,6 +36,7 @@ Where he is not allowed he does nothing: no pane, no timer, no state, every hook
 - **After a `cd` into a work folder**, at most about 4 or 5 of Rocky's own frames play (a few hundred milliseconds, no work data) before the pane closes. The picture ticks at 12 fps and only the ticker's stamps (about every 415 ms) ask; asking at the picture rate would cost two host reads per frame. The pane is closed by the next stamp, tool call or turn boundary, whichever comes first.
 - **Case matching approximates the file system's case folding** (NFC plus lower-casing, the macOS default). A case-sensitive volume, or unusual Unicode folding, may differ.
 - **Symlinks, bind mounts and directories reached through links** are judged by the path the session reports, never by where it resolves (the mod API offers no realpath). A link from a personal folder into a work folder is a personal path.
+- **Narrated file names follow links too.** The bubble names a file by the path the tool call used, never where it resolves. A link inside a personal folder that points into a work folder is a personal path, so the target file's basename (unless its name looks sensitive) can appear in the bubble. This is the same symlink limit as the guard's.
 - **Malformed settings keep Rocky off everywhere**: a control character or a backslash anywhere, whitespace at the start or end of a path or of any segment (an ordinary space inside a name is fine), and, in the option text only, a literal `$`, `~user`, a relative path, or a path that normalizes to nothing. Control characters, backslashes and segment whitespace are rejected in the options, in `$HOME` and in the session's directory alike.
 
 Paths compare per segment (`~/Projects/workshop` is not inside `~/Projects/work`), NFC-normalized and case-insensitively, with `.`, `..` and trailing slashes normalized.
@@ -43,6 +44,32 @@ Paths compare per segment (`~/Projects/workshop` is not inside `~/Projects/work`
 ## Moods
 
 `idle` (arms low, a slow breath), `thinking` (one hand up to his shell, a calm tap), `working` (fast alternating hammer strikes with sparks), `worry` (arms pulled in, a shake), `happy` (both arms waving, bouncing). A mood is shown for a while after its last event, then he settles back to idle.
+
+### What the bubble says while he works
+
+Rocky narrates the tool call in his doubled-verb way:
+
+| Tool | Bubble |
+| --- | --- |
+| Edit, Write, NotebookEdit | `edit edit: app.ts` |
+| Read | `read read: README.md` |
+| Grep, Glob | `search search` (never the pattern) |
+| Bash: a test runner (`pytest`, `bats`, `npm`/`pnpm`/`yarn test` or `run test[:x]`, `go test`, `cargo test`, `claude plugin test`, `uv run pytest`) | `test test: pytest` |
+| Bash: git | `git git: status` (only a real git subcommand from a fixed list; `git git` for a flag or any other word) |
+| Bash: a plain command | `run run: ls` (the first word) |
+| Bash: anything else (a wrapper such as `sudo`, `env`, `time`, `nohup` or `xargs`; a variable assignment first; quotes, `$`, or any other shell syntax in the first word) | `run run` |
+| WebFetch, WebSearch | `look look: web` |
+| Agent, Task | `friend friend: code-reviewer` |
+| An MCP tool | `tool tool: neon` (the server) |
+| Anything else, or an input he cannot read | `work work: <tool name>` |
+
+**How the Bash line is chosen.** No shell syntax is parsed. The command word is the command's first word only if it is plain (letters, digits, `.`, `_`, `/`, `-`) and ends at a space or the end of the command; otherwise the line is `run run`, so a secret in an assignment, a substitution or a quoted argument can never be picked up as a word. A wrapper is not looked through. A script given by path (`./run.sh`, `/path/to/run.sh`) is treated like a file: one inside your `workUnder` folder, or one that cannot be placed, gives `run run`. The words after the command word are used only to recognise a test runner or a git subcommand, and only while each is plain.
+
+**What is never shown:** a directory or a full path (only a file's basename), any argument of a Bash command, a search pattern, a web address or query, a prompt, file contents. A file inside your `workUnder` folder is not named, and neither is a path starting with `~` or containing `$`. A file whose name looks sensitive is not named either: `.env*`, key and certificate files (`.pem`, `.key`, `.p12`, `.pfx`, `.kdbx`, `.keystore`, `.jks`, `.asc`, `.gpg`), `id_*`, anything with `credential`, `secret`, `token` or `passw` in it, `.npmrc`, `.netrc`, `.pgpass`, `.pypirc`, `authorized_keys`, `known_hosts`, `kubeconfig`, `auth.json`, `*.env`, `*.tfvars`, `*.tfstate`, `*.p8`, `*.ppk`, `*.age`, service-account and API-key names, `.vault_pass` (an extension counts mid-name too: `server.key.bak`, `id.pem~`), a run of 24 or more letters, digits, `_` or `-`, or a well-known token prefix (`ghp_`, `gho_`, `github_pat_`, `sk-`, `xox`, `AKIA`). Those, and the cases above, show only the verb (`read read`). A path ending in a slash names a directory and shows only the verb too.
+
+**An accepted residual:** a short, random-looking command or script name (under 24 characters, with no known token prefix) can still be shown as the first word of a plain Bash command, since a name that short cannot be told from an ordinary one.
+
+**How a shown word is cleaned.** Only letters, numbers, punctuation, symbols and the plain space are kept (after NFC). Escape sequences, control characters, zero-width, bidirectional, soft-hyphen, word-joiner, interlinear-annotation and tag characters, variation selectors and combining marks are dropped, whitespace is collapsed, and each word is cut to 24 characters. Dropping combining marks means a name in a script that relies on them (some Indic scripts) loses them in the bubble. The words are worked out beside the tool call, never in its way.
 
 ## Regenerating the frames
 
