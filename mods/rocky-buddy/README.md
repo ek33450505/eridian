@@ -112,9 +112,11 @@ Only an upward crossing speaks: a steady 85% does not nag, and a drop below 80% 
 
 A crossing that is blocked is spent: if a question or an assistant-set face is showing when 80% is crossed, the 80% line does not appear later, though a 90% crossing still can. A session that starts or resumes at 80% or more worries once, on its first reading.
 
+**Compaction needs the append tier.** Claude Code's built-in security plugin, `cc-plugin-sec-default`, passes `session.compact` over every plugin a person installs, so in an ordinary install `brain small now` does not appear. The hook runs where the mod is seated in the `append` tier (`appendPlugins` in user settings), which also lets it see the other events that plugin guards. The context fill line is not affected.
+
 ### Rocky's own words
 
-The assistant can set Rocky's face itself, through a tool, `rocky_mood` (the model sees it as `mcp__rocky-buddy__rocky_mood`), when the work hits a real moment: blocked, fixed, shipped, waiting on you. It takes a `mood` (`happy`, `worry`, `thinking`, `working` or `idle`) and a `line` of a few words in Rocky's doubled style (`fix good good`). A system prompt section, added only where Rocky is allowed, tells the model when to use it: at most once per turn, never on routine steps, never with secrets, file paths or command text in the line.
+The assistant can set Rocky's face itself, through a tool, `rocky_mood` (the model sees it as `mcp__rocky-buddy__rocky_mood`), when the work hits a real moment: blocked, fixed, shipped, waiting on you. It takes a `mood` (`happy`, `worry`, `thinking`, `working` or `idle`) and a `line` of a few words in Rocky's doubled style (`fix good good`). The tool's own description tells the model when to use it: at most once per turn, never on routine steps, never with secrets, file paths or command text in the line. (It is not a system prompt section: Claude Code's built-in security plugin, `cc-plugin-sec-default`, passes the system prompt events over every plugin a person installs.)
 
 | Mood set | Lasts |
 | --- | --- |
@@ -128,7 +130,7 @@ The assistant can set Rocky's face itself, through a tool, `rocky_mood` (the mod
 
 **What holds the bubble.** A face the assistant set counts as a live mood: later tool-call narration, and the end of a call, do not replace it while it lasts, a finished subagent and the friends count do not either, and a later `rocky_mood` call does. A real event (a failing test run, a commit, a question to you) still shows over it.
 
-**Only where he is.** The tool is registered only where Rocky is allowed when the session starts, and the prompt section is added only then (in other sessions the prompt is exactly what the engine composed). A registered tool cannot be withdrawn mid-session, so if a session moves into a work folder the tool answers `Rocky is not here.` and writes nothing.
+**Only where he is.** The tool is registered only where Rocky is allowed when the session starts. A registered tool cannot be withdrawn mid-session, so if a session moves into a work folder the tool answers `Rocky is not here.` and writes nothing.
 
 **Permission is yours.** Rocky's `tool.check` hook only observes: it hands every verdict back exactly as it came, `rocky_mood` included, so Claude Code asks you the first time the assistant calls it (and Rocky does not wonder about his own face). To stop the question, allow the tool yourself: run `/permissions` and allow `mcp__rocky-buddy__rocky_mood`, or add it to `permissions.allow` in your settings (`"permissions": { "allow": ["mcp__rocky-buddy__rocky_mood"] }`). Without the rule Claude Code asks once per call, or once per session if you choose "don't ask again". Allowing the tool also means you stop seeing each call's line before it is drawn, which is why the line is held to words only. The assistant's face is not drawn into the transcript (the tool call row shows as any tool's does).
 

@@ -4,6 +4,9 @@ All notable changes to eridian (named undertone before 2026-11-05) are documente
 
 ## [Unreleased]
 
+### Changed
+- `mods/rocky-buddy` 0.1.1: the guidance for `rocky_mood` (real moments only, at most once per turn, never on routine steps, never secrets, paths or command text) now lives in the tool's own description, and the mod adds no system prompt section. Claude Code's built-in security plugin, `cc-plugin-sec-default`, passes `prompt.compose` over every installed plugin, so the section never reached the model. For the same reason the compaction line (`brain small now`) appears only where the mod is seated in the `append` tier; the README says so.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added

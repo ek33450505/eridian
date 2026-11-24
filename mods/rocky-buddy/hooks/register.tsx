@@ -983,7 +983,7 @@ const MOOD_TOOL_SPEC = {
   description:
     "Set Rocky's face in his side pane when the work hits a real moment: blocked, fixed, shipped, waiting on the user. " +
     "Line: up to five plain words, letters only, in Rocky's doubled style (e.g. 'fix good good', 'worry: review blocks'). " +
-    'At most once per turn. Never put secrets, paths or command text in the line. ' +
+    'At most once per turn, never on routine steps. Never put secrets, paths or command text in the line. ' +
     "The line is required but may be empty: Rocky then shows the mood's own words.",
   inputSchema: {
     type: 'object',
@@ -995,18 +995,6 @@ const MOOD_TOOL_SPEC = {
     additionalProperties: false,
   },
   isDeferred: false, // in the tool list, not behind ToolSearch
-} as const
-
-// The system prompt section that tells the model about the tool.
-const MOOD_SECTION = {
-  id: 'rocky-buddy:mood',
-  scope: 'session',
-  text: [
-    "[rocky-buddy mod] Rocky is a small mascot in the user's side pane; the rocky_mood tool sets his face.",
-    'Call it only at a real moment: blocked, fixed, shipped, or waiting on the user. At most once per turn, and never on routine steps.',
-    'Give a short line of up to five plain words (letters only) in his doubled style, for example "fix good good" or "worry: review blocks".',
-    'The line must never contain secrets, file paths or command text.',
-  ].join('\n'),
 } as const
 
 // (SAID_LINE below is the stated contract in one pattern; the per-word shape is
@@ -1338,24 +1326,6 @@ export const register: Register = (on, options) => {
       }
     } catch {
       // Rocky's wondering is not worth the verdict
-    }
-    return r
-  }).catch(($, e, next) => next(e))
-
-  // Tells the model about the tool, only where Rocky is allowed and the tool is
-  // offered. Where he is not, the prompt is exactly what `next` composed.
-  on('prompt.compose', async ($, e, next) => {
-    const r = await next(e)
-    try {
-      if (
-        e.tools.includes(ROCKY_TOOL) &&
-        !r.sections.some(section => section.id === MOOD_SECTION.id) &&
-        (await allowed($))
-      ) {
-        return { sections: [...r.sections, MOOD_SECTION] }
-      }
-    } catch {
-      // the prompt as it came
     }
     return r
   }).catch(($, e, next) => next(e))
