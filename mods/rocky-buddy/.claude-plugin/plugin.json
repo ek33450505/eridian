@@ -1,0 +1,23 @@
+{
+  "name": "rocky-buddy",
+  "version": "0.1.0",
+  "description": "Rocky, an animated helper in a side pane (personal sessions only)",
+  "author": { "name": "ek33450505" },
+  "license": "Apache-2.0",
+  "repository": "https://github.com/ek33450505/eridian",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "personalUnder": {
+      "type": "string",
+      "title": "Personal projects folder",
+      "description": "Rocky appears only in sessions whose directory is inside this folder.",
+      "default": "~/Projects/personal"
+    },
+    "workUnder": {
+      "type": "string",
+      "title": "Work projects folder",
+      "description": "Rocky never appears in sessions inside this folder, even if it is also inside the personal folder.",
+      "default": "~/Projects/work"
+    }
+  }
+}

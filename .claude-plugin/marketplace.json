@@ -1,0 +1,8 @@
+{
+  "name": "eridian",
+  "owner": { "name": "ek33450505" },
+  "description": "Claude Code mods from the eridian repository.",
+  "plugins": [
+    { "name": "rocky-buddy", "source": "./mods/rocky-buddy" }
+  ]
+}
