@@ -13,6 +13,9 @@ export type RockyMood = {
   gen: number
   until: number
   friendStarts: number[]
+  // True when the assistant set this mood itself (rocky_mood): later tool-call
+  // narration does not replace it while it lasts.
+  says: boolean
 }
 
 // The subagents Rocky has seen start and not yet end, by agent id: when, and
