@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, UiBlitArgs } from 'claude-code'
 
-import { failCount, isPersonAsk } from './outcome'
+import { agentOutcome, agentStatus, failCount, isPersonAsk } from './outcome'
 
 const PANE = {
   plugin: 'rocky-buddy',
@@ -22,6 +22,7 @@ const surfaces = ['terminal', 'desktop'] as const
 
 // What the ticker swapped into the picture: every `$.ui.blit` the plugin made.
 let blits: UiBlitArgs[] = []
+let clockStart = 0 // where `engine`'s mock clock starts (ms)
 let opened = 0 // panes opened
 // Which frame file a blit named: its mood and index.
 const picture = (b: UiBlitArgs) => {
@@ -54,7 +55,9 @@ const engine = (
   on('tool.call', (typeof toolResult === 'function' ? toolResult : () => toolResult) as never)
   on('turn.start', () => ({ turnId: 't1' }))
   on('turn.complete', () => ({ text: '' }))
-  return mock.clock(on)
+  const startAt = clockStart
+  clockStart = 0
+  return mock.clock(on, { now: startAt })
 }
 
 const moodMounted = async ($: any, line: RegExp, bodyColumns = 40) => {
@@ -899,7 +902,7 @@ test('a corrupt mood or a negative frame counter still names a real frame file',
   on('state.get', (_, e) => {
     const key = (e as { key?: unknown }).key
     if (key === 'mood') {
-      return { value: { version: 1, value: { shape: 'mood-3', value: { mood: 'zombie', detail: '', seq: 1, gen: 0, until: 1e12 } } } } as never
+      return { value: { version: 1, value: { shape: 'mood-6', value: { mood: 'zombie', detail: '', seq: 1, gen: 0, until: 1e12, friendStarts: [] } } } } as never
     }
     if (key === 'frame') {
       return { value: { version: 1, value: { shape: 'frame-2', value: { n: -7, now: 0 } } } } as never
@@ -1884,7 +1887,7 @@ test('the bubble line is cleaned again when drawn, whatever was stored', async (
   on('state.get', (_, e) => {
     const key = (e as { key?: unknown }).key
     if (key === 'mood') {
-      return { value: { version: 1, value: { shape: 'mood-4', value: { mood: 'working', detail: 'run run: a\u001b[31mb', seq: 1, gen: 0, until: 1e12 } } } } as never
+      return { value: { version: 1, value: { shape: 'mood-6', value: { mood: 'working', detail: 'run run: a\u001b[31mb', seq: 1, gen: 0, until: 1e12, friendStarts: [] } } } } as never
     }
     if (key === 'frame') return { value: { version: 1, value: { shape: 'frame-2', value: { n: 0, now: 0 } } } } as never
     return { value: { version: 1, value: { shape: 'fallback-1', value: 'image' } } } as never
@@ -2195,4 +2198,668 @@ test('in a work session a person\'s question is not written', async ($, on) => {
   await settle()
 
   expect(w.seen.writes).toBe(writes)
+})
+
+// ---- friends: the subagents ----
+
+let nextAgent = 0
+let spawnReply: (e: { subagentType?: string }) => unknown = () => ({ model: 'm', agentId: `a${++nextAgent}` })
+
+const friendsWorld = (on: On, toolResult?: Record<string, unknown> | (() => Promise<unknown>)) => {
+  nextAgent = 0
+  spawnReply = () => ({ model: 'm', agentId: `a${++nextAgent}` })
+  const clock = engine(on, toolResult)
+  on('agent.spawn', (_, e) => spawnReply(e as { subagentType?: string }) as never)
+  return clock
+}
+
+// Lets the friends bookkeeping (a chain of background writes) run to its end.
+const friendsDone = async () => {
+  for (let i = 0; i < 20; i++) await settle()
+}
+
+const spawn = async ($: Engine, subagentType = 'code-reviewer', background = false) =>
+  $.agent.spawn({ prompt: 'p', subagentType, description: 'd', background } as never)
+
+const finish = ($: Engine, agentId: string, answer = 'done', reason = 'answer') =>
+  $.turn.complete({
+    turnId: `sub-${agentId}`,
+    agentId,
+    reason,
+    answer,
+    durationMs: 1,
+    isAborted: reason === 'aborted',
+  } as never)
+
+test('spawns count up and finishes count down, then Rocky is himself again', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  expect(await bubbleSays($)).toBe('...')
+
+  await spawn($)
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+  await spawn($, 'planner')
+  await spawn($, 'Explore')
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 3 working')
+
+  await finish($, 'a2')
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 2 working')
+  await finish($, 'a1')
+  await finish($, 'a3')
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a background agent is counted the same way (its own turn.complete ends it)', async ($, on) => {
+  const clock = friendsWorld(on)
+  await $.session.start(SESSION)
+  await spawn($, 'code-reviewer', true)
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+  // the Agent tool call returned at launch: a tool call does not end it
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Agent', description: 'd', prompt: 'p' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('friend friend') // the call's own line shows over the count
+  await clock.advance(21000)
+  expect(await bubbleSays($)).toBe('friends friends: 1 working') // and the agent is still counted
+  await finish($, 'a1')
+  await settle()
+  expect(await bubbleSays($)).not.toMatch(/friends/)
+})
+
+test('a refused spawn is not a friend', async ($, on) => {
+  friendsWorld(on)
+  spawnReply = () => ({ deny: 'no' })
+  await $.session.start(SESSION)
+  await spawn($)
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('an agent that was never seen is not an end', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await finish($, 'nobody', 'Status: BLOCKED')
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+})
+
+test('a new session starts with no friends', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await spawn($)
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 2 working')
+  await $.session.start(SESSION)
+  expect(await bubbleSays($)).toBe('...')
+})
+
+const REPORTS: [string, string, string, number | undefined][] = [
+  ['Status: BLOCKED', 'Summary: x\n\nStatus: BLOCKED', 'worry worry: code-reviewer blocked', undefined],
+  ['NEEDS_CONTEXT like BLOCKED', 'Status: NEEDS_CONTEXT', 'worry worry: code-reviewer blocked', undefined],
+  ['DONE_WITH_CONCERNS', 'blah\nStatus: DONE_WITH_CONCERNS', 'hmm hmm: code-reviewer concerns', 10000],
+  ['DONE', 'blah\nStatus: DONE', 'good good: code-reviewer done', 4000],
+  ['the markdown form', 'x\n**Status:** DONE', 'good good: code-reviewer done', 4000],
+  ['the bold form', '**Status**: BLOCKED', 'worry worry: code-reviewer blocked', undefined],
+  ['the JSON form', '```json status\n{ "schema_version": "1.0", "status": "BLOCKED" }\n```', 'worry worry: code-reviewer blocked', undefined],
+  ['the JSON form with spaces', '{"status" : "DONE"}', 'good good: code-reviewer done', 4000],
+]
+
+for (const [name, report, line, ttl] of REPORTS) {
+  test(`a finished agent: ${name}`, async ($, on) => {
+    const clock = friendsWorld(on)
+    await $.session.start(SESSION)
+    await spawn($)
+    await finish($, 'a1', report)
+    await settle()
+    expect(await bubbleSays($)).toBe(line)
+    if (ttl !== undefined) {
+      await clock.advance(ttl - 1000)
+      expect(await bubbleSays($)).toBe(line)
+      await clock.advance(2000)
+      expect(await bubbleSays($)).toBe('...')
+    }
+  })
+}
+
+test('a blocked report is worry until it fades, then the remaining friends show', async ($, on) => {
+  const clock = friendsWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await spawn($, 'planner')
+  await finish($, 'a1', 'Status: BLOCKED')
+  await settle()
+  expect(await bubbleSays($)).toBe('worry worry: code-reviewer blocked')
+  await clock.advance(21000)
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+})
+
+test('an agent that was aborted or errored has no status mood', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await finish($, 'a1', 'Status: BLOCKED', 'aborted')
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a report with no status is just the end of a friend', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await spawn($)
+  await finish($, 'a1', 'All finished, nothing to report.')
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+const TYPES: [string, string][] = [
+  ['code-reviewer__rocky-narrate', 'code-reviewer'],
+  ['frontend-writer__fix-1', 'frontend-writer'],
+  ['general-purpose', 'general-purpose'],
+  ['plugin:helper', 'plugin:helper'],
+  ['bad name!', 'friend'],
+  ['a\u001b[31mb', 'friend'],
+  ['日本', 'friend'],
+  ['x'.repeat(40), 'friend'],
+  ['ghp_abc123', 'friend'],
+  ['secret-agent', 'friend'],
+  ['', 'friend'],
+  ['__only-a-suffix', 'friend'],
+  ['a:b:c:d:e:f:g:h:i:j:k:l:m:n', 'a:b:c:d:e:f:g:h:i:j:k:l:'],
+]
+
+for (const [raw, shown] of TYPES) {
+  test(`the agent type ${JSON.stringify(raw)} is shown as ${shown}`, async ($, on) => {
+    friendsWorld(on)
+    await $.session.start(SESSION)
+    await spawn($, raw)
+    await finish($, 'a1', 'Status: DONE')
+    await settle()
+    expect(await bubbleSays($)).toBe(`good good: ${shown} done`)
+  })
+}
+
+// ---- reading a report ----
+
+test('the status is read from the end, the last one winning', () => {
+  expect(agentStatus('Status: DONE\nmore text\nStatus: BLOCKED')).toBe('BLOCKED')
+  expect(agentStatus('Status: BLOCKED\n\nlater\n\nStatus: DONE')).toBe('DONE')
+  expect(agentStatus('```\nStatus: DONE\n```\n\n...and finally\nStatus: DONE_WITH_CONCERNS')).toBe('DONE_WITH_CONCERNS')
+  expect(agentStatus('"status": "DONE"\n\nStatus: BLOCKED')).toBe('BLOCKED')
+  expect(agentStatus('Status: BLOCKED\n\n{"status": "DONE"}')).toBe('DONE')
+})
+
+test('the status must start a line: quotes, prose and other words do not count', () => {
+  expect(agentStatus('> Status: DONE')).toBeUndefined()
+  expect(agentStatus('the Status: DONE line is quoted here')).toBeUndefined()
+  expect(agentStatus('        \t\t\t\tStatus: DONE')).toBeUndefined() // too deep: more than 8 of indent
+  expect(agentStatus('Status: DONEISH')).toBeUndefined()
+  expect(agentStatus('Status: done')).toBeUndefined()
+  expect(agentStatus('Status: ALMOST')).toBeUndefined()
+  expect(agentStatus('Statuses: DONE')).toBeUndefined()
+  expect(agentStatus(42)).toBeUndefined()
+  expect(agentStatus(undefined)).toBeUndefined()
+  expect(agentStatus('')).toBeUndefined()
+})
+
+test('only the last 4,000 characters of a report are read', () => {
+  expect(agentStatus('Status: BLOCKED\n' + 'x'.repeat(5000))).toBeUndefined()
+  expect(agentStatus('x'.repeat(5000) + '\nStatus: BLOCKED')).toBe('BLOCKED')
+})
+
+test('only the status token comes out of a report, nothing else', () => {
+  const secret = 'Status: BLOCKED token=ghp_secretsecretsecret'
+  expect(agentStatus(`${secret}`)).toBe('BLOCKED')
+  expect(agentOutcome('code-reviewer', 'BLOCKED').detail).toBe('worry worry: code-reviewer blocked')
+})
+
+const REPORT_BIG = 200000
+const HOSTILE: [string, string][] = [
+  ['stars', 'Status' + '*'.repeat(REPORT_BIG)],
+  ['spaces after the word', 'Status:' + ' '.repeat(REPORT_BIG)],
+  ['newlines', '\n'.repeat(REPORT_BIG)],
+  ['many near misses', 'Status: DON\n'.repeat(REPORT_BIG / 12)],
+  ['many Statuses', '\nStatus: '.repeat(REPORT_BIG / 9)],
+  ['JSON near misses', '"status"   :   '.repeat(REPORT_BIG / 15)],
+  ['tabs', '\n\t'.repeat(REPORT_BIG / 2)],
+  ['many real ones', 'Status: DONE\n'.repeat(REPORT_BIG / 13)],
+]
+
+for (const [what, text] of HOSTILE) {
+  test(`a ${REPORT_BIG}-character report (${what}) is read in under 100 ms`, () => {
+    const t = Date.now()
+    agentStatus(text)
+    expect(Date.now() - t).toBeLessThan(100)
+  })
+}
+
+// ---- what takes the bubble ----
+
+test('a test outcome shows over the friends count until it fades', async ($, on) => {
+  const clock = friendsWorld(on, { result: {}, isError: true, text: '3 failed' })
+  await $.session.start(SESSION)
+  await spawn($)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'pytest' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('worry worry: 3 tests fail')
+  await clock.advance(21000)
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+})
+
+test('a person\'s question shows over the friends count', async ($, on) => {
+  friendsWorld(on)
+  on('tool.check', () => ({ decision: 'ask' }) as never)
+  await $.session.start(SESSION)
+  await spawn($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, approver: 'person' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('question? you decide.')
+})
+
+// ---- stale and corrupt state ----
+
+// A tiny store of our own for the seeded keys (the rest fall through to the kit's):
+// it starts with the seed at version 1 and keeps what the plugin writes, with the
+// same compare-and-set the real one has.
+const seeded = (on: On, seed: Record<string, unknown>) => {
+  const store = new Map<string, { version: number; value: unknown }>(
+    Object.entries(seed).map(([key, value]) => [key, { version: 1, value }]),
+  )
+  on('state.get', async (_, e, next) => {
+    const held = store.get(String((e as { key?: unknown }).key))
+    return held ? ({ value: held } as never) : next(e)
+  })
+  on('state.set', async (_, e, next) => {
+    const { key, value, ifVersion } = e as { key: string; value: unknown; ifVersion?: number }
+    const held = store.get(key)
+    if (!held) return next(e)
+    if (ifVersion !== undefined && ifVersion !== held.version) return { value: { isSet: false, version: held.version } } as never
+    store.set(key, { version: held.version + 1, value })
+    return { value: { isSet: true, version: held.version + 1 } } as never
+  })
+  return store
+}
+
+const MOOD6 = (extra: Record<string, unknown>) => ({
+  shape: 'mood-6',
+  value: { mood: 'idle', detail: '', seq: 1, gen: 0, until: 0, friendStarts: [], ...extra },
+})
+
+test('a count whose time has passed is not shown', async ($, on) => {
+  seeded(on, { mood: MOOD6({ friendStarts: [0, 0] }), frame: { shape: 'frame-2', value: { n: 0, now: 31 * 60 * 1000 } } })
+  engine(on)
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a count within its time is shown, and never above 99', async ($, on) => {
+  seeded(on, { mood: MOOD6({ friendStarts: Array.from({ length: 500 }, () => 1e12) }) })
+  engine(on)
+  expect(await bubbleSays($)).toBe('friends friends: 99 working')
+})
+
+test('a corrupt count is not shown', async ($, on) => {
+  seeded(on, { mood: MOOD6({ friendStarts: 'many' }) })
+  engine(on)
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a lost completion is dropped when the next one is recorded', async ($, on) => {
+  seeded(on, { friends: { shape: 'friends-1', value: { ghost: { at: 0, type: 'planner' } } } })
+  clockStart = 31 * 60 * 1000 // the ghost began 31 minutes ago
+  friendsWorld(on)
+  await spawn($) // (no session.start: that would clear the set)
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working') // not 2
+})
+
+test('a lost completion still inside its time is counted', async ($, on) => {
+  seeded(on, { friends: { shape: 'friends-1', value: { ghost: { at: 0, type: 'planner' } } } })
+  clockStart = 29 * 60 * 1000
+  friendsWorld(on)
+  await spawn($)
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 2 working')
+})
+
+// ---- observe only, and the guard ----
+
+test('the spawn result and the agent\'s turn result go back exactly as they came', async ($, on) => {
+  friendsWorld(on)
+  const answer = { model: 'm', agentId: 'a-fixed' }
+  spawnReply = () => answer
+  await $.session.start(SESSION)
+
+  expect(await spawn($)).toEqual(answer)
+  expect(await finish($, 'a-fixed')).toEqual({ text: '' })
+})
+
+test('a refused spawn goes back as it came', async ($, on) => {
+  friendsWorld(on)
+  spawnReply = () => ({ deny: 'no friends today' })
+  await $.session.start(SESSION)
+  expect(await spawn($)).toEqual({ deny: 'no friends today' })
+})
+
+test('in a work session spawns and ends write nothing', async ($, on) => {
+  const w = watch(on)
+  on('agent.spawn', () => ({ model: 'm', agentId: 'w1' }) as never)
+  cwdNow = `${W}/crosscheck`
+  await $.session.start({ ...SESSION, cwd: cwdNow })
+  const writes = w.seen.writes
+
+  await spawn($)
+  await finish($, 'w1', 'Status: BLOCKED')
+  await settle()
+  await w.clock.advance(83 * 10)
+
+  expect(w.seen.writes).toBe(writes)
+  expect(opened).toBe(0)
+})
+
+// ---- round 2: each entry on its own clock, and who holds the bubble ----
+
+const MIN = 60 * 1000
+const FRAME_AT = (now: number) => ({ shape: 'frame-2', value: { n: 0, now } })
+
+for (const [now, shown] of [
+  [10 * MIN, 'friends friends: 2 working'],
+  [29 * MIN, 'friends friends: 2 working'],
+  [31 * MIN, 'friends friends: 1 working'],
+  [49 * MIN, 'friends friends: 1 working'],
+  [51 * MIN, '...'],
+] as [number, string][]) {
+  test(`two friends started at 0 and 20 minutes, drawn at ${now / MIN} minutes: ${shown}`, async ($, on) => {
+    seeded(on, { mood: MOOD6({ friendStarts: [0, 20 * MIN] }), frame: FRAME_AT(now) })
+    engine(on)
+    expect(await bubbleSays($)).toBe(shown)
+  })
+}
+
+test('a finished agent does not replace a question that is showing', async ($, on) => {
+  friendsWorld(on)
+  on('tool.check', () => ({ decision: 'ask' }) as never)
+  await $.session.start(SESSION)
+  await spawn($)
+  await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, approver: 'person' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('question? you decide.')
+
+  await finish($, 'a1', 'Status: DONE')
+  await settle()
+  expect(await bubbleSays($)).toBe('question? you decide.')
+})
+
+test('a finished agent does not replace a failing test run that is showing', async ($, on) => {
+  friendsWorld(on, { result: {}, isError: true, text: '3 failed' })
+  await $.session.start(SESSION)
+  await spawn($)
+  await spawn($, 'planner')
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'pytest' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('worry worry: 3 tests fail')
+
+  await finish($, 'a1', 'Status: DONE')
+  await settle()
+  expect(await bubbleSays($)).toBe('worry worry: 3 tests fail')
+})
+
+test('a finished agent does not replace an outcome that is showing', async ($, on) => {
+  friendsWorld(on, { result: {}, text: '5 passed' })
+  await $.session.start(SESSION)
+  await spawn($)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'pytest' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('good good good: tests pass')
+
+  await finish($, 'a1', 'Status: BLOCKED')
+  await settle()
+  expect(await bubbleSays($)).toBe('good good good: tests pass')
+})
+
+test('a finished agent does replace a tool\'s working line', async ($, on) => {
+  let release: () => void = () => {}
+  const hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  friendsWorld(on, async () => {
+    await hold
+    return { result: {} }
+  })
+  await $.session.start(SESSION)
+  await spawn($)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  const call = $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('run run: ls')
+  await finish($, 'a1', 'Status: BLOCKED')
+  await settle()
+  expect(await bubbleSays($)).toBe('worry worry: code-reviewer blocked')
+  release()
+  await call
+})
+
+test('a tool\'s own line shows over the count, a thinking Rocky without one shows the count', async ($, on) => {
+  let release: () => void = () => {}
+  const hold = new Promise<void>(resolve => {
+    release = resolve
+  })
+  friendsWorld(on, async () => {
+    await hold
+    return { result: {} }
+  })
+  await $.session.start(SESSION)
+  await spawn($)
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working') // thinking, no line of its own
+  const call = $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('run run: ls') // working, with a line
+  release()
+  await call
+})
+
+test('a teammate is not a friend', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await $.agent.spawn({ prompt: 'p', subagentType: 'teammate', description: 'd', isTeammate: true } as never)
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('a throwing hook beneath the spawn runs once, and the hook does not run it again', async ($, on) => {
+  nextAgent = 0
+  let ran = 0
+  engine(on)
+  on('agent.spawn', () => {
+    ran++
+    throw new Error('the agent could not start')
+  })
+  await $.session.start(SESSION)
+
+  await spawn($).catch(() => undefined)
+  await settle()
+
+  expect(ran).toBe(1)
+  expect(await bubbleSays($)).toBe('...') // and nothing was counted
+})
+
+test('an end seen before its start leaves no friend', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await finish($, 'a1', 'Status: DONE') // the end arrives first
+  await spawn($) // then the start, for the same agent
+  await settle()
+  expect(await bubbleSays($)).toBe('...')
+})
+
+test('an end seen first does not keep a later, different agent away', async ($, on) => {
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await finish($, 'a9', 'Status: DONE')
+  await spawn($) // a1
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+})
+
+test('the note of an early end is forgotten after a minute', async ($, on) => {
+  const clock = friendsWorld(on)
+  await $.session.start(SESSION)
+  await finish($, 'a1', 'Status: DONE')
+  await clock.advance(70 * 1000)
+  await spawn($) // a1 again, long after
+  await settle()
+  expect(await bubbleSays($)).toBe('friends friends: 1 working')
+})
+
+for (const [what, cwd, counted] of [
+  ['a personal directory', `${P}/eridian`, true],
+  ['no directory', undefined, true],
+  ['the work folder', `${W}/crosscheck`, false],
+  ['a path inside the work folder', `${W}/../work/x`, false],
+  ['a relative path', 'src', false],
+  ['an empty path', '', false],
+  ['a path with a control character', `${P}/a\u0001b`, false],
+] as [string, string | undefined, boolean][]) {
+  test(`an agent given ${what} to run in ${counted ? 'is' : 'is not'} counted`, async ($, on) => {
+    friendsWorld(on)
+    await $.session.start(SESSION)
+    await $.agent.spawn({ prompt: 'p', subagentType: 'code-reviewer', description: 'd', ...(cwd === undefined ? {} : { cwd }) } as never)
+    await settle()
+    expect(await bubbleSays($)).toBe(counted ? 'friends friends: 1 working' : '...')
+    // and its end gives no mood when it was not counted
+    await finish($, 'a1', 'Status: BLOCKED')
+    await settle()
+    expect(await bubbleSays($)).toBe(counted ? 'worry worry: code-reviewer blocked' : '...')
+  })
+}
+
+// ---- round 3: ordering, re-checks, and notes ----
+
+type SetEvent = { key: string; value?: { value?: unknown } }
+
+test('a reset cannot land between a sync\'s two writes', async ($, on) => {
+  let held = false
+  let release: () => void = () => {}
+  friendsWorld(on)
+  // hold the mood write that carries a friend: the second of the sync's two writes
+  on('state.set', async (_, e, next) => {
+    const ev = e as SetEvent
+    const starts = (ev.value?.value as { friendStarts?: number[] } | undefined)?.friendStarts
+    if (ev.key === 'mood' && !held && (starts?.length ?? 0) > 0) {
+      held = true
+      await new Promise<void>(resolve => {
+        release = resolve
+      })
+    }
+    return next(e)
+  })
+  await $.session.start(SESSION)
+  await spawn($)
+  await settle()
+  expect(held).toBe(true)
+
+  const restart = $.session.start(SESSION) // its reset has to wait its turn
+  await settle()
+  release()
+  await restart
+  await settle()
+
+  expect(await bubbleSays($)).toBe('...') // no friend left over from before the reset
+})
+
+test('the guard is asked again before the second write of a sync', async ($, on) => {
+  let held = false
+  let release: () => void = () => {}
+  let moodWithFriend = 0
+  friendsWorld(on)
+  on('state.set', async (_, e, next) => {
+    const ev = e as SetEvent
+    if (ev.key === 'friends' && !held && Object.keys((ev.value?.value as object | undefined) ?? {}).length > 0) {
+      held = true
+      await new Promise<void>(resolve => {
+        release = resolve
+      })
+    }
+    const starts = (ev.value?.value as { friendStarts?: number[] } | undefined)?.friendStarts
+    if (ev.key === 'mood' && (starts?.length ?? 0) > 0) moodWithFriend++
+    return next(e)
+  })
+  await $.session.start(SESSION)
+  await spawn($)
+  await settle()
+  expect(held).toBe(true) // the first write is in flight
+
+  cwdNow = `${W}/crosscheck` // a cd into work lands between the two writes
+  release()
+  await settle()
+
+  expect(moodWithFriend).toBe(0)
+})
+
+test('a flood of early ends never evicts a live start', async ($, on) => {
+  const live = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`live${i}`, { at: 2000 + i, type: 'planner' }]))
+  const store = seeded(on, {
+    friends: { shape: 'friends-1', value: live },
+    mood: MOOD6({ friendStarts: Array.from({ length: 200 }, (_, i) => 2000 + i) }),
+  })
+  clockStart = 3000
+  friendsWorld(on)
+  // (no session.start: its reset would clear the set)
+  for (let i = 0; i < 40; i++) await finish($, `unknown${i}`, 'x')
+  await settle()
+  await friendsDone()
+
+  const kept = Object.entries((store.get('friends')?.value as { value: Record<string, { gone?: true }> }).value)
+  expect(kept.filter(([, f]) => f.gone !== true)).toHaveLength(200)
+  expect(kept.filter(([, f]) => f.gone === true)).toHaveLength(0) // no room left for notes
+})
+
+test('a flood of early ends keeps live starts when there is room for both', async ($, on) => {
+  const live = Object.fromEntries(Array.from({ length: 3 }, (_, i) => [`live${i}`, { at: 2000 + i, type: 'planner' }]))
+  const store = seeded(on, { friends: { shape: 'friends-1', value: live } })
+  clockStart = 3000
+  friendsWorld(on)
+  for (let i = 0; i < 300; i++) await finish($, `unknown${i}`, 'x')
+  await settle()
+  await friendsDone()
+
+  const kept = Object.entries((store.get('friends')?.value as { value: Record<string, { gone?: true }> }).value)
+  expect(kept.filter(([, f]) => f.gone !== true)).toHaveLength(3)
+  expect(kept.length).toBeLessThanOrEqual(200)
+})
+
+test('a teammate\'s idle turns leave no note', async ($, on) => {
+  const store = seeded(on, { friends: { shape: 'friends-1', value: {} } })
+  friendsWorld(on)
+  spawnReply = () => ({ model: 'm', agentId: 'mate1' })
+  await $.agent.spawn({ prompt: 'p', subagentType: 'teammate', description: 'd', isTeammate: true } as never)
+  await finish($, 'mate1', 'turn one')
+  await finish($, 'mate1', 'turn two')
+  await settle()
+  await friendsDone()
+
+  const kept = (store.get('friends')?.value as { value: Record<string, unknown> }).value
+  expect(Object.keys(kept)).toHaveLength(0)
+})
+
+test('an end for an agent of no kind Rocky saw start leaves a note', async ($, on) => {
+  const store = seeded(on, { friends: { shape: 'friends-1', value: {} } })
+  friendsWorld(on)
+  await $.session.start(SESSION)
+  await finish($, 'stranger', 'x')
+  await settle()
+  await friendsDone()
+
+  const kept = (store.get('friends')?.value as { value: Record<string, { gone?: true }> }).value
+  expect(kept.stranger?.gone).toBe(true)
 })

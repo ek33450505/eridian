@@ -79,6 +79,26 @@ When a call finishes Rocky reacts to the outcome with a fixed line, never with t
 
 The only thing ever read from a result is a failure count, and only as a whole number from 1 to 9999 (`9999+` above that), looked for in the last 20,000 characters (where summaries are) with anchored, bounded patterns so a huge or hostile output cannot slow the hook: `pytest` and `npm`/`pnpm`/`yarn` (`N failed`), `uv run pytest`, `bats` (lines starting `not ok`), `claude plugin test` (` N fail`), `go test` (`--- FAIL` lines), `cargo test` (`N failed` in the `test result: FAILED` line). Any other output text is never shown. A failed commit or push is an ordinary failure.
 
+### Friends (subagents)
+
+While subagents run, Rocky counts them: `friends friends: 3 working`, counting down as they finish. **What shows over the count:** the count overlays an idle Rocky, and a working or thinking one only when it has no line of its own. Any line (a tool's narration while it runs, a test result, a commit, a question to you, a failure, a finished agent's status) shows over the count while it lasts, then the count comes back. With none left he returns to his usual moods.
+
+A finished agent's report is read for one thing only, a status token in its last 4,000 characters (`Status: DONE` at the start of a line, the markdown forms `**Status:** DONE`, or a JSON `"status": "DONE"`; the last one wins):
+
+| Status | Mood and line | Shown for |
+| --- | --- | --- |
+| `BLOCKED`, `NEEDS_CONTEXT` | worry, `worry worry: <agent> blocked` | 20 s |
+| `DONE_WITH_CONCERNS` | worry, `hmm hmm: <agent> concerns` | 10 s |
+| `DONE` | happy, `good good: <agent> done` | 4 s |
+
+A finished agent never replaces a mood that is still showing and belongs to something else: a question to you, a failure, or an outcome. It does replace a tool's working line and an idle or generic thinking Rocky. Nothing else of a report is ever read or shown. `<agent>` is the agent type, the part before `__` of a CAST-style name, and only if it is plain letters, digits, `_`, `:` or `-` and does not look sensitive (cut to 24 characters); otherwise `friend`. A run that was aborted or errored gets no status mood.
+
+**How it is known.** An agent's start (`agent.spawn`) is a +1 and its own `turn.complete` (carrying its agent id, for foreground and background agents alike: the Agent tool's launch return is not the end) a -1. Both hooks only observe, and return what they were given; nothing about a spawn is rewritten. The running set lives in state, so it survives a reload, and the start time of each entry is kept in the mood record: **each entry counts on its own clock**, for 30 minutes from its start, so a completion that never came cannot leave a count for ever, and when the oldest entry expires the younger ones keep counting. The price: a subagent that really runs longer than 30 minutes drops out of the count. An end that arrives before its start leaves a short-lived (one minute) note, and the late start is then dropped. Everything goes through the same guard as the rest of Rocky.
+
+**Not counted:** teammates (they idle between turns; the ones seen to spawn in this load leave no notes either), and an agent that was given its own directory (a worktree spawn) that is inside your `workUnder` folder or cannot be placed (a relative path, a malformed one): it is not tracked at all, so it adds no count and gives no mood. A directory that is neither work nor personal (a worktree in `/tmp`, say) is tracked on purpose. The set is bounded at 200 entries; over that, a one-minute note is dropped before any live start.
+
+**Changes to subagent turns.** A subagent's turn no longer goes through the main loop's guard check: it does not stand Rocky down (the main loop's turns, tool calls and stamps do). Every subagent and teammate `turn.complete` now reads its agent id and, if allowed, writes state (the running set, or a one-minute note for an agent Rocky never saw start), which is why teammates' turns write a little state too.
+
 ### Permission questions
 
 Rocky watches the permission check and changes nothing about it: his `tool.check` hook only observes, and hands the verdict back exactly as it came. When the engine asks a *person* (not a host program) whether a call may run, he wonders: thinking, `question? you decide.`, for up to 60 s or until the call goes on. The hook returns the verdict exactly as `next` gave it, whatever Rocky does with it, and a failure in Rocky's part can never reach the verdict. The tests raise the check with `approver: 'person'` through the kit; a real permission dialog was not exercised.
