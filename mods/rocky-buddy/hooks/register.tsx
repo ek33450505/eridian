@@ -10,6 +10,8 @@ import type {
 } from 'claude-code'
 
 import type { Fallback, Frame, Mood, RockyMood } from '../types'
+import { ASK, isPersonAsk, outcomeFor } from './outcome'
+import type { Kind } from './outcome'
 
 const PANE = 'rocky'
 const IMAGE_KEY = 'rocky'
@@ -193,10 +195,11 @@ const LINES: Record<Mood, string> = {
 const clip = (text: string, width: number) =>
   text.length <= width ? text : width > 2 ? `${text.slice(0, width - 2)}..` : text.slice(0, Math.max(0, width))
 
-// While working, the line is what the tool call narrated (cleaned again here:
+// The line is what the tool call narrated, or the outcome's words (any mood but idle),
+// cleaned again here:
 // a stored value is not trusted).
 const lineFor = (m: RockyMood) => {
-  const said = m.mood === 'working' && typeof m.detail === 'string' ? clean(m.detail, MAX_LINE) : ''
+  const said = m.mood !== 'idle' && typeof m.detail === 'string' ? clean(m.detail, MAX_LINE) : ''
   return said !== '' ? said : LINES[m.mood]
 }
 
@@ -264,13 +267,15 @@ type Ticking = Clocked & {
 // allowed, checked right before the write.
 const apply = async (
   $: Clocked,
-  change: (m: RockyMood, now: number) => Pick<RockyMood, 'mood' | 'detail' | 'gen'> | undefined,
+  change: (m: RockyMood, now: number) => (Pick<RockyMood, 'mood' | 'detail' | 'gen'> & { ttl?: number }) | undefined,
 ) => {
   const now = await $.clock.now()
   if (!(await allowed($))) return
   await update($, moodAtom, (m): RockyMood => {
     const next = change(m, now)
-    return next ? { ...next, seq: m.seq + 1, until: now + TTL_MS[next.mood] } : m
+    if (!next) return m
+    const { ttl, ...mood } = next
+    return { ...mood, seq: m.seq + 1, until: now + (ttl ?? TTL_MS[next.mood]) }
   })
 }
 
@@ -524,18 +529,21 @@ const GIT_SUBCOMMANDS = [
   'reset', 'restore', 'revert', 'rm', 'show', 'stash', 'status', 'switch', 'tag', 'worktree',
 ]
 
-const bashLine = (command: string, v: Verdict): string => {
+// A line for the bubble, and what the call was if it is one Rocky reacts to the end of.
+type Shape = { line: string; kind?: Kind; runner?: string }
+
+const bashShape = (command: string, v: Verdict): Shape => {
   const text = command.replace(/^\s+/, '')
   const found = COMMAND_WORD.exec(text)
-  if (!found) return 'run run'
+  if (!found) return { line: 'run run' }
   // A script given by path is a file like any other: one in the work folder (or
   // one that cannot be placed) is not named.
-  if (found[0].includes('/') && inWork(found[0], v)) return 'run run'
+  if (found[0].includes('/') && inWork(found[0], v)) return { line: 'run run' }
   // Judged on the whole word, before it is shortened for the bubble.
   const raw = found[0].split('/').filter(part => part !== '').pop() ?? ''
   const name = clean(raw)
   const lower = name.toLowerCase()
-  if (name === '' || WRAPPERS.includes(lower) || sensitive(raw)) return 'run run'
+  if (name === '' || WRAPPERS.includes(lower) || sensitive(raw)) return { line: 'run run' }
 
   // The plain words after the command word, up to the first one that is not.
   const after: string[] = []
@@ -554,14 +562,17 @@ const bashLine = (command: string, v: Verdict): string => {
     ((lower === 'go' || lower === 'cargo') && after[0] === 'test') ||
     (lower === 'claude' && after[0] === 'plugin' && after[1] === 'test') ||
     (lower === 'uv' && after[0] === 'run' && after.includes('pytest'))
-  if (isTest) return `test test: ${name}`
+  if (isTest) return { line: `test test: ${name}`, kind: 'test', runner: lower }
   if (lower === 'git') {
     const sub = after[0]
-    if (sub === undefined) return unclear ? `run run: ${name}` : 'git git'
-    if (sub.startsWith('-')) return 'git git'
-    return GIT_SUBCOMMANDS.includes(sub) ? `git git: ${sub}` : 'git git'
+    if (sub === undefined) return { line: unclear ? `run run: ${name}` : 'git git' }
+    if (sub.startsWith('-')) return { line: 'git git' }
+    if (!GIT_SUBCOMMANDS.includes(sub)) return { line: 'git git' }
+    return { line: `git git: ${sub}`, kind: sub === 'commit' ? 'commit' : sub === 'push' ? 'push' : undefined }
   }
-  return `run run: ${name}`
+  // `gh pr merge`: only these literal words count
+  if (lower === 'gh' && after[0] === 'pr' && after[1] === 'merge') return { line: `run run: ${name}`, kind: 'merge' }
+  return { line: `run run: ${name}` }
 }
 
 const fallbackLine = (tool: string) => {
@@ -571,7 +582,7 @@ const fallbackLine = (tool: string) => {
 
 // The bubble line for a tool call. Never throws: an input that is not what the
 // tool's type says falls back to the tool's name.
-const narrate = (tool: string, input: Readonly<Record<string, unknown>>, v: Verdict): string => {
+const narrateLine = (tool: string, input: Readonly<Record<string, unknown>>, v: Verdict): string => {
   try {
     const pathLine = (verb: string, path: unknown) => {
       if (typeof path !== 'string' || inWork(path, v)) return `${verb} ${verb}`
@@ -590,7 +601,7 @@ const narrate = (tool: string, input: Readonly<Record<string, unknown>>, v: Verd
       case 'Glob':
         return 'search search' // never the pattern: it can be anything the model is looking for
       case 'Bash':
-        return typeof input.command === 'string' ? bashLine(input.command, v) : fallbackLine(tool)
+        return typeof input.command === 'string' ? bashShape(input.command, v).line : fallbackLine(tool)
       case 'WebFetch':
       case 'WebSearch':
         return 'look look: web'
@@ -611,6 +622,18 @@ const narrate = (tool: string, input: Readonly<Record<string, unknown>>, v: Verd
   } catch {
     return fallbackLine(tool)
   }
+}
+
+// The line, and for Bash what kind of command it was (see Shape).
+const narrate = (tool: string, input: Readonly<Record<string, unknown>>, v: Verdict): Shape => {
+  if (tool === 'Bash' && typeof input.command === 'string') {
+    try {
+      return bashShape(input.command, v)
+    } catch {
+      return { line: fallbackLine(tool) }
+    }
+  }
+  return { line: narrateLine(tool, input, v) }
 }
 
 // ---- the work guard -------------------------------------------------------
@@ -647,6 +670,7 @@ let config: PluginOptions = {} // the plugin's options, as register received the
 // session (at its first check) so later checks cost nothing. A failed or missing
 // answer stays closed until the next session.start, or /rocky asks again.
 let workChecked: { path: string; ok: boolean } | undefined
+let lastPre: Promise<unknown> = Promise.resolve() // the latest tool call's start-of-call write
 let parked = false // Rocky closed the pane himself (sent away): a later allowed turn opens it again
 
 // An absolute path as lower-cased NFC segments; undefined if it is not
@@ -867,7 +891,7 @@ export const register: Register = (on, options) => {
   // the call, and the result goes back exactly as `next` produced it.
   on('tool.call', async ($, e, next) => {
     let gen: number | undefined
-    let line = fallbackLine(e.tool) // what the bubble says; narrated from the input in the chain below
+    let shape: Shape = { line: fallbackLine(e.tool) } // narrated from the input in the chain below
     const pre = (async () => {
       const v = await verdict($)
       if (!v.ok) {
@@ -876,7 +900,7 @@ export const register: Register = (on, options) => {
         await standDown($)
         return
       }
-      line = narrate(e.tool, e, v)
+      shape = narrate(e.tool, e, v)
       // Back from being sent away: the pane we closed opens again.
       if (parked) {
         parked = false
@@ -889,25 +913,54 @@ export const register: Register = (on, options) => {
         // a worry that has run out no longer holds
         return m.mood === 'worry' && m.until > now
           ? undefined
-          : { mood: 'working', detail: line, gen: m.gen }
+          : { mood: 'working', detail: shape.line, gen: m.gen }
       })
     })().catch(quiet)
+    lastPre = pre // the permission check (inside `next`) waits for it before it writes
 
     const ran = await next(e)
     const failed = 'deny' in ran ? ran.deny !== undefined : ran.isError === true
+    // The result as the model read it: only a count of failed tests is ever taken
+    // from it (see outcome.ts).
+    const text = 'text' in ran && typeof ran.text === 'string' ? ran.text : undefined
     void pre
       .then(async () => {
         const started = gen
         if (started === undefined) return
         await apply($, m => {
           if (m.gen !== started) return undefined // a turn boundary passed: late
-          if (failed) return { mood: 'worry', detail: line, gen: m.gen }
-          return m.mood === 'worry' ? { mood: 'working', detail: line, gen: m.gen } : undefined
+          const outcome = outcomeFor(shape.kind, shape.runner, failed, text)
+          if (outcome) return { ...outcome, gen: m.gen }
+          if (failed) return { mood: 'worry', detail: '', gen: m.gen }
+          // a question put to the person, or a worry, is over once the call ran
+          return m.mood === 'worry' || m.mood === 'thinking'
+            ? { mood: 'working', detail: shape.line, gen: m.gen }
+            : undefined
         })
       })
       .catch(quiet)
 
     return ran
+  }).catch(($, e, next) => next(e))
+
+  // Observes the permission verdict and changes nothing: what `next` settled to
+  // goes back as it came (an ask handed up as heard stays the engine's own).
+  // A person is being asked: Rocky wonders, for a minute or until the call goes on.
+  on('tool.check', async ($, e, next) => {
+    // (A throw from `await next(e)` itself is left to the `.catch`, which re-runs the chain beneath, as documented.)
+    const r = await next(e)
+    // Nothing here may throw before `return r`: the verdict goes back untouched.
+    try {
+      if (isPersonAsk(r?.decision, e.approver)) {
+        // after the call's own start-of-call write, so the question is the last word
+        void lastPre
+          .then(() => apply($, m => ({ mood: ASK.mood, detail: ASK.detail, gen: m.gen, ttl: ASK.ttl })))
+          .catch(quiet)
+      }
+    } catch {
+      // Rocky's wondering is not worth the verdict
+    }
+    return r
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
